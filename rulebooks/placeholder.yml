@@ -1,0 +1,8 @@
+---
+# Placeholder rulebook required by AAP cloud native import validation.
+# Real remediation automation is currently implemented under playbooks/.
+
+- name: Placeholder rulebook
+  hosts: all
+  sources: []
+  rules: []
