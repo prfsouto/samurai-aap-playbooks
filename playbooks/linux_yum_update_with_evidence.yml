@@ -1,359 +1,646 @@
 ---
-- name: SamurAI Shield - Linux Yum/DNF Update With Evidence
-  hosts: all
-  become: true
+# ============================================================================
+# SamurAI Shield :: Linux yum/dnf update with evidence
+# ----------------------------------------------------------------------------
+# Controlled package update playbook for Red Hat-like Linux servers, executed
+# from Ansible Automation Platform (AAP). Performs pre-checks, optional update,
+# post-checks and produces structured evidence files + a JSON summary that the
+# SamurAI Shield control plane can ingest from the AAP job stdout.
+#
+# Stages:
+#   1. Build dynamic in-memory inventory from HOSTNAMES (localhost play).
+#   2. Run pre-check, optional update and post-check on each target host.
+#   3. Emit a consolidated samurai_shield_result JSON block on stdout.
+#
+# Extra-vars contract — see ansible/playbooks/README_linux_yum_update_with_evidence.md
+# ============================================================================
+
+- name: "SamurAI :: yum-update :: build dynamic inventory from HOSTNAMES"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    HOSTNAMES: "{{ HOSTNAMES | default('') }}"
+    ACTION: "{{ ACTION | default('Check') }}"
+    UPDATE_MODE: "{{ UPDATE_MODE | default('all') }}"
+  tasks:
+    - name: "Validate HOSTNAMES is provided"
+      ansible.builtin.fail:
+        msg: "HOSTNAMES extra-var is required (single host, IP, or comma-separated list)."
+      when: HOSTNAMES is not defined or (HOSTNAMES | trim) == ''
+
+    - name: "Validate ACTION is Check or Apply"
+      ansible.builtin.fail:
+        msg: "Invalid ACTION '{{ ACTION }}'. Allowed values: Check, Apply."
+      when: ACTION not in ['Check', 'Apply']
+
+    - name: "Validate UPDATE_MODE is all or security"
+      ansible.builtin.fail:
+        msg: "Invalid UPDATE_MODE '{{ UPDATE_MODE }}'. Allowed values: all, security."
+      when: UPDATE_MODE not in ['all', 'security']
+
+    - name: "Parse HOSTNAMES into a list"
+      ansible.builtin.set_fact:
+        samurai_target_hosts: >-
+          {{ HOSTNAMES.split(',') | map('trim') | reject('equalto', '') | list }}
+
+    - name: "Add hosts to dynamic group samurai_yum_update_targets"
+      ansible.builtin.add_host:
+        name: "{{ item }}"
+        groups: samurai_yum_update_targets
+      loop: "{{ samurai_target_hosts }}"
+      changed_when: false
+
+    - name: "Show resolved target hosts"
+      ansible.builtin.debug:
+        msg: "Targets: {{ samurai_target_hosts | join(', ') }} | ACTION={{ ACTION }} | UPDATE_MODE={{ UPDATE_MODE }}"
+
+
+- name: "SamurAI :: yum-update :: pre-check, update and post-check"
+  hosts: samurai_yum_update_targets
   gather_facts: true
+  become: true
   serial: "{{ SERIAL_BATCH | default(1) }}"
 
   vars:
-    ACTION: "{{ ACTION | default('Check') }}"
-    UPDATE_MODE: "{{ UPDATE_MODE | default('all') }}"
-    EXCLUDE_PACKAGES: "{{ EXCLUDE_PACKAGES | default('') }}"
-    ALLOW_REBOOT: "{{ ALLOW_REBOOT | default(false) }}"
-    EVIDENCE_BASE_DIR: "{{ EVIDENCE_BASE_DIR | default('/var/tmp/samurai-shield/yum-update') }}"
-    execution_timestamp: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
-    evidence_dir: "{{ EVIDENCE_BASE_DIR }}/{{ inventory_hostname }}/{{ execution_timestamp }}"
+    ACTION: "{{ hostvars['localhost']['ACTION'] | default('Check') }}"
+    UPDATE_MODE: "{{ hostvars['localhost']['UPDATE_MODE'] | default('all') }}"
+    EXCLUDE_PACKAGES_RAW: "{{ hostvars['localhost']['EXCLUDE_PACKAGES'] | default('') }}"
+    ALLOW_REBOOT: "{{ hostvars['localhost']['ALLOW_REBOOT'] | default(false) | bool }}"
+    EVIDENCE_BASE_DIR: "{{ hostvars['localhost']['EVIDENCE_BASE_DIR'] | default('/var/tmp/samurai-shield/yum-update') }}"
+
+    exclude_packages_list: >-
+      {{
+        (EXCLUDE_PACKAGES_RAW | string).split(',')
+        | map('trim') | reject('equalto', '') | list
+      }}
+
+    samurai_warnings: []
+    samurai_errors: []
 
   tasks:
-    - name: Validate ACTION
-      ansible.builtin.assert:
-        that:
-          - ACTION in ['Check', 'Apply']
-        fail_msg: "ACTION must be Check or Apply"
 
-    - name: Validate UPDATE_MODE
-      ansible.builtin.assert:
-        that:
-          - UPDATE_MODE in ['all', 'security']
-        fail_msg: "UPDATE_MODE must be all or security"
-
-    - name: Validate RedHat family
-      ansible.builtin.assert:
-        that:
-          - ansible_os_family == "RedHat"
-        fail_msg: "Unsupported OS family: {{ ansible_os_family }}. This playbook supports only RedHat-like systems."
-
-    - name: Detect package manager
+    # ------------------------------------------------------------------------
+    # Phase 1: Input + OS compatibility validation
+    # ------------------------------------------------------------------------
+    - name: "Capture execution start timestamp"
       ansible.builtin.set_fact:
-        package_manager: "{{ 'dnf' if ansible_pkg_mgr == 'dnf' else 'yum' }}"
+        execution_started_at: "{{ '%Y-%m-%dT%H:%M:%SZ' | strftime(ansible_date_time.epoch | int) }}"
+        execution_timestamp: "{{ '%Y%m%dT%H%M%S' | strftime(ansible_date_time.epoch | int) }}"
 
-    - name: Create evidence directory
+    - name: "Fail when target OS family is not RedHat"
+      ansible.builtin.fail:
+        msg: >-
+          Unsupported OS family '{{ ansible_os_family }}' on host {{ inventory_hostname }}.
+          This playbook only supports Red Hat-like systems (RHEL, CentOS, Rocky,
+          AlmaLinux, Oracle Linux, Amazon Linux 2/2023).
+      when: ansible_os_family != 'RedHat'
+
+    - name: "Detect dnf binary"
+      ansible.builtin.stat:
+        path: /usr/bin/dnf
+      register: dnf_stat
+
+    - name: "Detect yum binary"
+      ansible.builtin.stat:
+        path: /usr/bin/yum
+      register: yum_stat
+
+    - name: "Fail when neither dnf nor yum is available"
+      ansible.builtin.fail:
+        msg: "Neither /usr/bin/dnf nor /usr/bin/yum found on {{ inventory_hostname }}."
+      when:
+        - not dnf_stat.stat.exists
+        - not yum_stat.stat.exists
+
+    - name: "Select package manager (prefer dnf)"
+      ansible.builtin.set_fact:
+        pkg_manager: "{{ 'dnf' if dnf_stat.stat.exists else 'yum' }}"
+
+    - name: "Build evidence directory path"
+      ansible.builtin.set_fact:
+        evidence_dir: "{{ EVIDENCE_BASE_DIR }}/{{ inventory_hostname }}/{{ execution_timestamp }}"
+
+    - name: "Create evidence directory"
       ansible.builtin.file:
         path: "{{ evidence_dir }}"
         state: directory
-        mode: '0755'
+        mode: '0750'
 
-    - name: Save system information before update
-      ansible.builtin.copy:
-        dest: "{{ evidence_dir }}/system_before.txt"
-        mode: '0644'
-        content: |
-          hostname={{ inventory_hostname }}
-          fqdn={{ ansible_fqdn | default('unknown') }}
-          os_family={{ ansible_os_family }}
-          distribution={{ ansible_distribution }}
-          distribution_version={{ ansible_distribution_version }}
-          kernel={{ ansible_kernel }}
-          architecture={{ ansible_architecture }}
-          package_manager={{ package_manager }}
-          action={{ ACTION }}
-          update_mode={{ UPDATE_MODE }}
-          started_at={{ execution_timestamp }}
+    # ------------------------------------------------------------------------
+    # Phase 2: Pre-check (always runs, even when ACTION=Check)
+    # ------------------------------------------------------------------------
+    - name: "Pre-check + optional update + post-check"
+      block:
 
-    - name: Check disk usage
-      ansible.builtin.shell: |
-        set -o pipefail
-        df -h / /var /boot 2>/dev/null || df -h
-      args:
-        executable: /bin/bash
-      register: disk_before
-      changed_when: false
+        # ---- system info --------------------------------------------------
+        - name: "Capture system info"
+          ansible.builtin.set_fact:
+            system_info:
+              hostname: "{{ ansible_hostname }}"
+              fqdn: "{{ ansible_fqdn }}"
+              primary_ip: "{{ ansible_default_ipv4.address | default('unknown') }}"
+              distribution: "{{ ansible_distribution }}"
+              distribution_version: "{{ ansible_distribution_version }}"
+              kernel: "{{ ansible_kernel }}"
+              architecture: "{{ ansible_architecture }}"
+              started_at: "{{ execution_started_at }}"
+              run_user: "{{ ansible_user_id | default('root') }}"
+              package_manager: "{{ pkg_manager }}"
 
-    - name: Save disk usage
-      ansible.builtin.copy:
-        dest: "{{ evidence_dir }}/disk_before.txt"
-        mode: '0644'
-        content: "{{ disk_before.stdout }}"
+        - name: "Write system_before.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/system_before.txt"
+            mode: '0640'
+            content: |
+              hostname: {{ system_info.hostname }}
+              fqdn: {{ system_info.fqdn }}
+              primary_ip: {{ system_info.primary_ip }}
+              distribution: {{ system_info.distribution }} {{ system_info.distribution_version }}
+              kernel: {{ system_info.kernel }}
+              architecture: {{ system_info.architecture }}
+              package_manager: {{ system_info.package_manager }}
+              started_at: {{ system_info.started_at }}
+              run_user: {{ system_info.run_user }}
 
-    - name: List enabled repositories
-      ansible.builtin.command: "{{ package_manager }} repolist enabled"
-      register: repos_enabled
-      changed_when: false
-      failed_when: false
+        # ---- disk space ---------------------------------------------------
+        - name: "Collect disk usage"
+          ansible.builtin.command: df -P -k
+          register: df_out
+          changed_when: false
 
-    - name: Save enabled repositories
-      ansible.builtin.copy:
-        dest: "{{ evidence_dir }}/repos_enabled_before.txt"
-        mode: '0644'
-        content: |
-          STDOUT:
-          {{ repos_enabled.stdout }}
+        - name: "Write disk_before.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/disk_before.txt"
+            mode: '0640'
+            content: "{{ df_out.stdout }}\n"
 
-          STDERR:
-          {{ repos_enabled.stderr }}
+        - name: "Compute filesystem usage percent (portable)"
+          ansible.builtin.shell: |
+            set -o pipefail
+            df -P {{ item }} 2>/dev/null | awk 'NR==2 {gsub("%","",$5); print $5}'
+          args:
+            executable: /bin/bash
+          register: fs_pct
+          changed_when: false
+          failed_when: false
+          loop:
+            - "/"
+            - "/var"
+            - "/boot"
 
-    - name: List installed packages before update
-      ansible.builtin.shell: |
-        rpm -qa --qf '%{NAME}|%{VERSION}|%{RELEASE}|%{ARCH}\n' | sort
-      register: packages_before
-      changed_when: false
+        - name: "Build filesystem usage dict"
+          ansible.builtin.set_fact:
+            fs_usage:
+              root: "{{ (fs_pct.results[0].stdout | default('0') | trim) | int }}"
+              var: "{{ (fs_pct.results[1].stdout | default('0') | trim) | int }}"
+              boot: "{{ (fs_pct.results[2].stdout | default('0') | trim) | int }}"
 
-    - name: Save installed packages before update
-      ansible.builtin.copy:
-        dest: "{{ evidence_dir }}/packages_before.txt"
-        mode: '0644'
-        content: "{{ packages_before.stdout }}"
+        - name: "Fail when /var usage exceeds 90%"
+          ansible.builtin.fail:
+            msg: "/var is at {{ fs_usage.var }}% — refusing to update (threshold 90%)."
+          when: fs_usage.var | int > 90
 
-    - name: Check available updates
-      ansible.builtin.command: "{{ package_manager }} check-update"
-      register: updates_available
-      changed_when: false
-      failed_when: updates_available.rc not in [0, 100]
+        - name: "Fail when /boot usage exceeds 85%"
+          ansible.builtin.fail:
+            msg: "/boot is at {{ fs_usage.boot }}% — refusing to update (threshold 85%)."
+          when: fs_usage.boot | int > 85
 
-    - name: Save available updates before update
-      ansible.builtin.copy:
-        dest: "{{ evidence_dir }}/updates_available_before.txt"
-        mode: '0644'
-        content: |
-          RC={{ updates_available.rc }}
+        - name: "Warn when / usage exceeds 85%"
+          ansible.builtin.set_fact:
+            samurai_warnings: "{{ samurai_warnings + ['/ is at ' + (fs_usage.root | string) + '%, above 85% warning threshold'] }}"
+          when: fs_usage.root | int > 85
 
-          STDOUT:
-          {{ updates_available.stdout }}
+        # ---- repos --------------------------------------------------------
+        - name: "List enabled repositories"
+          ansible.builtin.command: "{{ pkg_manager }} repolist enabled"
+          register: repos_out
+          changed_when: false
+          failed_when: false
 
-          STDERR:
-          {{ updates_available.stderr }}
+        - name: "Write repos_enabled_before.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/repos_enabled_before.txt"
+            mode: '0640'
+            content: "{{ repos_out.stdout }}\n"
 
-    - name: Count updates available
+        # ---- installed packages before -----------------------------------
+        - name: "List installed packages (before)"
+          ansible.builtin.shell: |
+            set -o pipefail
+            rpm -qa --qf '%{NAME}|%{VERSION}|%{RELEASE}|%{ARCH}\n' | sort
+          args:
+            executable: /bin/bash
+          register: pkgs_before
+          changed_when: false
+
+        - name: "Write packages_before.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/packages_before.txt"
+            mode: '0640'
+            content: "{{ pkgs_before.stdout }}\n"
+
+        # ---- updates available before ------------------------------------
+        - name: "Check available updates (before)"
+          ansible.builtin.command: "{{ pkg_manager }} -q check-update"
+          register: check_update_out
+          changed_when: false
+          failed_when: check_update_out.rc not in [0, 100]
+
+        - name: "Determine updates available count"
+          ansible.builtin.set_fact:
+            updates_available_count: >-
+              {{
+                (check_update_out.stdout_lines
+                 | reject('match', '^\\s*$')
+                 | reject('match', '^Obsoleting')
+                 | reject('match', '^Last metadata')
+                 | reject('match', '^Loaded plugins')
+                 | reject('match', '^Loading mirror')
+                 | list | length) if check_update_out.rc == 100 else 0
+              }}
+
+        - name: "Write updates_available_before.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/updates_available_before.txt"
+            mode: '0640'
+            content: |
+              exit_code: {{ check_update_out.rc }}
+              updates_available_count: {{ updates_available_count }}
+              ---
+              {{ check_update_out.stdout }}
+
+        # ---- package manager locks ---------------------------------------
+        - name: "Detect package manager locks"
+          ansible.builtin.shell: |
+            set -o pipefail
+            ps -eo pid,comm,args | awk '/[y]um|[d]nf|[r]pm/ {print}' || true
+          args:
+            executable: /bin/bash
+          register: pm_locks
+          changed_when: false
+
+        - name: "Write package_manager_locks_before.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/package_manager_locks_before.txt"
+            mode: '0640'
+            content: "{{ pm_locks.stdout if pm_locks.stdout else 'no_active_package_manager_processes' }}\n"
+
+        - name: "Detect real lock files"
+          ansible.builtin.stat:
+            path: "{{ item }}"
+          register: lock_stat
+          loop:
+            - /var/run/yum.pid
+            - /var/run/dnf.pid
+            - /var/lib/rpm/.rpm.lock
+
+        - name: "Fail when an active package manager lock is held"
+          ansible.builtin.fail:
+            msg: "Active package manager lock detected at {{ item.item }}."
+          loop: "{{ lock_stat.results }}"
+          when: item.stat.exists and item.stat.size | default(0) > 0
+          loop_control:
+            label: "{{ item.item }}"
+
+        # ---- reboot required before --------------------------------------
+        - name: "Detect needs-restarting binary"
+          ansible.builtin.stat:
+            path: /usr/bin/needs-restarting
+          register: needs_restarting_stat
+
+        - name: "Check reboot required (before)"
+          ansible.builtin.command: needs-restarting -r
+          register: reboot_before
+          changed_when: false
+          failed_when: false
+          when: needs_restarting_stat.stat.exists
+
+        - name: "Compute reboot_required_before status"
+          ansible.builtin.set_fact:
+            reboot_required_before: >-
+              {{
+                'unknown' if not needs_restarting_stat.stat.exists
+                else ('yes' if reboot_before.rc == 1 else ('no' if reboot_before.rc == 0 else 'unknown'))
+              }}
+
+        - name: "Write reboot_required_before.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/reboot_required_before.txt"
+            mode: '0640'
+            content: |
+              status: {{ reboot_required_before }}
+              needs_restarting_available: {{ needs_restarting_stat.stat.exists }}
+              ---
+              {{ (reboot_before.stdout | default('') ) if needs_restarting_stat.stat.exists else 'needs-restarting not installed' }}
+
+        # ------------------------------------------------------------------
+        # Phase 3/4: Apply update (skipped in Check mode)
+        # ------------------------------------------------------------------
+        - name: "Build update command argv"
+          ansible.builtin.set_fact:
+            update_argv: >-
+              {{
+                [pkg_manager, 'update', '-y']
+                + (['--security'] if UPDATE_MODE == 'security' else [])
+                + (exclude_packages_list | map('regex_replace', '^(.*)$', '--exclude=\\1') | list)
+              }}
+          when: ACTION == 'Apply'
+
+        - name: "Execute package update"
+          ansible.builtin.command: "{{ update_argv }}"
+          register: update_result
+          changed_when: ACTION == 'Apply' and update_result.rc == 0 and ('Nothing to do' not in (update_result.stdout | default('')))
+          failed_when: false
+          when: ACTION == 'Apply'
+
+        - name: "Write update_stdout.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/update_stdout.txt"
+            mode: '0640'
+            content: "{{ (update_result.stdout | default('not_applicable_check_mode')) if ACTION == 'Apply' else 'not_applicable_check_mode' }}\n"
+
+        - name: "Write update_stderr.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/update_stderr.txt"
+            mode: '0640'
+            content: "{{ (update_result.stderr | default('not_applicable_check_mode')) if ACTION == 'Apply' else 'not_applicable_check_mode' }}\n"
+
+        - name: "Fail playbook when update returned non-zero"
+          ansible.builtin.fail:
+            msg: "Package update failed (rc={{ update_result.rc }}). See {{ evidence_dir }}/update_stderr.txt"
+          when:
+            - ACTION == 'Apply'
+            - update_result.rc | default(0) != 0
+
+        # ------------------------------------------------------------------
+        # Phase 5: Post-check (only runs after Apply)
+        # ------------------------------------------------------------------
+        - name: "List installed packages (after)"
+          ansible.builtin.shell: |
+            set -o pipefail
+            rpm -qa --qf '%{NAME}|%{VERSION}|%{RELEASE}|%{ARCH}\n' | sort
+          args:
+            executable: /bin/bash
+          register: pkgs_after
+          changed_when: false
+          when: ACTION == 'Apply'
+
+        - name: "Write packages_after.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/packages_after.txt"
+            mode: '0640'
+            content: "{{ (pkgs_after.stdout | default('')) if ACTION == 'Apply' else 'not_applicable_check_mode' }}\n"
+
+        - name: "Compute packages diff before/after"
+          ansible.builtin.set_fact:
+            pkgs_before_set: "{{ pkgs_before.stdout_lines | default([]) | list }}"
+            pkgs_after_set: "{{ pkgs_after.stdout_lines | default([]) | list }}"
+          when: ACTION == 'Apply'
+
+        - name: "Identify updated packages (changed NVR)"
+          ansible.builtin.set_fact:
+            packages_updated: >-
+              {{
+                (pkgs_after_set | difference(pkgs_before_set))
+                | map('regex_replace', '^([^|]+)\\|.*$', '\\1') | unique | list
+              }}
+          when: ACTION == 'Apply'
+
+        - name: "Write packages_diff.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/packages_diff.txt"
+            mode: '0640'
+            content: |
+              {% if ACTION == 'Apply' %}
+              # Lines only in BEFORE (removed/replaced):
+              {% for line in pkgs_before_set | difference(pkgs_after_set) %}
+              - {{ line }}
+              {% endfor %}
+              # Lines only in AFTER (installed/upgraded):
+              {% for line in pkgs_after_set | difference(pkgs_before_set) %}
+              + {{ line }}
+              {% endfor %}
+              # Updated package names ({{ packages_updated | length }}):
+              {% for name in packages_updated %}
+              {{ name }}
+              {% endfor %}
+              {% else %}
+              not_applicable_check_mode
+              {% endif %}
+
+        # ---- failed services --------------------------------------------
+        - name: "Detect systemctl"
+          ansible.builtin.stat:
+            path: /usr/bin/systemctl
+          register: systemctl_stat
+          when: ACTION == 'Apply'
+
+        - name: "List failed systemd units"
+          ansible.builtin.command: systemctl --failed --no-pager --no-legend
+          register: failed_units
+          changed_when: false
+          failed_when: false
+          when:
+            - ACTION == 'Apply'
+            - systemctl_stat.stat.exists | default(false)
+
+        - name: "Build failed services list"
+          ansible.builtin.set_fact:
+            failed_services_list: >-
+              {{
+                (failed_units.stdout_lines | default([]))
+                | map('regex_replace', '^\\s*(\\S+).*$', '\\1') | list
+              }}
+          when: ACTION == 'Apply'
+
+        - name: "Write failed_services_after.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/failed_services_after.txt"
+            mode: '0640'
+            content: |
+              {% if ACTION != 'Apply' %}
+              not_applicable_check_mode
+              {% elif not (systemctl_stat.stat.exists | default(false)) %}
+              not_applicable
+              {% else %}
+              {{ failed_units.stdout | default('') }}
+              {% endif %}
+
+        # ---- reboot required after --------------------------------------
+        - name: "Check reboot required (after)"
+          ansible.builtin.command: needs-restarting -r
+          register: reboot_after
+          changed_when: false
+          failed_when: false
+          when:
+            - ACTION == 'Apply'
+            - needs_restarting_stat.stat.exists
+
+        - name: "Compute reboot_required_after status"
+          ansible.builtin.set_fact:
+            reboot_required_after: >-
+              {{
+                'not_applicable_check_mode' if ACTION != 'Apply'
+                else ('unknown' if not needs_restarting_stat.stat.exists
+                      else ('yes' if reboot_after.rc == 1 else ('no' if reboot_after.rc == 0 else 'unknown')))
+              }}
+
+        - name: "Write reboot_required_after.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/reboot_required_after.txt"
+            mode: '0640'
+            content: |
+              status: {{ reboot_required_after }}
+              ---
+              {{ reboot_after.stdout | default('not_applicable') }}
+
+        # ---- kernel info -------------------------------------------------
+        - name: "Capture kernel info (after)"
+          ansible.builtin.shell: |
+            set -o pipefail
+            echo "running_kernel=$(uname -r)"
+            echo "installed_kernels="
+            rpm -q kernel || true
+          args:
+            executable: /bin/bash
+          register: kernel_info
+          changed_when: false
+          when: ACTION == 'Apply'
+
+        - name: "Write kernel_after.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/kernel_after.txt"
+            mode: '0640'
+            content: "{{ (kernel_info.stdout | default('')) if ACTION == 'Apply' else 'not_applicable_check_mode' }}\n"
+
+        - name: "Capture kernel_after running version"
+          ansible.builtin.command: uname -r
+          register: kernel_after_uname
+          changed_when: false
+          when: ACTION == 'Apply'
+
+        # ---- optional reboot --------------------------------------------
+        - name: "Reboot host when ALLOW_REBOOT and reboot is required"
+          ansible.builtin.reboot:
+            msg: "SamurAI Shield :: post-update reboot"
+            reboot_timeout: 600
+          when:
+            - ACTION == 'Apply'
+            - ALLOW_REBOOT | bool
+            - reboot_required_after == 'yes'
+          register: reboot_action
+
+      rescue:
+        - name: "Capture rescue error"
+          ansible.builtin.set_fact:
+            samurai_errors: "{{ samurai_errors + [ansible_failed_result.msg | default('unknown failure')] }}"
+
+        - name: "Mark execution status as failed"
+          ansible.builtin.set_fact:
+            execution_status: "failed"
+
+      always:
+        # ------------------------------------------------------------------
+        # summary.json — runs even on failure
+        # ------------------------------------------------------------------
+        - name: "Compute final execution status"
+          ansible.builtin.set_fact:
+            execution_status: >-
+              {{
+                execution_status | default(
+                  'check_completed' if ACTION == 'Check'
+                  else ('updated' if (packages_updated | default([]) | length) > 0
+                        else 'no_updates')
+                )
+              }}
+
+        - name: "Capture finished_at timestamp"
+          ansible.builtin.set_fact:
+            execution_finished_at: "{{ '%Y-%m-%dT%H:%M:%SZ' | strftime(ansible_date_time.epoch | int) }}"
+
+        - name: "Build per-host summary"
+          ansible.builtin.set_fact:
+            host_summary:
+              tool: "SamurAI Shield"
+              playbook: "linux_yum_update_with_evidence"
+              host: "{{ inventory_hostname }}"
+              fqdn: "{{ ansible_fqdn | default(inventory_hostname) }}"
+              primary_ip: "{{ ansible_default_ipv4.address | default('unknown') }}"
+              os_family: "{{ ansible_os_family | default('unknown') }}"
+              distribution: "{{ ansible_distribution | default('unknown') }}"
+              distribution_version: "{{ ansible_distribution_version | default('unknown') }}"
+              kernel_before: "{{ ansible_kernel | default('unknown') }}"
+              kernel_after: "{{ kernel_after_uname.stdout | default(ansible_kernel | default('unknown')) | trim }}"
+              package_manager: "{{ pkg_manager | default('unknown') }}"
+              action: "{{ ACTION }}"
+              update_mode: "{{ UPDATE_MODE }}"
+              exclude_packages: "{{ exclude_packages_list }}"
+              updates_available_before_count: "{{ updates_available_count | default(0) | int }}"
+              packages_updated_count: "{{ (packages_updated | default([])) | length }}"
+              packages_updated: "{{ packages_updated | default([]) }}"
+              reboot_required_before: "{{ reboot_required_before | default('unknown') }}"
+              reboot_required_after: "{{ reboot_required_after | default('not_applicable_check_mode') }}"
+              rebooted: "{{ (reboot_action.rebooted | default(false)) | bool }}"
+              failed_services_after: "{{ failed_services_list | default([]) }}"
+              evidence_dir: "{{ evidence_dir }}"
+              started_at: "{{ execution_started_at }}"
+              finished_at: "{{ execution_finished_at }}"
+              status: "{{ execution_status }}"
+              warnings: "{{ samurai_warnings }}"
+              errors: "{{ samurai_errors }}"
+
+        - name: "Write summary.json"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/summary.json"
+            mode: '0640'
+            content: "{{ host_summary | to_nice_json }}\n"
+
+        - name: "Publish per-host summary as run stat"
+          ansible.builtin.set_stats:
+            data:
+              samurai_yum_update_summary: "{{ host_summary }}"
+            per_host: true
+            aggregate: false
+
+
+- name: "SamurAI :: yum-update :: emit consolidated stdout JSON"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: "Collect per-host summaries"
       ansible.builtin.set_fact:
-        updates_available_before_count: "{{ updates_available.stdout_lines | reject('match', '^$') | reject('search', 'Loaded plugins') | reject('search', 'Last metadata') | list | length }}"
+        all_host_summaries: >-
+          {{
+            groups['samurai_yum_update_targets'] | default([])
+            | map('extract', hostvars, 'host_summary')
+            | select('defined') | list
+          }}
 
-    - name: Check package manager locks
-      ansible.builtin.shell: |
-        pgrep -a 'yum|dnf|rpm' || true
-      register: package_locks
-      changed_when: false
-
-    - name: Save package manager locks
-      ansible.builtin.copy:
-        dest: "{{ evidence_dir }}/package_manager_locks_before.txt"
-        mode: '0644'
-        content: "{{ package_locks.stdout | default('no locks found') }}"
-
-    - name: Check reboot required before update
-      ansible.builtin.shell: |
-        if command -v needs-restarting >/dev/null 2>&1; then
-          needs-restarting -r >/tmp/samurai_reboot_check_before.txt 2>&1
-          rc=$?
-          cat /tmp/samurai_reboot_check_before.txt
-          exit $rc
-        else
-          echo "unknown - needs-restarting not installed"
-          exit 0
-        fi
-      register: reboot_before
-      changed_when: false
-      failed_when: false
-
-    - name: Save reboot required before update
-      ansible.builtin.copy:
-        dest: "{{ evidence_dir }}/reboot_required_before.txt"
-        mode: '0644'
-        content: |
-          RC={{ reboot_before.rc }}
-          {{ reboot_before.stdout }}
-          {{ reboot_before.stderr }}
-
-    - name: Initialize update result for Check mode
+    - name: "Compute consolidated status"
       ansible.builtin.set_fact:
-        update_result:
-          rc: 0
-          stdout: "not_applicable_check_mode"
-          stderr: ""
-        packages_after:
-          stdout: "{{ packages_before.stdout }}"
-        packages_updated_count: 0
-        final_status: "check_completed"
-      when: ACTION == "Check"
+        consolidated_status: >-
+          {{
+            'failed' if (all_host_summaries | selectattr('status', 'equalto', 'failed') | list | length) > 0
+            else 'completed'
+          }}
 
-    - name: Run package update in Apply mode
-      ansible.builtin.shell: |
-        set -o pipefail
-
-        EXCLUDES=""
-        if [ -n "{{ EXCLUDE_PACKAGES }}" ]; then
-          IFS=',' read -ra PKGS <<< "{{ EXCLUDE_PACKAGES }}"
-          for p in "${PKGS[@]}"; do
-            p="$(echo "$p" | xargs)"
-            if [ -n "$p" ]; then
-              EXCLUDES="$EXCLUDES --exclude=$p"
-            fi
-          done
-        fi
-
-        if [ "{{ UPDATE_MODE }}" = "security" ]; then
-          {{ package_manager }} update --security -y $EXCLUDES
-        else
-          {{ package_manager }} update -y $EXCLUDES
-        fi
-      args:
-        executable: /bin/bash
-      register: update_result
-      changed_when: >
-        update_result.rc == 0 and
-        ('Nothing to do' not in update_result.stdout) and
-        ('No packages marked for update' not in update_result.stdout) and
-        ('Nothing to do.' not in update_result.stdout)
-      failed_when: update_result.rc != 0
-      when: ACTION == "Apply"
-
-    - name: Save update stdout
-      ansible.builtin.copy:
-        dest: "{{ evidence_dir }}/update_stdout.txt"
-        mode: '0644'
-        content: "{{ update_result.stdout | default('') }}"
-
-    - name: Save update stderr
-      ansible.builtin.copy:
-        dest: "{{ evidence_dir }}/update_stderr.txt"
-        mode: '0644'
-        content: "{{ update_result.stderr | default('') }}"
-
-    - name: List installed packages after update
-      ansible.builtin.shell: |
-        rpm -qa --qf '%{NAME}|%{VERSION}|%{RELEASE}|%{ARCH}\n' | sort
-      register: packages_after_real
-      changed_when: false
-      when: ACTION == "Apply"
-
-    - name: Set packages_after fact for Apply mode
+    - name: "Build consolidated samurai_shield_result block"
       ansible.builtin.set_fact:
-        packages_after:
-          stdout: "{{ packages_after_real.stdout }}"
-      when: ACTION == "Apply"
-
-    - name: Save installed packages after update
-      ansible.builtin.copy:
-        dest: "{{ evidence_dir }}/packages_after.txt"
-        mode: '0644'
-        content: "{{ packages_after.stdout }}"
-
-    - name: Generate package diff
-      ansible.builtin.shell: |
-        diff -u "{{ evidence_dir }}/packages_before.txt" "{{ evidence_dir }}/packages_after.txt" || true
-      register: packages_diff
-      changed_when: false
-
-    - name: Save package diff
-      ansible.builtin.copy:
-        dest: "{{ evidence_dir }}/packages_diff.txt"
-        mode: '0644'
-        content: "{{ packages_diff.stdout | default('') }}"
-
-    - name: Calculate updated packages count
-      ansible.builtin.set_fact:
-        packages_updated_count: "{{ packages_diff.stdout_lines | select('match', '^\\+') | reject('match', '^\\+\\+\\+') | list | length }}"
-      when: ACTION == "Apply"
-
-    - name: Check failed systemd services
-      ansible.builtin.shell: |
-        if command -v systemctl >/dev/null 2>&1; then
-          systemctl --failed --no-pager || true
-        else
-          echo "not_applicable_no_systemd"
-        fi
-      register: failed_services
-      changed_when: false
-
-    - name: Save failed services after update
-      ansible.builtin.copy:
-        dest: "{{ evidence_dir }}/failed_services_after.txt"
-        mode: '0644'
-        content: "{{ failed_services.stdout }}"
-
-    - name: Check reboot required after update
-      ansible.builtin.shell: |
-        if command -v needs-restarting >/dev/null 2>&1; then
-          needs-restarting -r >/tmp/samurai_reboot_check_after.txt 2>&1
-          rc=$?
-          cat /tmp/samurai_reboot_check_after.txt
-          exit $rc
-        else
-          echo "unknown - needs-restarting not installed"
-          exit 0
-        fi
-      register: reboot_after
-      changed_when: false
-      failed_when: false
-
-    - name: Save reboot required after update
-      ansible.builtin.copy:
-        dest: "{{ evidence_dir }}/reboot_required_after.txt"
-        mode: '0644'
-        content: |
-          RC={{ reboot_after.rc }}
-          {{ reboot_after.stdout }}
-          {{ reboot_after.stderr }}
-
-    - name: Capture kernel info after update
-      ansible.builtin.shell: |
-        echo "running_kernel=$(uname -r)"
-        echo ""
-        echo "installed_kernels:"
-        rpm -q kernel || true
-      register: kernel_after
-      changed_when: false
-
-    - name: Save kernel info
-      ansible.builtin.copy:
-        dest: "{{ evidence_dir }}/kernel_after.txt"
-        mode: '0644'
-        content: "{{ kernel_after.stdout }}"
-
-    - name: Define final status for Apply
-      ansible.builtin.set_fact:
-        final_status: "{{ 'updated' if (packages_updated_count | int) > 0 else 'no_updates' }}"
-      when: ACTION == "Apply"
-
-    - name: Build summary
-      ansible.builtin.set_fact:
-        samurai_summary:
-          tool: "SamurAI Shield"
+        samurai_shield_result:
           playbook: "linux_yum_update_with_evidence"
-          host: "{{ inventory_hostname }}"
-          fqdn: "{{ ansible_fqdn | default('unknown') }}"
-          primary_ip: "{{ ansible_default_ipv4.address | default('unknown') }}"
-          os_family: "{{ ansible_os_family }}"
-          distribution: "{{ ansible_distribution }}"
-          distribution_version: "{{ ansible_distribution_version }}"
-          kernel_before: "{{ ansible_kernel }}"
-          kernel_after: "{{ ansible_kernel }}"
-          package_manager: "{{ package_manager }}"
-          action: "{{ ACTION }}"
-          update_mode: "{{ UPDATE_MODE }}"
-          exclude_packages: "{{ EXCLUDE_PACKAGES }}"
-          updates_available_before_count: "{{ updates_available_before_count | int }}"
-          packages_updated_count: "{{ packages_updated_count | int }}"
-          reboot_required_before_rc: "{{ reboot_before.rc }}"
-          reboot_required_after_rc: "{{ reboot_after.rc }}"
-          evidence_dir: "{{ evidence_dir }}"
-          started_at: "{{ execution_timestamp }}"
-          finished_at: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
-          status: "{{ final_status }}"
-          warnings: []
-          errors: []
+          action: "{{ ACTION | default('Check') }}"
+          update_mode: "{{ UPDATE_MODE | default('all') }}"
+          status: "{{ consolidated_status }}"
+          host_count: "{{ all_host_summaries | length }}"
+          hosts: "{{ all_host_summaries }}"
 
-    - name: Save summary.json
-      ansible.builtin.copy:
-        dest: "{{ evidence_dir }}/summary.json"
-        mode: '0644'
-        content: "{{ samurai_summary | to_nice_json }}"
-
-    - name: Print SamurAI Shield JSON result
+    - name: "Print consolidated SamurAI Shield JSON to stdout"
       ansible.builtin.debug:
-        msg:
-          samurai_shield_result:
-            playbook: "linux_yum_update_with_evidence"
-            action: "{{ ACTION }}"
-            status: "{{ final_status }}"
-            host: "{{ inventory_hostname }}"
-            summary: "{{ samurai_summary }}"
+        msg: "{{ {'samurai_shield_result': samurai_shield_result} | to_nice_json }}"
+
+    - name: "Publish consolidated result as workflow stat"
+      ansible.builtin.set_stats:
+        data:
+          samurai_shield_result: "{{ samurai_shield_result }}"
+        aggregate: false
+        per_host: false
