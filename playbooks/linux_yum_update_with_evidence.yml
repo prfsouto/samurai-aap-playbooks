@@ -12,7 +12,11 @@
 #   2. Run pre-check, optional update and post-check on each target host.
 #   3. Emit a consolidated samurai_shield_result JSON block on stdout.
 #
-# Extra-vars contract — see ansible/playbooks/README_linux_yum_update_with_evidence.md
+# Extra-vars contract: HOSTNAMES (required), ACTION (Check|Apply, default Check),
+# UPDATE_MODE (all|security, default all), EXCLUDE_PACKAGES (csv, optional),
+# ALLOW_REBOOT (bool, default false), EVIDENCE_BASE_DIR (default
+# /var/tmp/samurai-shield/yum-update), SERIAL_BATCH (default 1).
+# See README.md at the repository root for full documentation.
 # ============================================================================
 
 - name: "SamurAI :: yum-update :: build dynamic inventory from HOSTNAMES"
@@ -62,11 +66,11 @@
   serial: "{{ SERIAL_BATCH | default(1) }}"
 
   vars:
-    ACTION: "{{ hostvars['localhost']['ACTION'] | default('Check') }}"
-    UPDATE_MODE: "{{ hostvars['localhost']['UPDATE_MODE'] | default('all') }}"
-    EXCLUDE_PACKAGES_RAW: "{{ hostvars['localhost']['EXCLUDE_PACKAGES'] | default('') }}"
-    ALLOW_REBOOT: "{{ hostvars['localhost']['ALLOW_REBOOT'] | default(false) | bool }}"
-    EVIDENCE_BASE_DIR: "{{ hostvars['localhost']['EVIDENCE_BASE_DIR'] | default('/var/tmp/samurai-shield/yum-update') }}"
+    ACTION: "{{ ACTION | default('Check') }}"
+    UPDATE_MODE: "{{ UPDATE_MODE | default('all') }}"
+    EXCLUDE_PACKAGES_RAW: "{{ EXCLUDE_PACKAGES | default('') }}"
+    ALLOW_REBOOT: "{{ ALLOW_REBOOT | default(false) | bool }}"
+    EVIDENCE_BASE_DIR: "{{ EVIDENCE_BASE_DIR | default('/var/tmp/samurai-shield/yum-update') }}"
 
     exclude_packages_list: >-
       {{
@@ -82,10 +86,10 @@
     # ------------------------------------------------------------------------
     # Phase 1: Input + OS compatibility validation
     # ------------------------------------------------------------------------
-    - name: "Capture execution start timestamp"
+    - name: "Capture execution start timestamp (UTC, controller-side)"
       ansible.builtin.set_fact:
-        execution_started_at: "{{ '%Y-%m-%dT%H:%M:%SZ' | strftime(ansible_date_time.epoch | int) }}"
-        execution_timestamp: "{{ '%Y%m%dT%H%M%S' | strftime(ansible_date_time.epoch | int) }}"
+        execution_started_at: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+        execution_timestamp: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
 
     - name: "Fail when target OS family is not RedHat"
       ansible.builtin.fail:
@@ -367,7 +371,21 @@
 
         - name: "Fail playbook when update returned non-zero"
           ansible.builtin.fail:
-            msg: "Package update failed (rc={{ update_result.rc }}). See {{ evidence_dir }}/update_stderr.txt"
+            msg: >-
+              {% if UPDATE_MODE == 'security' %}
+              Security update failed (rc={{ update_result.rc }}) on {{ inventory_hostname }}.
+              UPDATE_MODE=security requires that the package manager, the security plugin
+              (e.g. dnf-plugin-security / yum-plugin-security) AND the enabled repositories
+              expose security advisory metadata (updateinfo.xml). When any of these is
+              missing the command --security may be rejected, return no candidates, or
+              fail with 'No such command' / 'unknown option'. The playbook deliberately
+              does NOT fall back to a full update — fix the security metadata or relaunch
+              with UPDATE_MODE=all if a full update is acceptable. See
+              {{ evidence_dir }}/update_stderr.txt for the underlying error.
+              {% else %}
+              Package update failed (rc={{ update_result.rc }}) on {{ inventory_hostname }}.
+              See {{ evidence_dir }}/update_stderr.txt for details.
+              {% endif %}
           when:
             - ACTION == 'Apply'
             - update_result.rc | default(0) != 0
@@ -554,9 +572,9 @@
                 )
               }}
 
-        - name: "Capture finished_at timestamp"
+        - name: "Capture finished_at timestamp (UTC, controller-side)"
           ansible.builtin.set_fact:
-            execution_finished_at: "{{ '%Y-%m-%dT%H:%M:%SZ' | strftime(ansible_date_time.epoch | int) }}"
+            execution_finished_at: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
 
         - name: "Build per-host summary"
           ansible.builtin.set_fact:
@@ -644,3 +662,8 @@
           samurai_shield_result: "{{ samurai_shield_result }}"
         aggregate: false
         per_host: false
+
+    - name: "Fail job when one or more hosts failed"
+      ansible.builtin.fail:
+        msg: "One or more hosts failed during yum/dnf update. See samurai_shield_result in stdout."
+      when: consolidated_status == 'failed'
