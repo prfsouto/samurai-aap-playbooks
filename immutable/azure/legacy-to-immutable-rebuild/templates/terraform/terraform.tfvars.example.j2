@@ -1,0 +1,30 @@
+################################################################################
+# SamurAI Shield :: Legacy-to-Immutable Rebuild :: generated baseline
+# terraform.tfvars.example
+#
+# Copy this file as terraform.tfvars and review every value before running
+# terraform plan. Do NOT commit terraform.tfvars with real subscription IDs.
+# No secrets are emitted here.
+################################################################################
+
+subscription_id      = "{{ azure_vm_facts.subscription_id }}"
+resource_group_name  = "{{ azure_vm_facts.resource_group }}"
+vm_name              = "{{ azure_vm_facts.vm_name }}"
+vm_size              = "{{ azure_vm_facts.vm_size }}"
+os_disk_name         = "{{ azure_vm_facts.os_disk.name }}"
+public_ip_name       = "{{ network_facts.public_ip.name }}"
+nic_name             = "{{ network_facts.nic.name }}"
+subnet_id            = "{{ network_facts.nic.subnet_id }}"
+private_ip           = "{{ network_facts.nic.private_ip }}"
+{% if (network_identity.nsg_id | default('')) != '' %}
+nsg_id               = "{{ network_identity.nsg_id }}"
+{% endif %}
+admin_username       = "samurai-shield"
+
+tags = {
+{% for k, v in (azure_vm_facts.tags | default({})).items() %}
+  "{{ k }}" = "{{ v | replace('\"', '\\\"') }}"
+{% endfor %}
+  "samurai_shield_origin"      = "legacy-to-immutable-rebuild"
+  "samurai_shield_baseline_at" = "{{ generated_at }}"
+}

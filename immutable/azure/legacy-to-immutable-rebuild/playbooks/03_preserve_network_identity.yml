@@ -1,0 +1,110 @@
+---
+# ============================================================================
+# SamurAI Shield :: Legacy-to-Immutable Rebuild :: 03 preserve network
+# ----------------------------------------------------------------------------
+# Read-only step. Validates the network identity of the VM and persists it.
+# Does NOT alter any network resource.
+#
+# Hard requirements:
+#   * Public IP allocation method MUST be Static. Dynamic IPs cannot be
+#     guaranteed to survive a VM rebuild and will fail this step with a
+#     clear message.
+#
+# Output: {{ artifact_output_dir }}/baseline/network_identity.json
+# ============================================================================
+
+- name: "SamurAI :: legacy-to-immutable :: preserve network identity"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    azure_subscription_id: "{{ azure_subscription_id }}"
+    azure_resource_group: "{{ azure_resource_group }}"
+    azure_vm_name: "{{ azure_vm_name }}"
+    artifact_output_dir: "{{ artifact_output_dir }}"
+    baseline_dir: "{{ artifact_output_dir }}/baseline"
+
+  tasks:
+    - name: "Validate baseline network_facts.json exists"
+      ansible.builtin.stat:
+        path: "{{ baseline_dir }}/network_facts.json"
+      register: net_facts_stat
+
+    - name: "Fail when baseline is missing"
+      ansible.builtin.fail:
+        msg: >-
+          Baseline not found at {{ baseline_dir }}/network_facts.json.
+          Run 01_collect_azure_vm_baseline.yml first.
+      when: not net_facts_stat.stat.exists
+
+    - name: "Load network_facts.json"
+      ansible.builtin.set_fact:
+        network_facts: "{{ lookup('file', baseline_dir ~ '/network_facts.json') | from_json }}"
+
+    - name: "Capture timestamp (UTC)"
+      ansible.builtin.set_fact:
+        captured_at: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+
+    - name: "Fail when no Public IP is associated to the NIC"
+      ansible.builtin.fail:
+        msg: >-
+          VM {{ azure_vm_name }} has no Public IP associated to its primary
+          NIC. Legacy-to-Immutable Rebuild requires a Public IP to preserve.
+      when: (network_facts.public_ip.id | default('')) == ''
+
+    - name: "Validate Public IP allocation method is Static"
+      ansible.builtin.fail:
+        msg: >-
+          Public IP must be Static before rebuild to guarantee IP preservation.
+          Current allocation method: {{ network_facts.public_ip.allocation_method }}.
+          Convert the Public IP to Static in Azure (and reapply) before rerunning
+          this workflow.
+      when: (network_facts.public_ip.allocation_method | lower) != 'static'
+
+    # ------------------------------------------------------------------
+    # Resolve subnet -> vnet (subnet_id is "<vnet>/subnets/<subnet>"):
+    # parse the VNet ID from the subnet path.
+    # ------------------------------------------------------------------
+    - name: "Derive VNet ID from subnet path"
+      ansible.builtin.set_fact:
+        derived_vnet_id: "{{ network_facts.nic.subnet_id | regex_replace('/subnets/[^/]+$', '') }}"
+
+    - name: "Build network_identity payload"
+      ansible.builtin.set_fact:
+        network_identity:
+          captured_at: "{{ captured_at }}"
+          vm_name: "{{ azure_vm_name }}"
+          resource_group: "{{ azure_resource_group }}"
+          subscription_id: "{{ azure_subscription_id }}"
+          public_ip_id: "{{ network_facts.public_ip.id }}"
+          public_ip_name: "{{ network_facts.public_ip.name }}"
+          public_ip_address: "{{ network_facts.public_ip.address }}"
+          allocation_method: "{{ network_facts.public_ip.allocation_method }}"
+          public_ip_sku: "{{ network_facts.public_ip.sku }}"
+          nic_id: "{{ network_facts.nic.id }}"
+          nic_name: "{{ network_facts.nic.name }}"
+          private_ip: "{{ network_facts.nic.private_ip }}"
+          subnet_id: "{{ network_facts.nic.subnet_id }}"
+          vnet_id: "{{ derived_vnet_id }}"
+          nsg_id: "{{ network_facts.nic.nsg_id }}"
+
+    - name: "Write network_identity.json"
+      ansible.builtin.copy:
+        dest: "{{ baseline_dir }}/network_identity.json"
+        content: "{{ network_identity | to_nice_json }}\n"
+        mode: '0640'
+
+    - name: "Publish network identity as workflow stat"
+      ansible.builtin.set_stats:
+        data:
+          samurai_network_identity_path: "{{ baseline_dir }}/network_identity.json"
+          samurai_public_ip_address: "{{ network_identity.public_ip_address }}"
+          samurai_public_ip_static: true
+        aggregate: false
+        per_host: false
+
+    - name: "Show preserved network identity"
+      ansible.builtin.debug:
+        msg: >-
+          Public IP {{ network_identity.public_ip_address }}
+          (allocation={{ network_identity.allocation_method }})
+          on NIC {{ network_identity.nic_name }} will be preserved.

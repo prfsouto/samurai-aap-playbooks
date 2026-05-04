@@ -1,0 +1,140 @@
+---
+# ============================================================================
+# SamurAI Shield :: Legacy-to-Immutable Rebuild :: 06 generate Terraform
+# ----------------------------------------------------------------------------
+# Read-only step. Renders an initial Terraform baseline that represents the
+# (re)built VM. The generated code is explicitly marked as a baseline and
+# MUST be reviewed before being applied to production.
+#
+# Outputs (under {{ artifact_output_dir }}/generated-iac/):
+#   main.tf
+#   variables.tf
+#   outputs.tf
+#   terraform.tfvars.example
+#   README.md
+#
+# Security:
+#   - No secrets, passwords, tokens or private keys are written.
+#   - admin_password / SSH key payloads are intentionally omitted; the
+#     baseline relies on the existing OS disk, so no admin credential is
+#     required for re-creation.
+# ============================================================================
+
+- name: "SamurAI :: legacy-to-immutable :: generate Terraform baseline"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    artifact_output_dir: "{{ artifact_output_dir }}"
+    baseline_dir: "{{ artifact_output_dir }}/baseline"
+    iac_dir: "{{ artifact_output_dir }}/generated-iac"
+
+  tasks:
+    - name: "Capture timestamp (UTC)"
+      ansible.builtin.set_fact:
+        generated_at: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+
+    - name: "Create generated-iac output directory"
+      ansible.builtin.file:
+        path: "{{ iac_dir }}"
+        state: directory
+        mode: '0750'
+
+    - name: "Load baseline azure_vm_facts.json"
+      ansible.builtin.set_fact:
+        azure_vm_facts: "{{ lookup('file', baseline_dir ~ '/azure_vm_facts.json') | from_json }}"
+
+    - name: "Load baseline network_facts.json"
+      ansible.builtin.set_fact:
+        network_facts: "{{ lookup('file', baseline_dir ~ '/network_facts.json') | from_json }}"
+
+    - name: "Load baseline disk_facts.json"
+      ansible.builtin.set_fact:
+        disk_facts: "{{ lookup('file', baseline_dir ~ '/disk_facts.json') | from_json }}"
+
+    - name: "Load baseline security_facts.json"
+      ansible.builtin.set_fact:
+        security_facts: "{{ lookup('file', baseline_dir ~ '/security_facts.json') | from_json }}"
+
+    - name: "Load network_identity.json"
+      ansible.builtin.set_fact:
+        network_identity: "{{ lookup('file', baseline_dir ~ '/network_identity.json') | from_json }}"
+
+    # ------------------------------------------------------------------
+    # Render Terraform files from Jinja templates.
+    # ------------------------------------------------------------------
+    - name: "Render main.tf"
+      ansible.builtin.template:
+        src: "../templates/terraform/main.tf.j2"
+        dest: "{{ iac_dir }}/main.tf"
+        mode: '0640'
+
+    - name: "Render variables.tf"
+      ansible.builtin.template:
+        src: "../templates/terraform/variables.tf.j2"
+        dest: "{{ iac_dir }}/variables.tf"
+        mode: '0640'
+
+    - name: "Render outputs.tf"
+      ansible.builtin.template:
+        src: "../templates/terraform/outputs.tf.j2"
+        dest: "{{ iac_dir }}/outputs.tf"
+        mode: '0640'
+
+    - name: "Render terraform.tfvars.example"
+      ansible.builtin.template:
+        src: "../templates/terraform/terraform.tfvars.example.j2"
+        dest: "{{ iac_dir }}/terraform.tfvars.example"
+        mode: '0640'
+
+    - name: "Write generated-iac/README.md"
+      ansible.builtin.copy:
+        dest: "{{ iac_dir }}/README.md"
+        mode: '0640'
+        content: |
+          # Generated Terraform baseline — {{ azure_vm_facts.vm_name }}
+
+          Generated at: {{ generated_at }}
+          Source: SamurAI Shield :: Legacy-to-Immutable Rebuild
+          Subscription: {{ azure_vm_facts.subscription_id }}
+          Resource group: {{ azure_vm_facts.resource_group }}
+
+          > ⚠️ This is a **generated baseline**. It represents the state of the
+          > Azure VM at the moment the baseline was collected. It is **not**
+          > production-ready as-is. Review every comment marked
+          > `# TODO: review` and adjust the inputs to match your tenant
+          > policies (NSG association, diagnostics, locks, custom extensions,
+          > governance tags) before running `terraform apply`.
+
+          ## Files
+
+          - `main.tf` — resource definitions for the VM, OS disk reference,
+            NIC, Public IP, NSG (when applicable) and data disks.
+          - `variables.tf` — declared variables (no secrets).
+          - `outputs.tf` — useful outputs (VM ID, NIC ID, Public IP address).
+          - `terraform.tfvars.example` — example values, populated from the
+            collected baseline. Copy to `terraform.tfvars` and review before use.
+
+          ## Security guarantees
+
+          - No secrets, passwords, tokens or private keys are present in any
+            file in this directory.
+          - `admin_username` and `admin_password` are deliberately omitted:
+            the baseline reuses the existing OS disk and does not require
+            credential injection at create time.
+
+          ## Manual review checklist
+
+          - [ ] NSG rules — replicate the rules from `security_facts.json`.
+          - [ ] Tags — confirm they match the governance taxonomy.
+          - [ ] VM extensions — if `security_facts.json/extensions` is non-empty,
+                add `azurerm_virtual_machine_extension` resources.
+          - [ ] Data disk attachments — confirm `caching` and `lun` values.
+          - [ ] State backend — switch from local state to a remote backend.
+
+    - name: "Publish IaC summary as workflow stat"
+      ansible.builtin.set_stats:
+        data:
+          samurai_iac_path: "{{ iac_dir }}"
+          samurai_iac_generated_at: "{{ generated_at }}"
+        aggregate: false
+        per_host: false

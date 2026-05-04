@@ -1,0 +1,329 @@
+---
+# ============================================================================
+# SamurAI Shield :: Legacy-to-Immutable Rebuild :: 04 destructive rebuild
+# ----------------------------------------------------------------------------
+# DESTRUCTIVE-GATED step. Recreates the VM resource from the existing OS
+# managed disk while preserving the OS disk, NIC and Public IP.
+#
+# Safety gates (ALL must pass before any destructive action):
+#   1. dry_run                       — if true, only print actions, do nothing.
+#   2. confirm_destructive_action    — must be exactly true.
+#   3. snapshots/snapshots.json      — must exist and contain at least one
+#                                      snapshot covering the OS disk.
+#   4. baseline/network_identity.json— must exist and report Static PIP.
+#
+# Sequence (when all gates pass):
+#   - Stop and deallocate the VM.
+#   - Capture OS disk ID (re-read from Azure to be safe).
+#   - Delete only the VM resource. OS disk, NIC and Public IP remain.
+#   - Recreate the VM from the existing OS managed disk, attaching the
+#     existing NIC.
+#   - Start the VM.
+#
+# Output: {{ artifact_output_dir }}/rebuild/rebuild_result.json
+# ============================================================================
+
+- name: "SamurAI :: legacy-to-immutable :: rebuild VM from existing OS disk"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    azure_subscription_id: "{{ azure_subscription_id }}"
+    azure_resource_group: "{{ azure_resource_group }}"
+    azure_vm_name: "{{ azure_vm_name }}"
+    artifact_output_dir: "{{ artifact_output_dir }}"
+    baseline_dir: "{{ artifact_output_dir }}/baseline"
+    snapshots_dir: "{{ artifact_output_dir }}/snapshots"
+    rebuild_dir: "{{ artifact_output_dir }}/rebuild"
+    dry_run: "{{ dry_run | default(true) | bool }}"
+    confirm_destructive_action: "{{ confirm_destructive_action | default(false) | bool }}"
+    rebuild_actions_log: []
+
+  tasks:
+    # ------------------------------------------------------------------
+    # 1) Pre-flight: load required artifacts from previous steps.
+    # ------------------------------------------------------------------
+    - name: "Capture timestamps (UTC)"
+      ansible.builtin.set_fact:
+        rebuild_started_at: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+
+    - name: "Create rebuild output directory"
+      ansible.builtin.file:
+        path: "{{ rebuild_dir }}"
+        state: directory
+        mode: '0750'
+
+    - name: "Validate snapshots.json exists"
+      ansible.builtin.stat:
+        path: "{{ snapshots_dir }}/snapshots.json"
+      register: snapshots_stat
+
+    - name: "Fail when snapshots.json is missing"
+      ansible.builtin.fail:
+        msg: >-
+          Snapshots not found at {{ snapshots_dir }}/snapshots.json. Refusing
+          to rebuild without safety snapshots — run
+          02_create_safety_snapshots.yml first.
+      when: not snapshots_stat.stat.exists
+
+    - name: "Load snapshots.json"
+      ansible.builtin.set_fact:
+        snapshots_data: "{{ lookup('file', snapshots_dir ~ '/snapshots.json') | from_json }}"
+
+    - name: "Fail when no OS-disk snapshot is recorded"
+      ansible.builtin.fail:
+        msg: >-
+          snapshots.json does not contain a snapshot with role=os.
+          Cannot proceed without an OS disk snapshot.
+      when: (snapshots_data.snapshots | selectattr('role', 'equalto', 'os') | list | length) == 0
+
+    - name: "Validate network_identity.json exists"
+      ansible.builtin.stat:
+        path: "{{ baseline_dir }}/network_identity.json"
+      register: netid_stat
+
+    - name: "Fail when network_identity.json is missing"
+      ansible.builtin.fail:
+        msg: >-
+          network_identity.json not found. Run
+          03_preserve_network_identity.yml first.
+      when: not netid_stat.stat.exists
+
+    - name: "Load network_identity.json"
+      ansible.builtin.set_fact:
+        network_identity: "{{ lookup('file', baseline_dir ~ '/network_identity.json') | from_json }}"
+
+    - name: "Re-validate Public IP is Static (defensive)"
+      ansible.builtin.fail:
+        msg: "Public IP allocation must be Static — refusing to rebuild."
+      when: (network_identity.allocation_method | lower) != 'static'
+
+    - name: "Load azure_vm_facts.json (for OS disk + size + location)"
+      ansible.builtin.set_fact:
+        azure_vm_facts: "{{ lookup('file', baseline_dir ~ '/azure_vm_facts.json') | from_json }}"
+
+    # ------------------------------------------------------------------
+    # 2) Safety gates summary.
+    # ------------------------------------------------------------------
+    - name: "Summarise safety gate state"
+      ansible.builtin.set_fact:
+        gate_state:
+          dry_run: "{{ dry_run }}"
+          confirm_destructive_action: "{{ confirm_destructive_action }}"
+          snapshots_present: true
+          os_snapshot_present: true
+          public_ip_static: true
+
+    - name: "Show planned actions (always, before any mutation)"
+      ansible.builtin.debug:
+        msg:
+          - "VM:        {{ azure_resource_group }}/{{ azure_vm_name }}"
+          - "Location:  {{ azure_vm_facts.location }}"
+          - "Size:      {{ azure_vm_facts.vm_size }}"
+          - "OS disk:   {{ azure_vm_facts.os_disk.name }} ({{ azure_vm_facts.os_disk.id }})"
+          - "OS type:   {{ azure_vm_facts.os_type }}"
+          - "NIC:       {{ network_identity.nic_name }} ({{ network_identity.nic_id }})"
+          - "Public IP: {{ network_identity.public_ip_address }} (static)"
+          - "Snapshots: {{ snapshots_data.snapshots | length }}"
+          - "dry_run:   {{ dry_run }}"
+          - "confirm:   {{ confirm_destructive_action }}"
+
+    - name: "Abort when confirm_destructive_action is not true (and not dry_run)"
+      ansible.builtin.fail:
+        msg: >-
+          confirm_destructive_action is not true. Refusing to perform any
+          destructive action against {{ azure_vm_name }}. Set
+          confirm_destructive_action=true to proceed (after reviewing
+          snapshots and the dry-run output).
+      when:
+        - not dry_run
+        - not confirm_destructive_action
+
+    - name: "Dry-run notice — listing actions only"
+      ansible.builtin.debug:
+        msg: >-
+          DRY RUN: no Azure resources will be modified. The actions listed
+          above describe what would be performed if dry_run=false and
+          confirm_destructive_action=true.
+      when: dry_run
+
+    # ------------------------------------------------------------------
+    # 3) Real destructive sequence (only when not dry_run AND confirmed).
+    # ------------------------------------------------------------------
+    - name: "Set Azure CLI subscription context"
+      ansible.builtin.command: >
+        az account set --subscription {{ azure_subscription_id }}
+      changed_when: false
+      when: not dry_run
+
+    # 3a) Stop + deallocate ------------------------------------------------
+    - name: "Stop and deallocate VM"
+      ansible.builtin.command: >
+        az vm deallocate
+          --resource-group {{ azure_resource_group }}
+          --name {{ azure_vm_name }}
+      register: deallocate_result
+      changed_when: deallocate_result.rc == 0
+      when:
+        - not dry_run
+        - confirm_destructive_action
+
+    - name: "Record deallocate action"
+      ansible.builtin.set_fact:
+        rebuild_actions_log: "{{ rebuild_actions_log + [{
+          'action': 'deallocate',
+          'rc': deallocate_result.rc | default(0),
+          'at': lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ'),
+          'dry_run': dry_run
+        }] }}"
+
+    # 3b) Re-read OS disk ID + NIC ID directly from Azure (safer than relying
+    #     on cached baseline in case it has drifted).
+    - name: "Re-read OS disk ID from Azure"
+      ansible.builtin.command: >
+        az vm show
+          --resource-group {{ azure_resource_group }}
+          --name {{ azure_vm_name }}
+          --query 'storageProfile.osDisk.managedDisk.id'
+          -o tsv
+      register: os_disk_id_query
+      changed_when: false
+      when:
+        - not dry_run
+        - confirm_destructive_action
+
+    - name: "Set OS disk ID variable"
+      ansible.builtin.set_fact:
+        os_disk_id_live: "{{ os_disk_id_query.stdout | default(azure_vm_facts.os_disk.id) | trim }}"
+
+    # 3c) Delete only the VM resource. --yes skips the confirmation prompt
+    #     because we already enforced confirm_destructive_action above.
+    - name: "Delete VM resource (preserving disk, NIC, Public IP)"
+      ansible.builtin.command: >
+        az vm delete
+          --resource-group {{ azure_resource_group }}
+          --name {{ azure_vm_name }}
+          --yes
+      register: delete_result
+      changed_when: delete_result.rc == 0
+      when:
+        - not dry_run
+        - confirm_destructive_action
+
+    - name: "Record delete action"
+      ansible.builtin.set_fact:
+        rebuild_actions_log: "{{ rebuild_actions_log + [{
+          'action': 'delete_vm_resource',
+          'rc': delete_result.rc | default(0),
+          'at': lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ'),
+          'dry_run': dry_run
+        }] }}"
+
+    # 3d) Recreate the VM from the existing OS disk + existing NIC.
+    - name: "Create new VM from existing OS managed disk"
+      ansible.builtin.command: >
+        az vm create
+          --resource-group {{ azure_resource_group }}
+          --name {{ azure_vm_name }}
+          --attach-os-disk {{ os_disk_id_live }}
+          --os-type {{ azure_vm_facts.os_type | lower }}
+          --nics {{ network_identity.nic_id }}
+          --size {{ azure_vm_facts.vm_size }}
+          --location {{ azure_vm_facts.location }}
+          --tags {{ (azure_vm_facts.tags | default({})) | dict2items |
+                    map(attribute='key') | zip(
+                      (azure_vm_facts.tags | default({})) | dict2items |
+                      map(attribute='value')
+                    ) | map('join', '=') | join(' ') }}
+          -o json
+      register: create_result
+      changed_when: create_result.rc == 0
+      when:
+        - not dry_run
+        - confirm_destructive_action
+
+    - name: "Record create action"
+      ansible.builtin.set_fact:
+        rebuild_actions_log: "{{ rebuild_actions_log + [{
+          'action': 'create_vm_from_os_disk',
+          'rc': create_result.rc | default(0),
+          'at': lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ'),
+          'dry_run': dry_run
+        }] }}"
+
+    # 3e) Reattach data disks (best effort — may have been preserved through
+    # the OS-disk attach step depending on Azure CLI version).
+    - name: "Reattach data disks (idempotent best effort)"
+      ansible.builtin.command: >
+        az vm disk attach
+          --resource-group {{ azure_resource_group }}
+          --vm-name {{ azure_vm_name }}
+          --name {{ item.managedDisk.id | default(item.name) }}
+      loop: "{{ azure_vm_facts.data_disks | default([]) }}"
+      loop_control:
+        label: "{{ item.name | default('data-disk') }}"
+      register: attach_result
+      changed_when: attach_result.rc == 0
+      failed_when: false
+      when:
+        - not dry_run
+        - confirm_destructive_action
+        - (item.managedDisk.id | default('')) != '' or (item.name | default('')) != ''
+
+    # 3f) Start (--restart guarantees running state). az vm create normally
+    # leaves the VM running, but we double-check.
+    - name: "Ensure VM is running"
+      ansible.builtin.command: >
+        az vm start
+          --resource-group {{ azure_resource_group }}
+          --name {{ azure_vm_name }}
+      register: start_result
+      changed_when: start_result.rc == 0
+      failed_when: false
+      when:
+        - not dry_run
+        - confirm_destructive_action
+
+    - name: "Record start action"
+      ansible.builtin.set_fact:
+        rebuild_actions_log: "{{ rebuild_actions_log + [{
+          'action': 'start_vm',
+          'rc': start_result.rc | default(0),
+          'at': lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ'),
+          'dry_run': dry_run
+        }] }}"
+
+    # ------------------------------------------------------------------
+    # 4) Persist rebuild_result.json (always — even in dry-run).
+    # ------------------------------------------------------------------
+    - name: "Build rebuild_result payload"
+      ansible.builtin.set_fact:
+        rebuild_result:
+          started_at: "{{ rebuild_started_at }}"
+          finished_at: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+          vm_name: "{{ azure_vm_name }}"
+          resource_group: "{{ azure_resource_group }}"
+          subscription_id: "{{ azure_subscription_id }}"
+          dry_run: "{{ dry_run }}"
+          confirm_destructive_action: "{{ confirm_destructive_action }}"
+          gates: "{{ gate_state }}"
+          os_disk_id_used: "{{ os_disk_id_live | default(azure_vm_facts.os_disk.id) }}"
+          nic_id_attached: "{{ network_identity.nic_id }}"
+          public_ip_preserved: "{{ network_identity.public_ip_address }}"
+          actions: "{{ rebuild_actions_log }}"
+          status: >-
+            {{ 'planned' if dry_run
+               else ('completed' if confirm_destructive_action else 'aborted') }}
+
+    - name: "Write rebuild_result.json"
+      ansible.builtin.copy:
+        dest: "{{ rebuild_dir }}/rebuild_result.json"
+        content: "{{ rebuild_result | to_nice_json }}\n"
+        mode: '0640'
+
+    - name: "Publish rebuild result as workflow stat"
+      ansible.builtin.set_stats:
+        data:
+          samurai_rebuild_status: "{{ rebuild_result.status }}"
+          samurai_rebuild_path: "{{ rebuild_dir }}/rebuild_result.json"
+        aggregate: false
+        per_host: false

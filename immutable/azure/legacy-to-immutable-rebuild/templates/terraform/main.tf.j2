@@ -1,0 +1,170 @@
+################################################################################
+# SamurAI Shield :: Legacy-to-Immutable Rebuild :: generated baseline
+# ------------------------------------------------------------------------------
+# Source VM:   {{ azure_vm_facts.vm_name }}
+# Subscription:{{ azure_vm_facts.subscription_id }}
+# Resource group: {{ azure_vm_facts.resource_group }}
+# Generated at:{{ generated_at }}
+#
+# WARNING: this is a generated baseline. Review every "TODO: review" comment
+# below before running terraform apply against any environment. No secrets,
+# passwords, tokens or private keys are embedded.
+################################################################################
+
+terraform {
+  required_version = ">= 1.5.0"
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "~> 3.110"
+    }
+  }
+  # TODO: review — switch to a remote state backend (azurerm/storage account).
+}
+
+provider "azurerm" {
+  features {}
+  subscription_id = var.subscription_id
+}
+
+# ------------------------------------------------------------------------------
+# Resource group (referenced — the legacy VM lived here).
+# ------------------------------------------------------------------------------
+data "azurerm_resource_group" "this" {
+  name = var.resource_group_name
+}
+
+# ------------------------------------------------------------------------------
+# Existing OS managed disk (preserved by the rebuild flow).
+# ------------------------------------------------------------------------------
+data "azurerm_managed_disk" "os" {
+  name                = var.os_disk_name
+  resource_group_name = data.azurerm_resource_group.this.name
+}
+
+# ------------------------------------------------------------------------------
+# Public IP — preserved (Static).
+# ------------------------------------------------------------------------------
+resource "azurerm_public_ip" "this" {
+  name                = var.public_ip_name
+  resource_group_name = data.azurerm_resource_group.this.name
+  location            = data.azurerm_resource_group.this.location
+  allocation_method   = "Static"
+  sku                 = "{{ network_facts.public_ip.sku | default('Standard') }}"
+
+  tags = var.tags
+}
+
+# ------------------------------------------------------------------------------
+# Network interface — preserved.
+# TODO: review — confirm subnet_id and private IP allocation policy.
+# ------------------------------------------------------------------------------
+resource "azurerm_network_interface" "this" {
+  name                = var.nic_name
+  resource_group_name = data.azurerm_resource_group.this.name
+  location            = data.azurerm_resource_group.this.location
+
+  ip_configuration {
+    name                          = "primary"
+    subnet_id                     = var.subnet_id
+    private_ip_address_allocation = "Static"
+    private_ip_address            = var.private_ip
+    public_ip_address_id          = azurerm_public_ip.this.id
+  }
+
+  tags = var.tags
+}
+
+{% if (network_identity.nsg_id | default('')) != '' %}
+# ------------------------------------------------------------------------------
+# NSG association — the legacy VM had an NSG attached at the NIC level.
+# TODO: review — replicate the NSG rules from baseline/security_facts.json.
+# ------------------------------------------------------------------------------
+resource "azurerm_network_interface_security_group_association" "this" {
+  network_interface_id      = azurerm_network_interface.this.id
+  network_security_group_id = var.nsg_id
+}
+{% endif %}
+
+# ------------------------------------------------------------------------------
+# Virtual machine — attaches the existing OS managed disk.
+# TODO: review — admin_username / SSH keys / WinRM are intentionally absent.
+# This block reuses the existing OS disk so no admin credential is required.
+# Replace with a fresh VM definition only after planning a controlled cutover.
+# ------------------------------------------------------------------------------
+{% if (azure_vm_facts.os_type | lower) == 'linux' %}
+resource "azurerm_linux_virtual_machine" "this" {
+  name                = var.vm_name
+  resource_group_name = data.azurerm_resource_group.this.name
+  location            = data.azurerm_resource_group.this.location
+  size                = var.vm_size
+
+  network_interface_ids = [azurerm_network_interface.this.id]
+
+  os_disk {
+    name                 = data.azurerm_managed_disk.os.name
+    caching              = "{{ azure_vm_facts.os_disk.caching | default('ReadWrite') }}"
+    storage_account_type = "{{ azure_vm_facts.os_disk.sku | default('Premium_LRS') }}"
+    disk_size_gb         = {{ azure_vm_facts.os_disk.disk_size_gb | default(0) }}
+    # TODO: review — managed disk attachment by ID requires importing into
+    # Terraform state or using azurerm_virtual_machine (legacy) for the
+    # `attach` workflow. azurerm_linux_virtual_machine creates a fresh OS
+    # disk by default. For a 1:1 reuse of the existing OS disk, prefer the
+    # `azurerm_virtual_machine` resource block (legacy) or import this
+    # resource and remove the os_disk creation block.
+  }
+
+  # TODO: review — admin_username is required by the provider but unused
+  # when reusing an existing OS disk. Provide a non-secret placeholder.
+  admin_username = var.admin_username
+
+  disable_password_authentication = true
+
+  tags = var.tags
+}
+{% else %}
+resource "azurerm_windows_virtual_machine" "this" {
+  name                = var.vm_name
+  resource_group_name = data.azurerm_resource_group.this.name
+  location            = data.azurerm_resource_group.this.location
+  size                = var.vm_size
+
+  network_interface_ids = [azurerm_network_interface.this.id]
+
+  os_disk {
+    name                 = data.azurerm_managed_disk.os.name
+    caching              = "{{ azure_vm_facts.os_disk.caching | default('ReadWrite') }}"
+    storage_account_type = "{{ azure_vm_facts.os_disk.sku | default('Premium_LRS') }}"
+    disk_size_gb         = {{ azure_vm_facts.os_disk.disk_size_gb | default(0) }}
+    # TODO: review — same caveat as the Linux block: prefer importing the
+    # existing OS disk into state or use the legacy azurerm_virtual_machine
+    # resource for true `attach` semantics.
+  }
+
+  # TODO: review — admin_username is required by the provider. Do NOT set
+  # admin_password here. Inject it via Key Vault / secret backend.
+  admin_username = var.admin_username
+
+  tags = var.tags
+}
+{% endif %}
+
+{% for d in (disk_facts.data_disks | default([])) %}
+{% if (d.managedDisk.id | default('')) != '' %}
+# ------------------------------------------------------------------------------
+# Data disk attachment — {{ d.name }}
+# ------------------------------------------------------------------------------
+data "azurerm_managed_disk" "data_{{ loop.index0 }}" {
+  name                = "{{ d.name }}"
+  resource_group_name = data.azurerm_resource_group.this.name
+}
+
+resource "azurerm_virtual_machine_data_disk_attachment" "data_{{ loop.index0 }}" {
+  managed_disk_id    = data.azurerm_managed_disk.data_{{ loop.index0 }}.id
+  virtual_machine_id = {% if (azure_vm_facts.os_type | lower) == 'linux' %}azurerm_linux_virtual_machine.this.id{% else %}azurerm_windows_virtual_machine.this.id{% endif %}
+
+  lun     = {{ d.lun | default(loop.index0) }}
+  caching = "{{ d.caching | default('ReadWrite') }}"
+}
+{% endif %}
+{% endfor %}

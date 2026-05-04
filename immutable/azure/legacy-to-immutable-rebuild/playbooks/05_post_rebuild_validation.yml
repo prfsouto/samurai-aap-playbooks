@@ -1,0 +1,313 @@
+---
+# ============================================================================
+# SamurAI Shield :: Legacy-to-Immutable Rebuild :: 05 post-rebuild validation
+# ----------------------------------------------------------------------------
+# Read-only step. Verifies the VM was rebuilt successfully and that the
+# preserved attributes (Public IP, Private IP, NIC, OS disk, data disks)
+# survived the operation. Compares the new state with the baseline and
+# emits a diff.
+#
+# Outputs (under {{ artifact_output_dir }}/validation/):
+#   post_rebuild_validation.json
+#   post_rebuild_validation.md
+#   diff_report.json
+# ============================================================================
+
+- name: "SamurAI :: legacy-to-immutable :: post-rebuild validation (Azure side)"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    azure_subscription_id: "{{ azure_subscription_id }}"
+    azure_resource_group: "{{ azure_resource_group }}"
+    azure_vm_name: "{{ azure_vm_name }}"
+    artifact_output_dir: "{{ artifact_output_dir }}"
+    baseline_dir: "{{ artifact_output_dir }}/baseline"
+    validation_dir: "{{ artifact_output_dir }}/validation"
+
+  tasks:
+    - name: "Capture validation timestamps (UTC)"
+      ansible.builtin.set_fact:
+        validation_started_at: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+
+    - name: "Create validation output directory"
+      ansible.builtin.file:
+        path: "{{ validation_dir }}"
+        state: directory
+        mode: '0750'
+
+    - name: "Load baseline azure_vm_facts.json"
+      ansible.builtin.set_fact:
+        baseline_vm: "{{ lookup('file', baseline_dir ~ '/azure_vm_facts.json') | from_json }}"
+
+    - name: "Load baseline network_identity.json"
+      ansible.builtin.set_fact:
+        baseline_net: "{{ lookup('file', baseline_dir ~ '/network_identity.json') | from_json }}"
+
+    - name: "Set Azure CLI subscription context"
+      ansible.builtin.command: >
+        az account set --subscription {{ azure_subscription_id }}
+      changed_when: false
+
+    # ------------------------------------------------------------------
+    # 1. Confirm the VM exists and is running.
+    # ------------------------------------------------------------------
+    - name: "Re-fetch VM (post-rebuild)"
+      ansible.builtin.command: >
+        az vm show
+          --resource-group {{ azure_resource_group }}
+          --name {{ azure_vm_name }}
+          --show-details
+          -o json
+      register: post_vm_show
+      changed_when: false
+      failed_when: post_vm_show.rc != 0
+
+    - name: "Parse post-rebuild VM JSON"
+      ansible.builtin.set_fact:
+        post_vm: "{{ post_vm_show.stdout | from_json }}"
+
+    - name: "Re-fetch primary NIC (post-rebuild)"
+      ansible.builtin.command: >
+        az network nic show --ids {{ (post_vm.networkProfile.networkInterfaces | default([]))[0].id }} -o json
+      register: post_nic_show
+      changed_when: false
+
+    - name: "Parse post-rebuild NIC JSON"
+      ansible.builtin.set_fact:
+        post_nic: "{{ post_nic_show.stdout | from_json }}"
+
+    - name: "Re-fetch Public IP (post-rebuild)"
+      ansible.builtin.command: >
+        az network public-ip show --ids {{ (post_nic.ipConfigurations | default([]))[0].publicIpAddress.id | default('') }} -o json
+      register: post_pip_show
+      changed_when: false
+      when: ((post_nic.ipConfigurations | default([]))[0].publicIpAddress.id | default('')) != ''
+
+    - name: "Parse post-rebuild Public IP JSON"
+      ansible.builtin.set_fact:
+        post_pip: "{{ (post_pip_show.stdout | default('{}')) | from_json }}"
+
+    # ------------------------------------------------------------------
+    # 2. Build validation checks.
+    # ------------------------------------------------------------------
+    - name: "Build per-check validation list"
+      ansible.builtin.set_fact:
+        checks:
+          - name: "vm_exists"
+            expected: "exists"
+            actual: "{{ 'exists' if (post_vm.id | default('')) != '' else 'missing' }}"
+            ok: "{{ (post_vm.id | default('')) != '' }}"
+          - name: "vm_running"
+            expected: "running"
+            actual: "{{ post_vm.powerState | default('unknown') }}"
+            ok: "{{ 'running' in (post_vm.powerState | default('') | lower) }}"
+          - name: "public_ip_preserved"
+            expected: "{{ baseline_net.public_ip_address }}"
+            actual: "{{ post_pip.ipAddress | default('') }}"
+            ok: "{{ (post_pip.ipAddress | default('')) == baseline_net.public_ip_address }}"
+          - name: "private_ip_preserved"
+            expected: "{{ baseline_net.private_ip }}"
+            actual: "{{ (post_nic.ipConfigurations | default([]))[0].privateIpAddress | default('') }}"
+            ok: "{{ ((post_nic.ipConfigurations | default([]))[0].privateIpAddress | default('')) == baseline_net.private_ip }}"
+          - name: "nic_preserved"
+            expected: "{{ baseline_net.nic_id }}"
+            actual: "{{ post_nic.id | default('') }}"
+            ok: "{{ (post_nic.id | default('')) == baseline_net.nic_id }}"
+          - name: "os_disk_preserved"
+            expected: "{{ baseline_vm.os_disk.id }}"
+            actual: "{{ post_vm.storageProfile.osDisk.managedDisk.id | default('') }}"
+            ok: "{{ (post_vm.storageProfile.osDisk.managedDisk.id | default('')) == baseline_vm.os_disk.id }}"
+          - name: "data_disks_count"
+            expected: "{{ baseline_vm.data_disks | length }}"
+            actual: "{{ post_vm.storageProfile.dataDisks | default([]) | length }}"
+            ok: "{{ (post_vm.storageProfile.dataDisks | default([]) | length) == (baseline_vm.data_disks | length) }}"
+
+    - name: "Compute overall validation status"
+      ansible.builtin.set_fact:
+        validation_status: "{{ 'passed' if (checks | rejectattr('ok') | list | length) == 0 else 'failed' }}"
+
+    # ------------------------------------------------------------------
+    # 3. Build a baseline-vs-post diff.
+    # ------------------------------------------------------------------
+    - name: "Build diff_report payload"
+      ansible.builtin.set_fact:
+        diff_report:
+          generated_at: "{{ validation_started_at }}"
+          fields:
+            location:
+              before: "{{ baseline_vm.location }}"
+              after: "{{ post_vm.location | default('unknown') }}"
+            vm_size:
+              before: "{{ baseline_vm.vm_size }}"
+              after: "{{ post_vm.hardwareProfile.vmSize | default('unknown') }}"
+            os_type:
+              before: "{{ baseline_vm.os_type }}"
+              after: "{{ post_vm.storageProfile.osDisk.osType | default('unknown') }}"
+            os_disk_id:
+              before: "{{ baseline_vm.os_disk.id }}"
+              after: "{{ post_vm.storageProfile.osDisk.managedDisk.id | default('unknown') }}"
+            nic_id:
+              before: "{{ baseline_net.nic_id }}"
+              after: "{{ post_nic.id | default('unknown') }}"
+            private_ip:
+              before: "{{ baseline_net.private_ip }}"
+              after: "{{ (post_nic.ipConfigurations | default([]))[0].privateIpAddress | default('unknown') }}"
+            public_ip:
+              before: "{{ baseline_net.public_ip_address }}"
+              after: "{{ post_pip.ipAddress | default('unknown') }}"
+            data_disks_count:
+              before: "{{ baseline_vm.data_disks | length }}"
+              after: "{{ post_vm.storageProfile.dataDisks | default([]) | length }}"
+            tags:
+              before: "{{ baseline_vm.tags | default({}) }}"
+              after: "{{ post_vm.tags | default({}) }}"
+
+    - name: "Add post host to dynamic inventory for connectivity test"
+      ansible.builtin.add_host:
+        name: "{{ target_host }}"
+        groups: samurai_legacy_post_target
+        ansible_user: "{{ ssh_username | default(winrm_username) | default(omit) }}"
+        ansible_connection: "{{ 'winrm' if (os_connection_type | default('ssh')) == 'winrm' else 'ssh' }}"
+      changed_when: false
+      when:
+        - target_host is defined
+        - (target_host | trim) != ''
+
+    - name: "Persist intermediate validation_payload (used by next play)"
+      ansible.builtin.copy:
+        dest: "{{ validation_dir }}/.validation_payload.json"
+        mode: '0640'
+        content: "{{ {
+          'started_at': validation_started_at,
+          'vm_name': azure_vm_name,
+          'resource_group': azure_resource_group,
+          'subscription_id': azure_subscription_id,
+          'checks': checks,
+          'azure_status': validation_status,
+          'diff_report': diff_report
+        } | to_nice_json }}\n"
+
+
+- name: "SamurAI :: legacy-to-immutable :: post-rebuild validation (OS side)"
+  hosts: samurai_legacy_post_target
+  gather_facts: true
+  become: "{{ (os_connection_type | default('ssh')) == 'ssh' }}"
+  ignore_unreachable: true
+  vars:
+    validation_dir: "{{ hostvars['localhost'].validation_dir }}"
+
+  tasks:
+    - name: "Linux :: collect failed services post-rebuild"
+      ansible.builtin.command: systemctl --failed --no-pager --no-legend
+      register: post_failed_units
+      changed_when: false
+      failed_when: false
+      when: ansible_system == 'Linux'
+
+    - name: "Linux :: collect listening ports post-rebuild"
+      ansible.builtin.shell: |
+        set -o pipefail
+        ss -tulnp 2>/dev/null || netstat -tulnp 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      register: post_ports
+      changed_when: false
+      failed_when: false
+      when: ansible_system == 'Linux'
+
+    - name: "Build os_post_rebuild payload"
+      ansible.builtin.set_fact:
+        os_post_rebuild:
+          reachable: true
+          hostname: "{{ ansible_hostname | default('unknown') }}"
+          fqdn: "{{ ansible_fqdn | default('unknown') }}"
+          os_family: "{{ ansible_os_family | default('unknown') }}"
+          kernel: "{{ ansible_kernel | default('unknown') }}"
+          failed_services: "{{ post_failed_units.stdout_lines | default([]) }}"
+          listening_ports: "{{ post_ports.stdout | default('') }}"
+
+    - name: "Save os_post_rebuild on controller"
+      ansible.builtin.copy:
+        dest: "{{ validation_dir }}/.os_post_rebuild.json"
+        mode: '0640'
+        content: "{{ os_post_rebuild | to_nice_json }}\n"
+      delegate_to: localhost
+      become: false
+
+
+- name: "SamurAI :: legacy-to-immutable :: emit final validation reports"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    validation_dir: "{{ artifact_output_dir }}/validation"
+
+  tasks:
+    - name: "Reload validation payload"
+      ansible.builtin.set_fact:
+        validation_payload: "{{ lookup('file', validation_dir ~ '/.validation_payload.json') | from_json }}"
+
+    - name: "Stat OS post-rebuild fragment"
+      ansible.builtin.stat:
+        path: "{{ validation_dir }}/.os_post_rebuild.json"
+      register: os_post_stat
+
+    - name: "Load OS post-rebuild fragment when present"
+      ansible.builtin.set_fact:
+        os_post_rebuild: "{{ lookup('file', validation_dir ~ '/.os_post_rebuild.json') | from_json }}"
+      when: os_post_stat.stat.exists
+
+    - name: "Build consolidated post_rebuild_validation payload"
+      ansible.builtin.set_fact:
+        post_rebuild_validation:
+          generated_at: "{{ validation_payload.started_at }}"
+          vm_name: "{{ validation_payload.vm_name }}"
+          resource_group: "{{ validation_payload.resource_group }}"
+          subscription_id: "{{ validation_payload.subscription_id }}"
+          azure_checks: "{{ validation_payload.checks }}"
+          azure_status: "{{ validation_payload.azure_status }}"
+          os_reachable: "{{ os_post_stat.stat.exists }}"
+          os_post_rebuild: "{{ os_post_rebuild | default({}) }}"
+          overall_status: >-
+            {{ 'passed' if (validation_payload.azure_status == 'passed' and os_post_stat.stat.exists)
+               else ('partial' if validation_payload.azure_status == 'passed' else 'failed') }}
+
+    - name: "Write post_rebuild_validation.json"
+      ansible.builtin.copy:
+        dest: "{{ validation_dir }}/post_rebuild_validation.json"
+        content: "{{ post_rebuild_validation | to_nice_json }}\n"
+        mode: '0640'
+
+    - name: "Write diff_report.json"
+      ansible.builtin.copy:
+        dest: "{{ validation_dir }}/diff_report.json"
+        content: "{{ validation_payload.diff_report | to_nice_json }}\n"
+        mode: '0640'
+
+    - name: "Render post_rebuild_validation.md from template"
+      ansible.builtin.template:
+        src: "../templates/reports/post_rebuild_validation.md.j2"
+        dest: "{{ validation_dir }}/post_rebuild_validation.md"
+        mode: '0640'
+
+    - name: "Cleanup intermediate fragments"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ validation_dir }}/.validation_payload.json"
+        - "{{ validation_dir }}/.os_post_rebuild.json"
+
+    - name: "Publish validation summary as workflow stat"
+      ansible.builtin.set_stats:
+        data:
+          samurai_validation_status: "{{ post_rebuild_validation.overall_status }}"
+          samurai_validation_path: "{{ validation_dir }}/post_rebuild_validation.json"
+        aggregate: false
+        per_host: false
+
+    - name: "Fail when overall validation did not pass"
+      ansible.builtin.fail:
+        msg: >-
+          Post-rebuild validation status: {{ post_rebuild_validation.overall_status }}.
+          See {{ validation_dir }}/post_rebuild_validation.md for details.
+      when: post_rebuild_validation.overall_status == 'failed'

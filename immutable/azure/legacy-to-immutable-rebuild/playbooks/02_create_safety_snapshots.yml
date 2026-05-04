@@ -1,0 +1,157 @@
+---
+# ============================================================================
+# SamurAI Shield :: Legacy-to-Immutable Rebuild :: 02 safety snapshots
+# ----------------------------------------------------------------------------
+# Mutating step. Creates Azure managed-disk snapshots for the OS disk and
+# every data disk attached to the VM, BEFORE any destructive operation.
+#
+# Snapshot naming: samurai-<vm_name>-<disk_name>-<timestamp>
+#
+# This step is MANDATORY before step 4 (rebuild). Step 4 inspects
+# snapshots.json and refuses to proceed if any snapshot is missing.
+#
+# Output: {{ artifact_output_dir }}/snapshots/snapshots.json
+# ============================================================================
+
+- name: "SamurAI :: legacy-to-immutable :: create safety snapshots"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    azure_subscription_id: "{{ azure_subscription_id }}"
+    azure_resource_group: "{{ azure_resource_group }}"
+    azure_vm_name: "{{ azure_vm_name }}"
+    artifact_output_dir: "{{ artifact_output_dir }}"
+    snapshots_dir: "{{ artifact_output_dir }}/snapshots"
+    baseline_dir: "{{ artifact_output_dir }}/baseline"
+
+  tasks:
+    - name: "Validate baseline disk_facts.json exists"
+      ansible.builtin.stat:
+        path: "{{ baseline_dir }}/disk_facts.json"
+      register: disk_facts_stat
+
+    - name: "Fail when baseline is missing"
+      ansible.builtin.fail:
+        msg: >-
+          Baseline not found at {{ baseline_dir }}/disk_facts.json.
+          Run 01_collect_azure_vm_baseline.yml first.
+      when: not disk_facts_stat.stat.exists
+
+    - name: "Load disk_facts.json"
+      ansible.builtin.set_fact:
+        disk_facts: "{{ lookup('file', baseline_dir ~ '/disk_facts.json') | from_json }}"
+
+    - name: "Capture snapshot timestamps (UTC)"
+      ansible.builtin.set_fact:
+        snapshot_started_at: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+        snapshot_timestamp: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+
+    - name: "Create snapshots output directory"
+      ansible.builtin.file:
+        path: "{{ snapshots_dir }}"
+        state: directory
+        mode: '0750'
+
+    - name: "Set Azure CLI subscription context"
+      ansible.builtin.command: >
+        az account set --subscription {{ azure_subscription_id }}
+      changed_when: false
+
+    # ------------------------------------------------------------------
+    # Build a flat list of disks to snapshot (OS first, then each data
+    # disk). Each entry: { role, name, id }.
+    # ------------------------------------------------------------------
+    - name: "Initialise disks-to-snapshot list with OS disk"
+      ansible.builtin.set_fact:
+        disks_to_snapshot:
+          - role: "os"
+            name: "{{ disk_facts.os_disk.name }}"
+            id: "{{ disk_facts.os_disk.id }}"
+
+    - name: "Append each data disk to disks-to-snapshot list"
+      ansible.builtin.set_fact:
+        disks_to_snapshot: >-
+          {{ disks_to_snapshot + [{
+               'role': 'data',
+               'name': item.name,
+               'id': item.managedDisk.id
+             }] }}
+      loop: "{{ disk_facts.data_disks | default([]) }}"
+      loop_control:
+        label: "{{ item.name | default('unnamed-data-disk') }}"
+      when:
+        - item.name is defined
+        - item.managedDisk is defined
+        - (item.managedDisk.id | default('')) != ''
+
+    - name: "Fail when OS disk ID is missing"
+      ansible.builtin.fail:
+        msg: "OS disk ID is empty in disk_facts.json — cannot snapshot."
+      when: (disks_to_snapshot[0].id | default('')) == ''
+
+    - name: "Show disks selected for snapshot"
+      ansible.builtin.debug:
+        msg: >-
+          Will snapshot {{ disks_to_snapshot | length }} disk(s):
+          {{ disks_to_snapshot | map(attribute='name') | list }}
+
+    # ------------------------------------------------------------------
+    # Snapshot creation loop. One az CLI invocation per disk.
+    # ------------------------------------------------------------------
+    - name: "Create snapshot for each disk"
+      ansible.builtin.command: >
+        az snapshot create
+          --resource-group {{ azure_resource_group }}
+          --name samurai-{{ azure_vm_name }}-{{ item.name }}-{{ snapshot_timestamp }}
+          --source {{ item.id }}
+          -o json
+      register: snapshot_create
+      loop: "{{ disks_to_snapshot }}"
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: snapshot_create.rc == 0
+
+    - name: "Build snapshot results list"
+      ansible.builtin.set_fact:
+        snapshot_results: >-
+          {{
+            (snapshot_results | default([])) + [{
+              'role': item.item.role,
+              'source_disk_name': item.item.name,
+              'source_disk_id': item.item.id,
+              'snapshot_name': 'samurai-' ~ azure_vm_name ~ '-' ~ item.item.name ~ '-' ~ snapshot_timestamp,
+              'snapshot_id': (item.stdout | from_json).id,
+              'created_at': snapshot_started_at
+            }]
+          }}
+      loop: "{{ snapshot_create.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    - name: "Verify every target disk produced a snapshot"
+      ansible.builtin.fail:
+        msg: >-
+          Snapshot count ({{ (snapshot_results | default([])) | length }}) does
+          not match disk count ({{ disks_to_snapshot | length }}). Refusing
+          to proceed — rerun this playbook before step 4.
+      when: ((snapshot_results | default([])) | length) != (disks_to_snapshot | length)
+
+    - name: "Write snapshots.json"
+      ansible.builtin.copy:
+        dest: "{{ snapshots_dir }}/snapshots.json"
+        mode: '0640'
+        content: "{{ {
+          'collected_at': snapshot_started_at,
+          'vm_name': azure_vm_name,
+          'resource_group': azure_resource_group,
+          'subscription_id': azure_subscription_id,
+          'snapshots': snapshot_results
+        } | to_nice_json }}\n"
+
+    - name: "Publish snapshots summary as workflow stat"
+      ansible.builtin.set_stats:
+        data:
+          samurai_snapshots_count: "{{ snapshot_results | length }}"
+          samurai_snapshots_path: "{{ snapshots_dir }}/snapshots.json"
+        aggregate: false
+        per_host: false

@@ -1,0 +1,88 @@
+################################################################################
+# SamurAI Shield :: Legacy-to-Immutable Rebuild :: generated baseline
+# variables.tf — declared inputs, no secrets.
+################################################################################
+
+variable "subscription_id" {
+  description = "Azure subscription ID where the VM lives."
+  type        = string
+}
+
+variable "resource_group_name" {
+  description = "Resource group of the legacy VM."
+  type        = string
+  default     = "{{ azure_vm_facts.resource_group }}"
+}
+
+variable "vm_name" {
+  description = "Name of the (re)built VM."
+  type        = string
+  default     = "{{ azure_vm_facts.vm_name }}"
+}
+
+variable "vm_size" {
+  description = "Azure VM size (e.g. Standard_B2s)."
+  type        = string
+  default     = "{{ azure_vm_facts.vm_size }}"
+}
+
+variable "os_disk_name" {
+  description = "Name of the existing OS managed disk to reuse."
+  type        = string
+  default     = "{{ azure_vm_facts.os_disk.name }}"
+}
+
+variable "public_ip_name" {
+  description = "Name of the preserved Public IP."
+  type        = string
+  default     = "{{ network_facts.public_ip.name }}"
+}
+
+variable "nic_name" {
+  description = "Name of the preserved NIC."
+  type        = string
+  default     = "{{ network_facts.nic.name }}"
+}
+
+variable "subnet_id" {
+  description = "Subnet ID where the NIC is attached. TODO: review."
+  type        = string
+  default     = "{{ network_facts.nic.subnet_id }}"
+}
+
+variable "private_ip" {
+  description = "Static private IP address of the NIC."
+  type        = string
+  default     = "{{ network_facts.nic.private_ip }}"
+}
+
+{% if (network_identity.nsg_id | default('')) != '' %}
+variable "nsg_id" {
+  description = "Network Security Group ID associated with the NIC. TODO: review rules."
+  type        = string
+  default     = "{{ network_identity.nsg_id }}"
+}
+{% endif %}
+
+variable "admin_username" {
+  description = <<EOT
+    Required by azurerm_(linux|windows)_virtual_machine. The legacy OS disk
+    is reused as-is, so this value is effectively unused at create time.
+    Provide a non-secret placeholder; never set admin_password here.
+    TODO: review.
+  EOT
+  type    = string
+  default = "samurai-shield"
+}
+
+variable "tags" {
+  description = "Tags applied to all created/managed resources."
+  type        = map(string)
+  default     = {
+{% for k, v in (azure_vm_facts.tags | default({})).items() %}
+    "{{ k }}" = "{{ v | replace('\"', '\\\"') }}"
+{% endfor %}
+    "samurai_shield_origin" = "legacy-to-immutable-rebuild"
+    "samurai_shield_baseline_at" = "{{ generated_at }}"
+  }
+}

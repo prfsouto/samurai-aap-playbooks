@@ -1,0 +1,97 @@
+# Baseline Validation Report — {{ azure_vm_facts.vm_name }}
+
+**Generated at (UTC):** {{ execution_started_at }}
+**Subscription:** `{{ azure_vm_facts.subscription_id }}`
+**Resource group:** `{{ azure_vm_facts.resource_group }}`
+**Flow:** SamurAI Shield :: Legacy-to-Immutable Rebuild
+
+---
+
+## VM identity
+
+| Attribute       | Value |
+| --------------- | ----- |
+| VM name         | `{{ azure_vm_facts.vm_name }}` |
+| VM ID           | `{{ azure_vm_facts.vm_id }}` |
+| Location        | `{{ azure_vm_facts.location }}` |
+| Size            | `{{ azure_vm_facts.vm_size }}` |
+| OS type         | `{{ azure_vm_facts.os_type }}` |
+| Power state     | `{{ azure_vm_facts.power_state }}` |
+| Availability zone | `{{ azure_vm_facts.availability_zone | default('—') }}` |
+
+## OS disk
+
+| Attribute       | Value |
+| --------------- | ----- |
+| Name            | `{{ azure_vm_facts.os_disk.name }}` |
+| ID              | `{{ azure_vm_facts.os_disk.id }}` |
+| Caching         | `{{ azure_vm_facts.os_disk.caching }}` |
+| SKU             | `{{ azure_vm_facts.os_disk.sku }}` |
+| Size (GiB)      | `{{ azure_vm_facts.os_disk.disk_size_gb }}` |
+
+## Data disks ({{ azure_vm_facts.data_disks | length }})
+
+{% if (azure_vm_facts.data_disks | length) == 0 %}
+_None._
+{% else %}
+| LUN | Name | Size (GiB) | Caching | SKU |
+| --- | ---- | ---------- | ------- | --- |
+{% for d in azure_vm_facts.data_disks %}
+| {{ d.lun | default('—') }} | `{{ d.name | default('—') }}` | {{ d.diskSizeGb | default('—') }} | {{ d.caching | default('—') }} | {{ (d.managedDisk.storageAccountType) | default('—') }} |
+{% endfor %}
+{% endif %}
+
+## Network
+
+| Attribute       | Value |
+| --------------- | ----- |
+| NIC name        | `{{ network_facts.nic.name }}` |
+| NIC ID          | `{{ network_facts.nic.id }}` |
+| Private IP      | `{{ network_facts.nic.private_ip }}` |
+| Subnet ID       | `{{ network_facts.nic.subnet_id }}` |
+| NSG ID          | `{{ network_facts.nic.nsg_id | default('—') }}` |
+| Public IP       | `{{ network_facts.public_ip.address | default('—') }}` |
+| Public IP alloc | `{{ network_facts.public_ip.allocation_method | default('—') }}` |
+| Public IP SKU   | `{{ network_facts.public_ip.sku | default('—') }}` |
+
+## Tags
+
+{% if (azure_vm_facts.tags | default({})) | length == 0 %}
+_None._
+{% else %}
+| Key | Value |
+| --- | ----- |
+{% for k, v in azure_vm_facts.tags.items() %}
+| `{{ k }}` | `{{ v }}` |
+{% endfor %}
+{% endif %}
+
+## VM extensions
+
+{% if (security_facts.extensions | default([])) | length == 0 %}
+_None._
+{% else %}
+| Name | Publisher | Type | Version |
+| ---- | --------- | ---- | ------- |
+{% for e in security_facts.extensions %}
+| `{{ e.name }}` | `{{ e.publisher }}` | `{{ e.typePropertiesType | default(e.virtualMachineExtensionType) | default('—') }}` | `{{ e.typeHandlerVersion | default('—') }}` |
+{% endfor %}
+{% endif %}
+
+## OS-level summary
+
+{% if os_facts is defined %}
+- Hostname: `{{ os_facts.hostname }}`
+- FQDN: `{{ os_facts.fqdn }}`
+- Family: `{{ os_facts.os_family }}`
+- Distribution: `{{ os_facts.distribution }} {{ os_facts.distribution_version }}`
+- Kernel: `{{ os_facts.kernel }}`
+- Architecture: `{{ os_facts.architecture }}`
+{% else %}
+_OS-level facts were not collected (target host unreachable or skipped)._
+{% endif %}
+
+---
+
+> This report is the input for steps 2 → 7 of the Legacy-to-Immutable
+> Rebuild flow. It is committed to Git by step 7.

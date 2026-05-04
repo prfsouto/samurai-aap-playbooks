@@ -1,0 +1,166 @@
+---
+# ============================================================================
+# SamurAI Shield :: Legacy-to-Immutable Rebuild :: AAP Workflow Template
+# ----------------------------------------------------------------------------
+# Declarative description of the workflow that the SamurAI Shield control
+# plane must invoke on Ansible Automation Platform. This file is the source
+# of truth for the AAP Workflow Template definition — it can be imported via
+# `awx import` / `ansible.controller.workflow_job_template` or used as
+# documentation when building the Workflow visually.
+#
+# Each node maps 1:1 to a playbook in ./playbooks/. Edges describe the
+# success path; on_failure is set to halt the workflow because every step is
+# either read-only, mutating-with-rollback (snapshots, Git) or destructive
+# (rebuild) and there is no safe automatic recovery.
+# ============================================================================
+
+name: "SamurAI :: Legacy-to-Immutable Rebuild (Azure)"
+description: >-
+  Converts a brownfield Azure VM into a governed, validated and IaC-ready
+  asset. Read-only baseline → snapshots → identity preservation →
+  destructive-gated rebuild → post-rebuild validation → Terraform generation
+  → Git commit.
+
+# ---------------------------------------------------------------------------
+# Inputs the workflow expects from SamurAI Shield (extra_vars).
+# ---------------------------------------------------------------------------
+inputs:
+  required:
+    - managed_server_id
+    - cloud_provider           # must be "azure"
+    - azure_subscription_id
+    - azure_resource_group
+    - azure_vm_name
+    - artifact_output_dir
+    - target_host
+    - os_connection_type       # ssh | winrm
+  optional:
+    - git_repo_url
+    - git_branch
+    - dry_run                  # default true
+    - confirm_destructive_action  # default false
+    - ssh_username
+    - winrm_username
+
+# ---------------------------------------------------------------------------
+# Workflow nodes (executed sequentially in the order below).
+# ---------------------------------------------------------------------------
+nodes:
+
+  - id: collect_baseline
+    name: "1. Collect Azure VM Baseline"
+    playbook: "playbooks/01_collect_azure_vm_baseline.yml"
+    classification: "read-only"
+    description: >-
+      Gathers Azure resource facts (VM, disks, NIC, public IP, NSG, tags,
+      extensions) and OS-level facts (hostname, packages, services, ports).
+      Writes baseline/*.json and baseline/validation_report.md.
+    on_success: create_snapshots
+    on_failure: halt
+
+  - id: create_snapshots
+    name: "2. Create Safety Snapshots"
+    playbook: "playbooks/02_create_safety_snapshots.yml"
+    classification: "mutating"
+    description: >-
+      Creates Azure snapshots of the OS disk and every data disk. Names
+      follow samurai-<vm>-<disk>-<timestamp>. Fails fast if any snapshot
+      cannot be created — the workflow never proceeds to rebuild without
+      a complete snapshot set.
+    on_success: preserve_network
+    on_failure: halt
+
+  - id: preserve_network
+    name: "3. Preserve Network Identity"
+    playbook: "playbooks/03_preserve_network_identity.yml"
+    classification: "read-only"
+    description: >-
+      Validates that the Public IP is Static and captures NIC, IP, subnet,
+      VNet and NSG identifiers into network_identity.json. Does not mutate
+      networking — only validates and records.
+    on_success: rebuild_vm
+    on_failure: halt
+
+  - id: rebuild_vm
+    name: "4. Rebuild VM From Existing OS Disk"
+    playbook: "playbooks/04_rebuild_vm_from_existing_os_disk.yml"
+    classification: "destructive-gated"
+    description: >-
+      Stops and deallocates the VM, deletes the VM resource (preserving
+      OS disk, NIC and Public IP) and recreates a new VM that attaches the
+      same OS disk and NIC. Honours dry_run and confirm_destructive_action.
+      Every destructive call is gated.
+    requires:
+      - dry_run: "exists"
+      - confirm_destructive_action: "true (when dry_run=false)"
+    on_success: validate_rebuild
+    on_failure: halt
+
+  - id: validate_rebuild
+    name: "5. Post Rebuild Validation"
+    playbook: "playbooks/05_post_rebuild_validation.yml"
+    classification: "read-only"
+    description: >-
+      Verifies VM is running, IP/NIC/disk preserved, OS reachable and
+      services up. Compares before/after baseline and produces a diff.
+    on_success: generate_terraform
+    on_failure: halt
+
+  - id: generate_terraform
+    name: "6. Generate Terraform From VM"
+    playbook: "playbooks/06_generate_terraform_from_vm.yml"
+    classification: "read-only"
+    description: >-
+      Renders main.tf / variables.tf / outputs.tf / terraform.tfvars.example
+      from the collected facts. Output is marked "generated baseline" and
+      must be reviewed before use in production.
+    on_success: commit_artifacts
+    on_failure: halt
+
+  - id: commit_artifacts
+    name: "7. Commit Artifacts To Git"
+    playbook: "playbooks/07_commit_artifacts_to_git.yml"
+    classification: "mutating (Git)"
+    description: >-
+      Pushes baseline, snapshots, rebuild result, validation, and the
+      generated Terraform to the SamurAI Shield evidence repository at
+      inventory/managed-servers/<managed_server_id>-<azure_vm_name>/.
+    on_success: end
+    on_failure: halt
+
+# ---------------------------------------------------------------------------
+# Step classifications, summarised for the SamurAI Shield UI.
+# ---------------------------------------------------------------------------
+classifications:
+  read_only:
+    - collect_baseline
+    - preserve_network
+    - validate_rebuild
+    - generate_terraform
+  mutating:
+    - create_snapshots
+    - commit_artifacts
+  destructive_gated:
+    - rebuild_vm
+
+# ---------------------------------------------------------------------------
+# Outputs surfaced to the SamurAI Shield workflow history.
+# ---------------------------------------------------------------------------
+outputs:
+  - artifact_output_dir/baseline/azure_vm_facts.json
+  - artifact_output_dir/baseline/os_facts.json
+  - artifact_output_dir/baseline/network_facts.json
+  - artifact_output_dir/baseline/disk_facts.json
+  - artifact_output_dir/baseline/security_facts.json
+  - artifact_output_dir/baseline/network_identity.json
+  - artifact_output_dir/baseline/validation_report.md
+  - artifact_output_dir/snapshots/snapshots.json
+  - artifact_output_dir/rebuild/rebuild_result.json
+  - artifact_output_dir/validation/post_rebuild_validation.json
+  - artifact_output_dir/validation/post_rebuild_validation.md
+  - artifact_output_dir/validation/diff_report.json
+  - artifact_output_dir/generated-iac/main.tf
+  - artifact_output_dir/generated-iac/variables.tf
+  - artifact_output_dir/generated-iac/outputs.tf
+  - artifact_output_dir/generated-iac/terraform.tfvars.example
+  - artifact_output_dir/generated-iac/README.md
