@@ -1,0 +1,59 @@
+---
+# ============================================================================
+# SamurAI Shield :: Legacy-to-Immutable Rebuild :: sample extra_vars
+# ----------------------------------------------------------------------------
+# Copy this file as a launch-time extra-vars payload for the AAP Workflow
+# Template. Replace every placeholder enclosed in <...>. Never commit a
+# populated copy of this file with real subscription IDs, Git tokens or
+# credentials — it is only an example.
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# SamurAI Shield context
+# ---------------------------------------------------------------------------
+managed_server_id: 123
+cloud_provider: azure
+
+# ---------------------------------------------------------------------------
+# Azure target
+# ---------------------------------------------------------------------------
+azure_subscription_id: "<subscription-id>"
+azure_resource_group: "<resource-group>"
+azure_vm_name: "<vm-name>"
+
+# ---------------------------------------------------------------------------
+# OS-level access (used by step 1 baseline + step 5 post-rebuild validation)
+# ---------------------------------------------------------------------------
+# os_connection_type must be "ssh" (Linux) or "winrm" (Windows).
+os_connection_type: "ssh"
+target_host: "<public-ip-or-dns>"
+
+# Linux only — username for SSH. Key/password is provided by the AAP Machine
+# credential, never in this file.
+ssh_username: "<user>"
+
+# Windows only — uncomment when os_connection_type=winrm.
+# winrm_username: "<user>"
+
+# ---------------------------------------------------------------------------
+# Artifact + Git output
+# ---------------------------------------------------------------------------
+# Local working directory on the AAP execution environment. Each step writes
+# its outputs under this path; step 7 then pushes them to Git.
+artifact_output_dir: "/tmp/samurai/legacy-to-immutable-rebuild/<vm-name>"
+
+git_repo_url: "https://github.com/<org>/<repo>.git"
+git_branch: "main"
+# git_token is intentionally NOT set here. It must come from an AAP Source
+# Control credential or from the GIT_TOKEN env-var.
+
+# ---------------------------------------------------------------------------
+# Safety gates
+# ---------------------------------------------------------------------------
+# dry_run=true makes step 4 print the planned actions without mutating Azure.
+# Always run with dry_run=true at least once before flipping it.
+dry_run: true
+
+# confirm_destructive_action MUST be true to allow step 4 to delete the VM
+# resource. Any other value aborts the workflow before any destructive call.
+confirm_destructive_action: false

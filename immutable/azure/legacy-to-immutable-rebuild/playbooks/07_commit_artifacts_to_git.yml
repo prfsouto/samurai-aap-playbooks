@@ -1,0 +1,211 @@
+---
+# ============================================================================
+# SamurAI Shield :: Legacy-to-Immutable Rebuild :: 07 commit artifacts
+# ----------------------------------------------------------------------------
+# Mutating step (Git only). Pushes the artifacts produced by all previous
+# steps to the SamurAI Shield evidence repository, under:
+#
+#   inventory/managed-servers/<managed_server_id>-<azure_vm_name>/
+#       baseline/
+#       snapshots/
+#       rebuild/
+#       validation/
+#       generated-iac/
+#
+# Inputs (extra_vars):
+#   git_repo_url, git_branch, managed_server_id, azure_vm_name,
+#   artifact_output_dir
+#   git_token (optional — preferred via AAP credential / env GIT_TOKEN)
+#
+# Security:
+#   - The token is only used in-memory to build a one-time push URL and is
+#     redacted from logs (no_log on every task that touches it).
+#   - The token is NOT written to disk, JSON, Markdown or Terraform.
+#   - Local git config is scoped to the cloned working copy only.
+# ============================================================================
+
+- name: "SamurAI :: legacy-to-immutable :: commit artifacts to Git"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    artifact_output_dir: "{{ artifact_output_dir }}"
+    managed_server_id: "{{ managed_server_id }}"
+    azure_vm_name: "{{ azure_vm_name }}"
+    git_repo_url: "{{ git_repo_url }}"
+    git_branch: "{{ git_branch | default('main') }}"
+    # The token can come from extra_vars (AAP credential injection) or from
+    # the GIT_TOKEN env var. Default to empty — anonymous push will fail
+    # cleanly if no token is provided.
+    git_token_resolved: "{{ git_token | default(lookup('env', 'GIT_TOKEN')) | default('') }}"
+    git_workdir: "/tmp/samurai-aap-git/{{ managed_server_id }}-{{ azure_vm_name }}"
+    target_subpath: "inventory/managed-servers/{{ managed_server_id }}-{{ azure_vm_name }}"
+
+  tasks:
+    - name: "Validate required extra-vars are present"
+      ansible.builtin.fail:
+        msg: "Required extra-var '{{ item }}' is missing."
+      when: vars[item] is not defined or (vars[item] | string | trim) == ''
+      loop:
+        - artifact_output_dir
+        - managed_server_id
+        - azure_vm_name
+        - git_repo_url
+
+    - name: "Verify artifact source directory exists"
+      ansible.builtin.stat:
+        path: "{{ artifact_output_dir }}"
+      register: src_stat
+
+    - name: "Fail when artifact_output_dir does not exist"
+      ansible.builtin.fail:
+        msg: "artifact_output_dir {{ artifact_output_dir }} not found."
+      when: not src_stat.stat.exists
+
+    - name: "Reset Git workdir"
+      ansible.builtin.file:
+        path: "{{ git_workdir }}"
+        state: absent
+
+    - name: "Recreate Git workdir"
+      ansible.builtin.file:
+        path: "{{ git_workdir }}"
+        state: directory
+        mode: '0750'
+
+    # ------------------------------------------------------------------
+    # Build an authenticated clone URL in-memory. The credential never
+    # touches disk and is redacted from logs.
+    # ------------------------------------------------------------------
+    - name: "Build authenticated remote URL (in-memory only)"
+      ansible.builtin.set_fact:
+        git_remote_authed: >-
+          {{
+            git_repo_url
+              | regex_replace('^https://',
+                              'https://oauth2:' ~ git_token_resolved ~ '@')
+            if (git_token_resolved | length) > 0
+            else git_repo_url
+          }}
+      no_log: true
+
+    - name: "Clone repository (shallow)"
+      ansible.builtin.command:
+        cmd: "git clone --depth 1 --branch {{ git_branch }} {{ git_remote_authed }} ."
+        chdir: "{{ git_workdir }}"
+      register: clone_result
+      changed_when: clone_result.rc == 0
+      no_log: true
+
+    - name: "Configure local Git identity (scoped to this clone only)"
+      ansible.builtin.command:
+        cmd: "{{ item }}"
+        chdir: "{{ git_workdir }}"
+      loop:
+        - git config user.email "samurai-shield@bot.invalid"
+        - git config user.name  "SamurAI Shield Bot"
+      changed_when: false
+
+    - name: "Ensure target subpath exists in working copy"
+      ansible.builtin.file:
+        path: "{{ git_workdir }}/{{ target_subpath }}"
+        state: directory
+        mode: '0750'
+
+    # ------------------------------------------------------------------
+    # Copy artifacts into the working copy.
+    # ------------------------------------------------------------------
+    - name: "Copy baseline/ into working copy"
+      ansible.posix.synchronize:
+        src: "{{ artifact_output_dir }}/baseline/"
+        dest: "{{ git_workdir }}/{{ target_subpath }}/baseline/"
+        delete: false
+        recursive: true
+      delegate_to: localhost
+
+    - name: "Copy snapshots/ into working copy"
+      ansible.posix.synchronize:
+        src: "{{ artifact_output_dir }}/snapshots/"
+        dest: "{{ git_workdir }}/{{ target_subpath }}/snapshots/"
+        delete: false
+        recursive: true
+      delegate_to: localhost
+      failed_when: false
+
+    - name: "Copy rebuild/ into working copy"
+      ansible.posix.synchronize:
+        src: "{{ artifact_output_dir }}/rebuild/"
+        dest: "{{ git_workdir }}/{{ target_subpath }}/rebuild/"
+        delete: false
+        recursive: true
+      delegate_to: localhost
+      failed_when: false
+
+    - name: "Copy validation/ into working copy"
+      ansible.posix.synchronize:
+        src: "{{ artifact_output_dir }}/validation/"
+        dest: "{{ git_workdir }}/{{ target_subpath }}/validation/"
+        delete: false
+        recursive: true
+      delegate_to: localhost
+      failed_when: false
+
+    - name: "Copy generated-iac/ into working copy"
+      ansible.posix.synchronize:
+        src: "{{ artifact_output_dir }}/generated-iac/"
+        dest: "{{ git_workdir }}/{{ target_subpath }}/generated-iac/"
+        delete: false
+        recursive: true
+      delegate_to: localhost
+      failed_when: false
+
+    # ------------------------------------------------------------------
+    # Commit + push.
+    # ------------------------------------------------------------------
+    - name: "Stage changes"
+      ansible.builtin.command:
+        cmd: "git add {{ target_subpath }}"
+        chdir: "{{ git_workdir }}"
+      changed_when: false
+
+    - name: "Detect whether there are changes to commit"
+      ansible.builtin.command:
+        cmd: "git status --porcelain"
+        chdir: "{{ git_workdir }}"
+      register: git_status
+      changed_when: false
+
+    - name: "Commit changes"
+      ansible.builtin.command:
+        cmd: 'git commit -m "Add legacy Azure VM rebuild baseline for {{ azure_vm_name }}"'
+        chdir: "{{ git_workdir }}"
+      when: (git_status.stdout | trim) != ''
+      register: commit_result
+      changed_when: commit_result.rc == 0
+
+    - name: "Push to remote"
+      ansible.builtin.command:
+        cmd: "git push origin {{ git_branch }}"
+        chdir: "{{ git_workdir }}"
+      when: (git_status.stdout | trim) != ''
+      register: push_result
+      changed_when: push_result.rc == 0
+      no_log: true
+
+    - name: "Publish commit summary as workflow stat"
+      ansible.builtin.set_stats:
+        data:
+          samurai_git_committed: "{{ (git_status.stdout | trim) != '' }}"
+          samurai_git_target_subpath: "{{ target_subpath }}"
+          samurai_git_branch: "{{ git_branch }}"
+        aggregate: false
+        per_host: false
+
+    # ------------------------------------------------------------------
+    # Cleanup the working copy. Failure here is non-fatal — the commit
+    # is already pushed.
+    # ------------------------------------------------------------------
+    - name: "Cleanup local Git workdir"
+      ansible.builtin.file:
+        path: "{{ git_workdir }}"
+        state: absent
+      failed_when: false

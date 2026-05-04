@@ -1,0 +1,403 @@
+---
+# ============================================================================
+# SamurAI Shield :: Legacy-to-Immutable Rebuild :: 01 collect baseline
+# ----------------------------------------------------------------------------
+# Read-only step. Collects:
+#   - Azure resource facts via `az` CLI (VM, OS disk, data disks, NIC, public
+#     IP, NSG, VNet/subnet, tags, identity, extensions, boot diagnostics).
+#   - OS-level facts via SSH (Linux) or WinRM (Windows): hostname, OS version,
+#     packages, services, listening ports, firewall, cron/timers.
+#
+# Outputs (written under {{ artifact_output_dir }}/baseline/):
+#   azure_vm_facts.json   os_facts.json     network_facts.json
+#   disk_facts.json       security_facts.json   validation_report.md
+#
+# This playbook never mutates Azure or the target host. It is safe to re-run.
+# ============================================================================
+
+- name: "SamurAI :: legacy-to-immutable :: collect Azure VM baseline (controller)"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    azure_subscription_id: "{{ azure_subscription_id }}"
+    azure_resource_group: "{{ azure_resource_group }}"
+    azure_vm_name: "{{ azure_vm_name }}"
+    artifact_output_dir: "{{ artifact_output_dir }}"
+    baseline_dir: "{{ artifact_output_dir }}/baseline"
+    samurai_warnings: []
+    samurai_errors: []
+
+  tasks:
+    - name: "Validate required extra-vars are present"
+      ansible.builtin.fail:
+        msg: "Required extra-var '{{ item }}' is missing."
+      when: vars[item] is not defined or (vars[item] | string | trim) == ''
+      loop:
+        - azure_subscription_id
+        - azure_resource_group
+        - azure_vm_name
+        - artifact_output_dir
+
+    - name: "Capture execution timestamps (UTC)"
+      ansible.builtin.set_fact:
+        execution_started_at: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+        execution_timestamp: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+
+    - name: "Create baseline output directory"
+      ansible.builtin.file:
+        path: "{{ baseline_dir }}"
+        state: directory
+        mode: '0750'
+
+    - name: "Set Azure CLI subscription context"
+      ansible.builtin.command: >
+        az account set --subscription {{ azure_subscription_id }}
+      changed_when: false
+
+    # ------------------------------------------------------------------
+    # VM resource facts
+    # ------------------------------------------------------------------
+    - name: "Collect Azure VM facts (az vm show -d)"
+      ansible.builtin.command: >
+        az vm show
+          --resource-group {{ azure_resource_group }}
+          --name {{ azure_vm_name }}
+          --show-details
+          -o json
+      register: az_vm_show
+      changed_when: false
+
+    - name: "Parse VM facts JSON"
+      ansible.builtin.set_fact:
+        azure_vm_raw: "{{ az_vm_show.stdout | from_json }}"
+
+    - name: "Build azure_vm_facts payload"
+      ansible.builtin.set_fact:
+        azure_vm_facts:
+          collected_at: "{{ execution_started_at }}"
+          subscription_id: "{{ azure_subscription_id }}"
+          resource_group: "{{ azure_resource_group }}"
+          vm_id: "{{ azure_vm_raw.id | default('unknown') }}"
+          vm_name: "{{ azure_vm_raw.name | default(azure_vm_name) }}"
+          location: "{{ azure_vm_raw.location | default('unknown') }}"
+          vm_size: "{{ azure_vm_raw.hardwareProfile.vmSize | default('unknown') }}"
+          os_type: "{{ azure_vm_raw.storageProfile.osDisk.osType | default('unknown') }}"
+          image_reference: "{{ azure_vm_raw.storageProfile.imageReference | default({}) }}"
+          os_disk:
+            name: "{{ azure_vm_raw.storageProfile.osDisk.name | default('unknown') }}"
+            id: "{{ azure_vm_raw.storageProfile.osDisk.managedDisk.id | default('unknown') }}"
+            caching: "{{ azure_vm_raw.storageProfile.osDisk.caching | default('unknown') }}"
+            sku: "{{ azure_vm_raw.storageProfile.osDisk.managedDisk.storageAccountType | default('unknown') }}"
+            disk_size_gb: "{{ azure_vm_raw.storageProfile.osDisk.diskSizeGb | default(0) }}"
+          data_disks: "{{ azure_vm_raw.storageProfile.dataDisks | default([]) }}"
+          tags: "{{ azure_vm_raw.tags | default({}) }}"
+          identity: "{{ azure_vm_raw.identity | default({}) }}"
+          availability_zone: "{{ (azure_vm_raw.zones | default([]))[0] | default(none) }}"
+          boot_diagnostics: "{{ azure_vm_raw.diagnosticsProfile.bootDiagnostics | default({}) }}"
+          public_ips: "{{ azure_vm_raw.publicIps | default('') }}"
+          private_ips: "{{ azure_vm_raw.privateIps | default('') }}"
+          power_state: "{{ azure_vm_raw.powerState | default('unknown') }}"
+
+    # ------------------------------------------------------------------
+    # NIC + Public IP details
+    # ------------------------------------------------------------------
+    - name: "Resolve primary NIC ID"
+      ansible.builtin.set_fact:
+        primary_nic_id: "{{ (azure_vm_raw.networkProfile.networkInterfaces | default([]))[0].id | default('') }}"
+
+    - name: "Fail when VM has no NIC attached"
+      ansible.builtin.fail:
+        msg: "VM {{ azure_vm_name }} has no NIC attached — refusing to proceed."
+      when: primary_nic_id == ''
+
+    - name: "Fetch NIC details"
+      ansible.builtin.command: >
+        az network nic show --ids {{ primary_nic_id }} -o json
+      register: az_nic_show
+      changed_when: false
+
+    - name: "Parse NIC JSON"
+      ansible.builtin.set_fact:
+        azure_nic_raw: "{{ az_nic_show.stdout | from_json }}"
+
+    - name: "Resolve public IP ID (if any)"
+      ansible.builtin.set_fact:
+        primary_public_ip_id: >-
+          {{ (azure_nic_raw.ipConfigurations | default([]))[0].publicIpAddress.id | default('') }}
+
+    - name: "Fetch Public IP details"
+      ansible.builtin.command: >
+        az network public-ip show --ids {{ primary_public_ip_id }} -o json
+      register: az_pip_show
+      changed_when: false
+      when: primary_public_ip_id != ''
+
+    - name: "Parse Public IP JSON"
+      ansible.builtin.set_fact:
+        azure_public_ip_raw: "{{ (az_pip_show.stdout | from_json) if (primary_public_ip_id != '') else {} }}"
+
+    - name: "Build network_facts payload"
+      ansible.builtin.set_fact:
+        network_facts:
+          collected_at: "{{ execution_started_at }}"
+          nic:
+            id: "{{ azure_nic_raw.id | default('unknown') }}"
+            name: "{{ azure_nic_raw.name | default('unknown') }}"
+            mac: "{{ azure_nic_raw.macAddress | default('unknown') }}"
+            private_ip: "{{ (azure_nic_raw.ipConfigurations | default([]))[0].privateIpAddress | default('unknown') }}"
+            subnet_id: "{{ (azure_nic_raw.ipConfigurations | default([]))[0].subnet.id | default('unknown') }}"
+            nsg_id: "{{ azure_nic_raw.networkSecurityGroup.id | default('') }}"
+          public_ip:
+            id: "{{ azure_public_ip_raw.id | default('') }}"
+            name: "{{ azure_public_ip_raw.name | default('') }}"
+            address: "{{ azure_public_ip_raw.ipAddress | default('') }}"
+            allocation_method: "{{ azure_public_ip_raw.publicIpAllocationMethod | default('unknown') }}"
+            sku: "{{ azure_public_ip_raw.sku.name | default('unknown') }}"
+
+    # ------------------------------------------------------------------
+    # Disks (OS + data)
+    # ------------------------------------------------------------------
+    - name: "Build disk_facts payload"
+      ansible.builtin.set_fact:
+        disk_facts:
+          collected_at: "{{ execution_started_at }}"
+          os_disk: "{{ azure_vm_facts.os_disk }}"
+          data_disks: "{{ azure_vm_facts.data_disks }}"
+
+    # ------------------------------------------------------------------
+    # Extensions (security/diagnostics surface)
+    # ------------------------------------------------------------------
+    - name: "List VM extensions"
+      ansible.builtin.command: >
+        az vm extension list
+          --resource-group {{ azure_resource_group }}
+          --vm-name {{ azure_vm_name }}
+          -o json
+      register: az_ext_list
+      changed_when: false
+      failed_when: false
+
+    - name: "Parse extensions JSON"
+      ansible.builtin.set_fact:
+        azure_extensions: "{{ (az_ext_list.stdout | default('[]')) | from_json }}"
+
+    - name: "Build security_facts payload"
+      ansible.builtin.set_fact:
+        security_facts:
+          collected_at: "{{ execution_started_at }}"
+          managed_identity: "{{ azure_vm_facts.identity }}"
+          nsg_id: "{{ network_facts.nic.nsg_id }}"
+          extensions: "{{ azure_extensions }}"
+          boot_diagnostics: "{{ azure_vm_facts.boot_diagnostics }}"
+
+    # ------------------------------------------------------------------
+    # Persist Azure-side JSON files
+    # ------------------------------------------------------------------
+    - name: "Write azure_vm_facts.json"
+      ansible.builtin.copy:
+        dest: "{{ baseline_dir }}/azure_vm_facts.json"
+        content: "{{ azure_vm_facts | to_nice_json }}\n"
+        mode: '0640'
+
+    - name: "Write network_facts.json"
+      ansible.builtin.copy:
+        dest: "{{ baseline_dir }}/network_facts.json"
+        content: "{{ network_facts | to_nice_json }}\n"
+        mode: '0640'
+
+    - name: "Write disk_facts.json"
+      ansible.builtin.copy:
+        dest: "{{ baseline_dir }}/disk_facts.json"
+        content: "{{ disk_facts | to_nice_json }}\n"
+        mode: '0640'
+
+    - name: "Write security_facts.json"
+      ansible.builtin.copy:
+        dest: "{{ baseline_dir }}/security_facts.json"
+        content: "{{ security_facts | to_nice_json }}\n"
+        mode: '0640'
+
+    - name: "Add target host to dynamic inventory for OS-fact collection"
+      ansible.builtin.add_host:
+        name: "{{ target_host }}"
+        groups: samurai_legacy_target
+        ansible_user: "{{ ssh_username | default(winrm_username) | default(omit) }}"
+        ansible_connection: "{{ 'winrm' if (os_connection_type | default('ssh')) == 'winrm' else 'ssh' }}"
+      changed_when: false
+      when: target_host is defined and (target_host | trim) != ''
+
+
+- name: "SamurAI :: legacy-to-immutable :: collect OS facts"
+  hosts: samurai_legacy_target
+  gather_facts: true
+  become: "{{ (os_connection_type | default('ssh')) == 'ssh' }}"
+  vars:
+    baseline_dir: "{{ hostvars['localhost'].baseline_dir }}"
+    execution_started_at: "{{ hostvars['localhost'].execution_started_at }}"
+
+  tasks:
+    # --------------------------------------------------------------
+    # Linux branch
+    # --------------------------------------------------------------
+    - name: "Linux :: collect installed packages (rpm)"
+      ansible.builtin.shell: |
+        set -o pipefail
+        rpm -qa --qf '%{NAME}|%{VERSION}|%{RELEASE}|%{ARCH}\n' 2>/dev/null | sort
+      args:
+        executable: /bin/bash
+      register: linux_pkgs_rpm
+      changed_when: false
+      failed_when: false
+      when: ansible_os_family == 'RedHat'
+
+    - name: "Linux :: collect installed packages (dpkg)"
+      ansible.builtin.shell: |
+        set -o pipefail
+        dpkg-query -W -f='${Package}|${Version}|${Architecture}\n' 2>/dev/null | sort
+      args:
+        executable: /bin/bash
+      register: linux_pkgs_deb
+      changed_when: false
+      failed_when: false
+      when: ansible_os_family == 'Debian'
+
+    - name: "Linux :: collect active services"
+      ansible.builtin.command: systemctl list-units --type=service --state=running --no-pager --no-legend
+      register: linux_services
+      changed_when: false
+      failed_when: false
+      when: ansible_system == 'Linux'
+
+    - name: "Linux :: collect listening ports"
+      ansible.builtin.shell: |
+        set -o pipefail
+        ss -tulnp 2>/dev/null || netstat -tulnp 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      register: linux_ports
+      changed_when: false
+      failed_when: false
+      when: ansible_system == 'Linux'
+
+    - name: "Linux :: collect firewall state (firewalld/ufw/iptables)"
+      ansible.builtin.shell: |
+        set -o pipefail
+        if command -v firewall-cmd >/dev/null 2>&1; then
+          echo "tool=firewalld"
+          firewall-cmd --state 2>/dev/null || true
+          firewall-cmd --list-all 2>/dev/null || true
+        elif command -v ufw >/dev/null 2>&1; then
+          echo "tool=ufw"
+          ufw status verbose 2>/dev/null || true
+        else
+          echo "tool=iptables"
+          iptables -S 2>/dev/null || true
+        fi
+      args:
+        executable: /bin/bash
+      register: linux_firewall
+      changed_when: false
+      failed_when: false
+      when: ansible_system == 'Linux'
+
+    - name: "Linux :: collect cron + systemd timers"
+      ansible.builtin.shell: |
+        set -o pipefail
+        echo "### /etc/crontab"
+        cat /etc/crontab 2>/dev/null || true
+        echo "### /etc/cron.d"
+        ls -la /etc/cron.d 2>/dev/null || true
+        echo "### systemd timers"
+        systemctl list-timers --all --no-pager --no-legend 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      register: linux_cron
+      changed_when: false
+      failed_when: false
+      when: ansible_system == 'Linux'
+
+    # --------------------------------------------------------------
+    # Windows branch
+    # --------------------------------------------------------------
+    - name: "Windows :: collect installed packages (Get-Package)"
+      ansible.windows.win_shell: |
+        Get-Package | Select-Object Name, Version | ConvertTo-Json -Depth 2
+      register: win_pkgs
+      changed_when: false
+      failed_when: false
+      when: ansible_system == 'Win32NT'
+
+    - name: "Windows :: collect running services"
+      ansible.windows.win_shell: |
+        Get-Service | Where-Object Status -eq 'Running' |
+          Select-Object Name, DisplayName | ConvertTo-Json -Depth 2
+      register: win_services
+      changed_when: false
+      failed_when: false
+      when: ansible_system == 'Win32NT'
+
+    - name: "Windows :: collect listening ports"
+      ansible.windows.win_shell: |
+        Get-NetTCPConnection -State Listen |
+          Select-Object LocalAddress, LocalPort, OwningProcess |
+          ConvertTo-Json -Depth 2
+      register: win_ports
+      changed_when: false
+      failed_when: false
+      when: ansible_system == 'Win32NT'
+
+    # --------------------------------------------------------------
+    # Aggregate per-host OS facts
+    # --------------------------------------------------------------
+    - name: "Build os_facts payload"
+      ansible.builtin.set_fact:
+        os_facts:
+          collected_at: "{{ execution_started_at }}"
+          hostname: "{{ ansible_hostname | default('unknown') }}"
+          fqdn: "{{ ansible_fqdn | default('unknown') }}"
+          os_family: "{{ ansible_os_family | default('unknown') }}"
+          distribution: "{{ ansible_distribution | default('unknown') }}"
+          distribution_version: "{{ ansible_distribution_version | default('unknown') }}"
+          kernel: "{{ ansible_kernel | default('unknown') }}"
+          architecture: "{{ ansible_architecture | default('unknown') }}"
+          mounts: "{{ ansible_mounts | default([]) }}"
+          users: "{{ ansible_facts.getent_passwd | default({}) | list }}"
+          packages_linux_rpm: "{{ linux_pkgs_rpm.stdout_lines | default([]) }}"
+          packages_linux_deb: "{{ linux_pkgs_deb.stdout_lines | default([]) }}"
+          services_linux: "{{ linux_services.stdout_lines | default([]) }}"
+          listening_ports_linux: "{{ linux_ports.stdout | default('') }}"
+          firewall_linux: "{{ linux_firewall.stdout | default('') }}"
+          cron_linux: "{{ linux_cron.stdout | default('') }}"
+          packages_windows: "{{ win_pkgs.stdout | default('') }}"
+          services_windows: "{{ win_services.stdout | default('') }}"
+          listening_ports_windows: "{{ win_ports.stdout | default('') }}"
+
+    - name: "Persist os_facts.json on controller"
+      ansible.builtin.copy:
+        dest: "{{ baseline_dir }}/os_facts.json"
+        content: "{{ os_facts | to_nice_json }}\n"
+        mode: '0640'
+      delegate_to: localhost
+      become: false
+
+
+- name: "SamurAI :: legacy-to-immutable :: render baseline validation_report.md"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    baseline_dir: "{{ artifact_output_dir }}/baseline"
+
+  tasks:
+    - name: "Render validation_report.md from template"
+      ansible.builtin.template:
+        src: "../templates/reports/validation_report.md.j2"
+        dest: "{{ baseline_dir }}/validation_report.md"
+        mode: '0640'
+
+    - name: "Publish baseline summary as workflow stat"
+      ansible.builtin.set_stats:
+        data:
+          samurai_baseline_collected: true
+          samurai_baseline_dir: "{{ baseline_dir }}"
+        aggregate: false
+        per_host: false

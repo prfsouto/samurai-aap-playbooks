@@ -1,0 +1,55 @@
+# Post-Rebuild Validation Report — {{ post_rebuild_validation.vm_name }}
+
+**Generated at (UTC):** {{ post_rebuild_validation.generated_at }}
+**Subscription:** `{{ post_rebuild_validation.subscription_id }}`
+**Resource group:** `{{ post_rebuild_validation.resource_group }}`
+**Overall status:** **{{ post_rebuild_validation.overall_status | upper }}**
+
+---
+
+## Azure-side checks
+
+| Check | Expected | Actual | Result |
+| ----- | -------- | ------ | ------ |
+{% for c in post_rebuild_validation.azure_checks %}
+| `{{ c.name }}` | `{{ c.expected }}` | `{{ c.actual }}` | {{ '✅ ok' if c.ok else '❌ fail' }} |
+{% endfor %}
+
+## OS-side reachability
+
+{% if post_rebuild_validation.os_reachable %}
+- Reachable: **yes**
+- Hostname: `{{ post_rebuild_validation.os_post_rebuild.hostname }}`
+- FQDN: `{{ post_rebuild_validation.os_post_rebuild.fqdn }}`
+- Kernel: `{{ post_rebuild_validation.os_post_rebuild.kernel }}`
+- Failed services (post-rebuild): {{ post_rebuild_validation.os_post_rebuild.failed_services | length }}
+{% if (post_rebuild_validation.os_post_rebuild.failed_services | length) > 0 %}
+{% for s in post_rebuild_validation.os_post_rebuild.failed_services %}
+  - `{{ s }}`
+{% endfor %}
+{% endif %}
+{% else %}
+- Reachable: **no** — SSH/WinRM did not respond. Investigate before
+  considering the rebuild successful.
+{% endif %}
+
+## Diff summary (baseline → post-rebuild)
+
+{% set d = validation_payload.diff_report.fields if validation_payload is defined else {} %}
+{% set diff_fields = post_rebuild_validation.diff_report.fields | default(d) %}
+| Field | Before | After |
+| ----- | ------ | ----- |
+{% for k, v in diff_fields.items() %}
+| `{{ k }}` | `{{ v.before }}` | `{{ v.after }}` |
+{% endfor %}
+
+---
+
+## Interpretation
+
+- `passed` — every Azure-side check matched and the OS responded.
+- `partial` — Azure-side checks passed but the OS did not respond. The
+  rebuild may still be successful; SSH/WinRM may need a retry or a security
+  group/NSG fix.
+- `failed` — at least one Azure-side check did not match. Use the
+  snapshots from `snapshots/snapshots.json` to roll back if necessary.
