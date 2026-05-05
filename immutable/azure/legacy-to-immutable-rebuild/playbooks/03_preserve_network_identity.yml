@@ -24,6 +24,13 @@
     baseline_dir: "{{ artifact_output_dir }}/baseline"
 
   tasks:
+    # Authenticate Azure CLI even though this play is logic-only — it makes
+    # the precondition uniform across the workflow and guarantees the SP
+    # can still see the subscription before we move into the destructive
+    # step 4 that follows.
+    - name: "Authenticate Azure CLI (Service Principal) and set subscription"
+      ansible.builtin.import_tasks: ../tasks/azure_cli_login.yml
+
     - name: "Validate baseline network_facts.json exists"
       ansible.builtin.stat:
         path: "{{ baseline_dir }}/network_facts.json"

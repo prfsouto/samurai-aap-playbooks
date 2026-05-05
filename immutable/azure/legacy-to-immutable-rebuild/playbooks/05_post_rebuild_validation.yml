@@ -43,10 +43,8 @@
       ansible.builtin.set_fact:
         baseline_net: "{{ lookup('file', baseline_dir ~ '/network_identity.json') | from_json }}"
 
-    - name: "Set Azure CLI subscription context"
-      ansible.builtin.command: >
-        az account set --subscription {{ azure_subscription_id }}
-      changed_when: false
+    - name: "Authenticate Azure CLI (Service Principal) and set subscription"
+      ansible.builtin.import_tasks: ../tasks/azure_cli_login.yml
 
     # ------------------------------------------------------------------
     # 1. Confirm the VM exists and is running.

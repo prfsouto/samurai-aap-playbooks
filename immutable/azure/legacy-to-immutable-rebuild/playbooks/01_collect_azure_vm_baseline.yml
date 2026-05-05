@@ -49,10 +49,11 @@
         state: directory
         mode: '0750'
 
-    - name: "Set Azure CLI subscription context"
-      ansible.builtin.command: >
-        az account set --subscription {{ azure_subscription_id }}
-      changed_when: false
+    # Authenticate Azure CLI BEFORE any az * call. AAP Azure RM credential
+    # injects AZURE_CLIENT_ID / AZURE_SECRET / AZURE_TENANT into the env but
+    # does NOT log the CLI in — that has to happen explicitly here.
+    - name: "Authenticate Azure CLI (Service Principal) and set subscription"
+      ansible.builtin.import_tasks: ../tasks/azure_cli_login.yml
 
     # ------------------------------------------------------------------
     # VM resource facts

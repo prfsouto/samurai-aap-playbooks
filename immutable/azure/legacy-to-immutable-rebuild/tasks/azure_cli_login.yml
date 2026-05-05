@@ -1,0 +1,121 @@
+---
+# ============================================================================
+# SamurAI Shield :: Legacy-to-Immutable Rebuild :: Azure CLI login (reusable)
+# ----------------------------------------------------------------------------
+# Performs an Azure CLI login on the AAP execution environment using a
+# Service Principal. AAP "Microsoft Azure Resource Manager" credentials
+# inject the SP into env vars but DO NOT authenticate `az` CLI — that has
+# to be done explicitly. This task file is the single source of truth for
+# that login and is meant to be imported by every Azure playbook in this
+# flow.
+#
+# Usage (inside any play that runs on localhost / controller side):
+#
+#   tasks:
+#     - import_tasks: ../tasks/azure_cli_login.yml
+#       vars:
+#         azure_subscription_id: "{{ azure_subscription_id }}"
+#     - ...
+#
+# Required env vars (any of the alternative names below work):
+#
+#   AZURE_CLIENT_ID
+#   AZURE_SECRET            (canonical, set by AAP Azure RM credential)
+#     or AZURE_CLIENT_SECRET (alternative)
+#   AZURE_TENANT            (canonical, set by AAP Azure RM credential)
+#     or AZURE_TENANT_ID    (alternative)
+#
+# Required extra-var:
+#
+#   azure_subscription_id   (the subscription ID to set as default)
+#
+# Security:
+#   - Every task that reads/uses the SP secret has no_log: true.
+#   - The secret never lands in JSON, Markdown, set_stats or stdout.
+#   - The "safe debug" task only echoes the subscription/tenant IDs.
+# ============================================================================
+
+- name: "azure-cli-login :: resolve credentials from environment"
+  ansible.builtin.set_fact:
+    _azure_client_id: "{{ lookup('env', 'AZURE_CLIENT_ID') }}"
+    _azure_secret: >-
+      {{ lookup('env', 'AZURE_SECRET')
+         | default(lookup('env', 'AZURE_CLIENT_SECRET'), true) }}
+    _azure_tenant: >-
+      {{ lookup('env', 'AZURE_TENANT')
+         | default(lookup('env', 'AZURE_TENANT_ID'), true) }}
+  no_log: true
+
+- name: "azure-cli-login :: validate credentials are present"
+  ansible.builtin.fail:
+    msg: >-
+      Azure Service Principal credentials are missing from the execution
+      environment. Expected AZURE_CLIENT_ID, AZURE_SECRET (or
+      AZURE_CLIENT_SECRET) and AZURE_TENANT (or AZURE_TENANT_ID) to be
+      injected by an AAP "Microsoft Azure Resource Manager" credential.
+  when: >-
+    (_azure_client_id | length) == 0 or
+    (_azure_secret | length) == 0 or
+    (_azure_tenant | length) == 0
+
+- name: "azure-cli-login :: validate azure_subscription_id is provided"
+  ansible.builtin.fail:
+    msg: "Required extra-var 'azure_subscription_id' is missing or empty."
+  when: (azure_subscription_id | default('') | trim) == ''
+
+- name: "azure-cli-login :: set Azure cloud to AzureCloud"
+  ansible.builtin.command: az cloud set --name AzureCloud
+  changed_when: false
+
+- name: "azure-cli-login :: login with service principal"
+  ansible.builtin.command:
+    argv:
+      - az
+      - login
+      - --service-principal
+      - -u
+      - "{{ _azure_client_id }}"
+      - -p
+      - "{{ _azure_secret }}"
+      - --tenant
+      - "{{ _azure_tenant }}"
+  register: az_login_result
+  changed_when: az_login_result.rc == 0
+  no_log: true
+
+- name: "azure-cli-login :: set subscription context"
+  ansible.builtin.command: >
+    az account set --subscription {{ azure_subscription_id }}
+  changed_when: false
+
+- name: "azure-cli-login :: validate subscription is accessible"
+  ansible.builtin.command: az account show
+  register: azure_account
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: "azure-cli-login :: fail when subscription is not accessible"
+  ansible.builtin.fail:
+    msg: >-
+      Azure CLI login succeeded but subscription
+      {{ azure_subscription_id }} is not accessible by this Service
+      Principal. Verify the SP has at least Reader on the subscription.
+  when: azure_account.rc != 0
+
+- name: "azure-cli-login :: safe debug (subscription + tenant only)"
+  ansible.builtin.command: >
+    az account show --query "{subscription:id, tenant:tenantId}" -o json
+  register: debug_account
+  changed_when: false
+
+- name: "azure-cli-login :: show resolved Azure context"
+  ansible.builtin.debug:
+    msg: "Azure CLI authenticated — context: {{ debug_account.stdout }}"
+
+- name: "azure-cli-login :: scrub credentials from playbook scope"
+  ansible.builtin.set_fact:
+    _azure_client_id: ""
+    _azure_secret: ""
+    _azure_tenant: ""
+  no_log: true
