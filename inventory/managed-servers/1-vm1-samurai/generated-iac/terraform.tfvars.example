@@ -1,0 +1,25 @@
+################################################################################
+# SamurAI Shield :: Legacy-to-Immutable Rebuild :: generated baseline
+# terraform.tfvars.example
+#
+# Copy this file as terraform.tfvars and review every value before running
+# terraform plan. Do NOT commit terraform.tfvars with real subscription IDs.
+# No secrets are emitted here.
+################################################################################
+
+subscription_id      = "8a46e231-771b-40d7-90f5-6a8e17682197"
+resource_group_name  = "Samurai"
+vm_name              = "vm1-samurai"
+vm_size              = "Standard_B1ms"
+os_disk_name         = "vm1-samurai_OsDisk_1_2d9c0ae602e947aebbeb03c4d4eb1d47"
+public_ip_name       = "vm-samurai-ip"
+nic_name             = "vm1-samurai814_z1"
+subnet_id            = "/subscriptions/8a46e231-771b-40d7-90f5-6a8e17682197/resourceGroups/Samurai/providers/Microsoft.Network/virtualNetworks/vm1-samurai-vnet/subnets/default"
+private_ip           = "10.1.0.4"
+nsg_id               = "/subscriptions/8a46e231-771b-40d7-90f5-6a8e17682197/resourceGroups/Samurai/providers/Microsoft.Network/networkSecurityGroups/vm1-samurai-nsg"
+admin_username       = "samurai-shield"
+
+tags = {
+  "samurai_shield_origin"      = "legacy-to-immutable-rebuild"
+  "samurai_shield_baseline_at" = "2026-05-05T05:31:48Z"
+}

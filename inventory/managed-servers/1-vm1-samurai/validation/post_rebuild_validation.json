@@ -1,0 +1,62 @@
+{
+    "azure_checks": [
+        {
+            "actual": "exists",
+            "expected": "exists",
+            "name": "vm_exists",
+            "ok": true
+        },
+        {
+            "actual": "VM running",
+            "expected": "running",
+            "name": "vm_running",
+            "ok": true
+        },
+        {
+            "actual": "172.206.227.150",
+            "expected": "172.206.227.150",
+            "name": "public_ip_preserved",
+            "ok": true
+        },
+        {
+            "actual": "10.1.0.4",
+            "expected": "10.1.0.4",
+            "name": "private_ip_preserved",
+            "ok": true
+        },
+        {
+            "actual": "/subscriptions/8a46e231-771b-40d7-90f5-6a8e17682197/resourceGroups/Samurai/providers/Microsoft.Network/networkInterfaces/vm1-samurai814_z1",
+            "expected": "/subscriptions/8a46e231-771b-40d7-90f5-6a8e17682197/resourceGroups/Samurai/providers/Microsoft.Network/networkInterfaces/vm1-samurai814_z1",
+            "name": "nic_preserved",
+            "ok": true
+        },
+        {
+            "actual": "/subscriptions/8a46e231-771b-40d7-90f5-6a8e17682197/resourceGroups/SAMURAI/providers/Microsoft.Compute/disks/vm1-samurai_OsDisk_1_2d9c0ae602e947aebbeb03c4d4eb1d47",
+            "expected": "/subscriptions/8a46e231-771b-40d7-90f5-6a8e17682197/resourceGroups/SAMURAI/providers/Microsoft.Compute/disks/vm1-samurai_OsDisk_1_2d9c0ae602e947aebbeb03c4d4eb1d47",
+            "name": "os_disk_preserved",
+            "ok": true
+        },
+        {
+            "actual": "0",
+            "expected": "0",
+            "name": "data_disks_count",
+            "ok": true
+        }
+    ],
+    "azure_status": "passed",
+    "generated_at": "2026-05-05T05:31:28Z",
+    "os_post_rebuild": {
+        "failed_services": [],
+        "fqdn": "vm1-samurai.internal.cloudapp.net",
+        "hostname": "vm1-samurai",
+        "kernel": "4.18.0-553.115.1.el8_10.x86_64",
+        "listening_ports": "Netid State  Recv-Q Send-Q Local Address:Port Peer Address:PortProcess                                   \nudp   UNCONN 0      0          127.0.0.1:323       0.0.0.0:*    users:((\"chronyd\",pid=846,fd=5))         \nudp   UNCONN 0      0      127.0.0.53%lo:53        0.0.0.0:*    users:((\"systemd-resolve\",pid=794,fd=16))\nudp   UNCONN 0      0            0.0.0.0:68        0.0.0.0:*    users:((\"dhclient\",pid=1132,fd=6))       \nudp   UNCONN 0      0            0.0.0.0:5355      0.0.0.0:*    users:((\"systemd-resolve\",pid=794,fd=11))\nudp   UNCONN 0      0              [::1]:323          [::]:*    users:((\"chronyd\",pid=846,fd=6))         \nudp   UNCONN 0      0               [::]:5355         [::]:*    users:((\"systemd-resolve\",pid=794,fd=13))\ntcp   LISTEN 0      128          0.0.0.0:22        0.0.0.0:*    users:((\"sshd\",pid=1370,fd=3))           \ntcp   LISTEN 0      128          0.0.0.0:5355      0.0.0.0:*    users:((\"systemd-resolve\",pid=794,fd=12))\ntcp   LISTEN 0      128             [::]:22           [::]:*    users:((\"sshd\",pid=1370,fd=4))           \ntcp   LISTEN 0      128             [::]:5355         [::]:*    users:((\"systemd-resolve\",pid=794,fd=14))",
+        "os_family": "RedHat",
+        "reachable": true
+    },
+    "os_reachable": true,
+    "overall_status": "passed",
+    "resource_group": "Samurai",
+    "subscription_id": "8a46e231-771b-40d7-90f5-6a8e17682197",
+    "vm_name": "vm1-samurai"
+}

@@ -1,0 +1,17 @@
+{
+    "allocation_method": "Static",
+    "captured_at": "2026-05-05T05:31:19Z",
+    "nic_id": "/subscriptions/8a46e231-771b-40d7-90f5-6a8e17682197/resourceGroups/Samurai/providers/Microsoft.Network/networkInterfaces/vm1-samurai814_z1",
+    "nic_name": "vm1-samurai814_z1",
+    "nsg_id": "/subscriptions/8a46e231-771b-40d7-90f5-6a8e17682197/resourceGroups/Samurai/providers/Microsoft.Network/networkSecurityGroups/vm1-samurai-nsg",
+    "private_ip": "10.1.0.4",
+    "public_ip_address": "172.206.227.150",
+    "public_ip_id": "/subscriptions/8a46e231-771b-40d7-90f5-6a8e17682197/resourceGroups/Samurai/providers/Microsoft.Network/publicIPAddresses/vm-samurai-ip",
+    "public_ip_name": "vm-samurai-ip",
+    "public_ip_sku": "Standard",
+    "resource_group": "Samurai",
+    "subnet_id": "/subscriptions/8a46e231-771b-40d7-90f5-6a8e17682197/resourceGroups/Samurai/providers/Microsoft.Network/virtualNetworks/vm1-samurai-vnet/subnets/default",
+    "subscription_id": "8a46e231-771b-40d7-90f5-6a8e17682197",
+    "vm_name": "vm1-samurai",
+    "vnet_id": "/subscriptions/8a46e231-771b-40d7-90f5-6a8e17682197/resourceGroups/Samurai/providers/Microsoft.Network/virtualNetworks/vm1-samurai-vnet"
+}

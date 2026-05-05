@@ -1,0 +1,11 @@
+{
+    "collected_at": "2026-05-05T05:30:25Z",
+    "data_disks": [],
+    "os_disk": {
+        "caching": "ReadWrite",
+        "disk_size_gb": "0",
+        "id": "/subscriptions/8a46e231-771b-40d7-90f5-6a8e17682197/resourceGroups/SAMURAI/providers/Microsoft.Compute/disks/vm1-samurai_OsDisk_1_2d9c0ae602e947aebbeb03c4d4eb1d47",
+        "name": "vm1-samurai_OsDisk_1_2d9c0ae602e947aebbeb03c4d4eb1d47",
+        "sku": "Standard_LRS"
+    }
+}

@@ -1,0 +1,41 @@
+{
+    "fields": {
+        "data_disks_count": {
+            "after": "0",
+            "before": "0"
+        },
+        "location": {
+            "after": "eastus",
+            "before": "eastus"
+        },
+        "nic_id": {
+            "after": "/subscriptions/8a46e231-771b-40d7-90f5-6a8e17682197/resourceGroups/Samurai/providers/Microsoft.Network/networkInterfaces/vm1-samurai814_z1",
+            "before": "/subscriptions/8a46e231-771b-40d7-90f5-6a8e17682197/resourceGroups/Samurai/providers/Microsoft.Network/networkInterfaces/vm1-samurai814_z1"
+        },
+        "os_disk_id": {
+            "after": "/subscriptions/8a46e231-771b-40d7-90f5-6a8e17682197/resourceGroups/SAMURAI/providers/Microsoft.Compute/disks/vm1-samurai_OsDisk_1_2d9c0ae602e947aebbeb03c4d4eb1d47",
+            "before": "/subscriptions/8a46e231-771b-40d7-90f5-6a8e17682197/resourceGroups/SAMURAI/providers/Microsoft.Compute/disks/vm1-samurai_OsDisk_1_2d9c0ae602e947aebbeb03c4d4eb1d47"
+        },
+        "os_type": {
+            "after": "Linux",
+            "before": "Linux"
+        },
+        "private_ip": {
+            "after": "10.1.0.4",
+            "before": "10.1.0.4"
+        },
+        "public_ip": {
+            "after": "172.206.227.150",
+            "before": "172.206.227.150"
+        },
+        "tags": {
+            "after": {},
+            "before": {}
+        },
+        "vm_size": {
+            "after": "Standard_B1ms",
+            "before": "Standard_B1ms"
+        }
+    },
+    "generated_at": "2026-05-05T05:31:28Z"
+}

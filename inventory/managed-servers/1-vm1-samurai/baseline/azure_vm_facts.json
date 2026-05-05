@@ -1,0 +1,34 @@
+{
+    "availability_zone": "1",
+    "boot_diagnostics": {
+        "enabled": true
+    },
+    "collected_at": "2026-05-05T05:30:25Z",
+    "data_disks": [],
+    "identity": {},
+    "image_reference": {
+        "exactVersion": "8.10.2025052607",
+        "offer": "RHEL",
+        "publisher": "RedHat",
+        "sku": "810-gen2",
+        "version": "latest"
+    },
+    "location": "eastus",
+    "os_disk": {
+        "caching": "ReadWrite",
+        "disk_size_gb": "0",
+        "id": "/subscriptions/8a46e231-771b-40d7-90f5-6a8e17682197/resourceGroups/SAMURAI/providers/Microsoft.Compute/disks/vm1-samurai_OsDisk_1_2d9c0ae602e947aebbeb03c4d4eb1d47",
+        "name": "vm1-samurai_OsDisk_1_2d9c0ae602e947aebbeb03c4d4eb1d47",
+        "sku": "Standard_LRS"
+    },
+    "os_type": "Linux",
+    "power_state": "VM running",
+    "private_ips": "10.1.0.4",
+    "public_ips": "172.206.227.150",
+    "resource_group": "Samurai",
+    "subscription_id": "8a46e231-771b-40d7-90f5-6a8e17682197",
+    "tags": {},
+    "vm_id": "/subscriptions/8a46e231-771b-40d7-90f5-6a8e17682197/resourceGroups/Samurai/providers/Microsoft.Compute/virtualMachines/vm1-samurai",
+    "vm_name": "vm1-samurai",
+    "vm_size": "Standard_B1ms"
+}
