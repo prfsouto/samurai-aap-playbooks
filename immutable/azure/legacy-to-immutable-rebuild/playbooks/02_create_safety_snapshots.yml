@@ -57,14 +57,30 @@
 
     # ------------------------------------------------------------------
     # Build a flat list of disks to snapshot (OS first, then each data
-    # disk). Each entry: { role, name, id }.
+    # disk). Each entry: { role, name, id, snapshot_name }.
+    #
+    # Naming rule (kept under Azure's 80-char snapshot.name limit):
+    #   samurai-<vm_trunc40>-<role><idx?>-<ts>
+    # - vm_trunc40: azure_vm_name with non-alnum/hyphen chars stripped,
+    #   truncated to 40 chars.
+    # - role: 'os' (no index) or 'data<N>' (N=0..) for data disks.
+    # - ts: snapshot_timestamp (UTC, YYYYMMDDTHHMMSSZ).
+    #
+    # Full disk names/IDs are preserved in snapshots.json under
+    # source_disk_name / source_disk_id for traceability.
     # ------------------------------------------------------------------
+    - name: "Compute snapshot name prefix"
+      ansible.builtin.set_fact:
+        snapshot_name_prefix: >-
+          samurai-{{ (azure_vm_name | regex_replace('[^a-zA-Z0-9-]', ''))[:40] }}
+
     - name: "Initialise disks-to-snapshot list with OS disk"
       ansible.builtin.set_fact:
         disks_to_snapshot:
           - role: "os"
             name: "{{ disk_facts.os_disk.name }}"
             id: "{{ disk_facts.os_disk.id }}"
+            snapshot_name: "{{ snapshot_name_prefix | trim }}-os-{{ snapshot_timestamp }}"
 
     - name: "Append each data disk to disks-to-snapshot list"
       ansible.builtin.set_fact:
@@ -72,11 +88,13 @@
           {{ disks_to_snapshot + [{
                'role': 'data',
                'name': item.name,
-               'id': item.managedDisk.id
+               'id': item.managedDisk.id,
+               'snapshot_name': (snapshot_name_prefix | trim) ~ '-data' ~ idx ~ '-' ~ snapshot_timestamp
              }] }}
       loop: "{{ disk_facts.data_disks | default([]) }}"
       loop_control:
         label: "{{ item.name | default('unnamed-data-disk') }}"
+        index_var: idx
       when:
         - item.name is defined
         - item.managedDisk is defined
@@ -100,13 +118,13 @@
       ansible.builtin.command: >
         az snapshot create
           --resource-group {{ azure_resource_group }}
-          --name samurai-{{ azure_vm_name }}-{{ item.name }}-{{ snapshot_timestamp }}
+          --name {{ item.snapshot_name }}
           --source {{ item.id }}
           -o json
       register: snapshot_create
       loop: "{{ disks_to_snapshot }}"
       loop_control:
-        label: "{{ item.name }}"
+        label: "{{ item.name }} -> {{ item.snapshot_name }}"
       changed_when: snapshot_create.rc == 0
 
     - name: "Build snapshot results list"
@@ -117,7 +135,7 @@
               'role': item.item.role,
               'source_disk_name': item.item.name,
               'source_disk_id': item.item.id,
-              'snapshot_name': 'samurai-' ~ azure_vm_name ~ '-' ~ item.item.name ~ '-' ~ snapshot_timestamp,
+              'snapshot_name': item.item.snapshot_name,
               'snapshot_id': (item.stdout | from_json).id,
               'created_at': snapshot_started_at
             }]

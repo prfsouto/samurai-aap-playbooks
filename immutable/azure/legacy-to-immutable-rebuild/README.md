@@ -46,6 +46,63 @@ The full sequence is documented in [`workflow.yml`](workflow.yml) and in
 
 ---
 
+## Execution modes
+
+The 7 playbooks need to share artifacts (`baseline/*.json`, `snapshots.json`,
+`network_identity.json`, ...) across stages. AAP Workflow Templates spawn a
+**separate ephemeral Execution Environment container per node**, so files
+written to `/tmp/...` in one node do **not** persist into the next node by
+default. There are two supported ways to handle this:
+
+### Mode A — Single Job Template (recommended for demos)
+
+Use the wrapper playbook
+[`playbooks/00_full_workflow.yml`](playbooks/00_full_workflow.yml). It
+imports all 7 playbooks in sequence inside **one** Ansible run, so the
+artifacts stay on the same Execution Environment filesystem and the
+inter-stage handoff works without any persistent storage.
+
+Setup:
+
+1. AAP UI → **Templates → Add → Job Template**.
+2. **Playbook:** `immutable/azure/legacy-to-immutable-rebuild/playbooks/00_full_workflow.yml`
+3. Attach the Azure RM credential and the target VM Machine credential.
+4. Check **Prompt on launch** for *Extra variables* (so SamurAI Shield can
+   override at launch time).
+5. Save. Launch.
+
+Trade-off: you lose per-stage gating in the AAP UI (the workflow runs as a
+single job), but the entire pipeline runs end-to-end with zero infra setup.
+
+### Mode B — Multi-node Workflow Template (production)
+
+Use the workflow definition in [`workflow.yml`](workflow.yml). Each of the
+7 nodes points to its own Job Template. Per-stage gating, pause and
+restart are available.
+
+**Hard requirement for Mode B:** the Execution Environment must mount a
+**persistent volume** at the path used by `artifact_output_dir`. Options:
+
+- Azure Files share mounted into the EE container (recommended on Azure).
+- NFS share mounted at `/mnt/samurai-artifacts/`.
+- Kubernetes PersistentVolumeClaim (when AAP is deployed on OpenShift / k8s).
+
+Without a persistent mount, every node re-clones the repo into a fresh
+`/tmp/` and the inter-stage handoff fails with
+`Baseline not found at <path>/baseline/disk_facts.json`. See the section
+"Failure points and recovery" in
+[`docs/azure_legacy_to_immutable_rebuild_workflow.md`](docs/azure_legacy_to_immutable_rebuild_workflow.md)
+for the EE configuration cookbook.
+
+### Which one am I running?
+
+| Symptom | You're in… |
+| ------- | ---------- |
+| One Job Template, one log, all 7 PLAYs scroll past in sequence | Mode A |
+| Workflow Template, 7 nodes in the visualiser, each its own log | Mode B (needs persistent volume) |
+
+---
+
 ## Prerequisites
 
 ### Azure

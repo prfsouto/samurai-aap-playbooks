@@ -236,6 +236,72 @@ every task that touches it.
 
 ---
 
+## 6.1 Execution Environment persistence (critical)
+
+Each AAP Workflow node spawns a **separate ephemeral Execution Environment
+container**. Files written to `/tmp/...` in a node are wiped when that
+node's container terminates — they do **not** carry over to the next node.
+
+Because the Legacy-to-Immutable Rebuild flow hands JSON artifacts from one
+stage to the next via the filesystem (e.g. playbook 02 reads
+`baseline/disk_facts.json` written by playbook 01), this matters a lot.
+
+### Two supported configurations
+
+#### A. Single Job Template via `00_full_workflow.yml` (no infra change)
+
+The wrapper playbook
+`playbooks/00_full_workflow.yml` imports all 7 playbooks in one Ansible
+run. Single container, single `/tmp/`, artifacts naturally persist.
+Recommended for demos and first-time validation.
+
+#### B. Multi-node Workflow Template + Persistent Volume
+
+Mount a persistent volume into the Execution Environment at the path that
+will be used by `artifact_output_dir`. Two common implementations:
+
+##### B.1 — Azure Files (recommended on Azure)
+
+1. Create an Azure Files share, e.g.
+   `samuraiartifacts.file.core.windows.net/legacy-to-immutable`.
+2. On the AAP controller host (or in the EE definition), add a CIFS mount
+   at `/mnt/samurai-artifacts`:
+   ```
+   //samuraiartifacts.file.core.windows.net/legacy-to-immutable /mnt/samurai-artifacts \
+       cifs vers=3.0,credentials=/etc/samurai-azfiles.cred,dir_mode=0750,file_mode=0640 0 0
+   ```
+3. In the EE definition (`execution-environment.yml`), bind-mount the host
+   path into the container:
+   ```yaml
+   additional_build_steps:
+     append_final: []
+   # In the AAP "Mount Paths" setting for this EE, add:
+   #   /mnt/samurai-artifacts:/mnt/samurai-artifacts
+   ```
+4. Set `artifact_output_dir: /mnt/samurai-artifacts/<managed_server_id>-<vm_name>`.
+
+##### B.2 — Kubernetes PersistentVolumeClaim (AAP on OpenShift)
+
+In the controller's `awx-ee` deployment, add a PVC mount and reference it
+in the EE container spec. Documented in the official AAP installer guide.
+
+### How to tell if you forgot the persistent volume
+
+Symptom: playbook 02 fails on the first task with:
+
+```
+Baseline not found at <artifact_output_dir>/baseline/disk_facts.json.
+Run 01_collect_azure_vm_baseline.yml first.
+```
+
+…even though playbook 01 just succeeded. That is the canonical sign that
+each node is starting from an empty `/tmp/`.
+
+Fix: either switch to Mode A (single Job Template) or finish the
+persistent-volume configuration above.
+
+---
+
 ## 7. Failure points and recovery
 
 | Stage | Failure              | Recovery                                                    |

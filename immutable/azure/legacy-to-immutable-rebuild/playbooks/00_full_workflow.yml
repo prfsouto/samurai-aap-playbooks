@@ -1,0 +1,65 @@
+---
+# ============================================================================
+# SamurAI Shield :: Legacy-to-Immutable Rebuild :: full workflow wrapper
+# ----------------------------------------------------------------------------
+# Imports all 7 playbooks in sequence inside a SINGLE Ansible run so that
+# the artifacts written to {{ artifact_output_dir }} by each stage are
+# visible to the next stage.
+#
+# Why this wrapper exists:
+#   AAP Workflow Templates spawn a separate ephemeral Execution Environment
+#   container for every node. Files written to /tmp/... in node N do NOT
+#   persist into node N+1 because each container is destroyed when its job
+#   finishes. As a result, playbook 02 cannot find the baseline JSON files
+#   that playbook 01 wrote, and so on. Running all 7 playbooks inside one
+#   Job Template (this wrapper) keeps them in the same EE filesystem, so
+#   the inter-stage file handoff works without any persistent storage.
+#
+# When to use this wrapper vs. the multi-node Workflow Template:
+#   * Use this wrapper as the target of a SINGLE Job Template when:
+#       - You want a self-contained, demo-friendly, no-infra-required run.
+#       - You don't need per-stage manual gating in AAP UI.
+#   * Use the multi-node Workflow Template (workflow.yml) when:
+#       - The Execution Environment has a persistent volume mounted at
+#         the location pointed to by artifact_output_dir.
+#       - You want per-stage approval / pause / restart points in AAP.
+#
+# How safety gates still work:
+#   * dry_run and confirm_destructive_action are honoured by playbook 04
+#     exactly as in the multi-node flow. Set dry_run=true on the first run
+#     to validate end-to-end without any destructive action.
+#   * Playbook 02 (snapshots) and playbook 07 (Git commit) are mutating
+#     even in dry_run. If you want a fully read-only rehearsal, run
+#     playbooks 01, 03 and 06 individually instead of this wrapper.
+#
+# Required extra-vars (same contract as the multi-node flow):
+#   azure_subscription_id, azure_resource_group, azure_vm_name,
+#   artifact_output_dir, target_host, os_connection_type,
+#   ssh_username (Linux) or winrm_username (Windows),
+#   managed_server_id, git_repo_url, git_branch,
+#   dry_run, confirm_destructive_action.
+#
+# See ../sample_extra_vars.yml for the full payload and ../README.md
+# section "Execution modes" for the operational details.
+# ============================================================================
+
+- name: "SamurAI :: legacy-to-immutable :: 1/7 collect baseline"
+  import_playbook: 01_collect_azure_vm_baseline.yml
+
+- name: "SamurAI :: legacy-to-immutable :: 2/7 create safety snapshots"
+  import_playbook: 02_create_safety_snapshots.yml
+
+- name: "SamurAI :: legacy-to-immutable :: 3/7 preserve network identity"
+  import_playbook: 03_preserve_network_identity.yml
+
+- name: "SamurAI :: legacy-to-immutable :: 4/7 destructive rebuild (gated)"
+  import_playbook: 04_rebuild_vm_from_existing_os_disk.yml
+
+- name: "SamurAI :: legacy-to-immutable :: 5/7 post-rebuild validation"
+  import_playbook: 05_post_rebuild_validation.yml
+
+- name: "SamurAI :: legacy-to-immutable :: 6/7 generate Terraform"
+  import_playbook: 06_generate_terraform_from_vm.yml
+
+- name: "SamurAI :: legacy-to-immutable :: 7/7 commit artifacts to Git"
+  import_playbook: 07_commit_artifacts_to_git.yml
