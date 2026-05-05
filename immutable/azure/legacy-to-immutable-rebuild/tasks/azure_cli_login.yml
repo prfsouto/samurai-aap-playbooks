@@ -67,7 +67,15 @@
   ansible.builtin.command: az cloud set --name AzureCloud
   changed_when: false
 
-- name: "azure-cli-login :: login with service principal"
+# ============================================================================
+# >>> TEMPORARY DEBUG BLOCK <<<
+# no_log was removed from the `az login` task on purpose to expose the
+# stderr / cmd / rc when the SP login fails on AAP. This WILL print the
+# Service Principal ID, the tenant ID and the registered command line in
+# stdout. RESTORE no_log: true and remove the two debug tasks below as
+# soon as the login is working.
+# ============================================================================
+- name: "azure-cli-login :: login with service principal (DEBUG, no_log off)"
   ansible.builtin.command:
     argv:
       - az
@@ -81,7 +89,19 @@
       - "{{ _azure_tenant }}"
   register: az_login_result
   changed_when: az_login_result.rc == 0
-  no_log: true
+  failed_when: false
+
+- name: "azure-cli-login :: debug login result (TEMPORARY)"
+  ansible.builtin.debug:
+    var: az_login_result
+
+- name: "azure-cli-login :: fail if login failed (TEMPORARY)"
+  ansible.builtin.fail:
+    msg: "Azure CLI login failed: {{ az_login_result.stderr }}"
+  when: az_login_result.rc != 0
+# ============================================================================
+# >>> END TEMPORARY DEBUG BLOCK <<<
+# ============================================================================
 
 - name: "azure-cli-login :: set subscription context"
   ansible.builtin.command: >
