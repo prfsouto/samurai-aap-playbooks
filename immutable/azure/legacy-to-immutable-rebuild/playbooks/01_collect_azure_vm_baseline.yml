@@ -121,10 +121,27 @@
       ansible.builtin.set_fact:
         azure_nic_raw: "{{ az_nic_show.stdout | from_json }}"
 
-    - name: "Resolve public IP ID (if any)"
+    # `az network nic show` returns the IP keys with `IP` in uppercase
+    # (publicIPAddress, privateIPAddress) in modern CLI versions, but
+    # some older / forked builds use lowercase `Ip` (publicIpAddress).
+    # We resolve via cascading defaults so both are accepted. Same goes
+    # for publicIPAllocationMethod on `az network public-ip show`.
+    - name: "Resolve primary IP configuration block (NIC)"
+      ansible.builtin.set_fact:
+        primary_ip_config: "{{ (azure_nic_raw.ipConfigurations | default([{}]))[0] | default({}) }}"
+
+    - name: "Resolve public IP ID (handle both PI/IP casings)"
       ansible.builtin.set_fact:
         primary_public_ip_id: >-
-          {{ (azure_nic_raw.ipConfigurations | default([]))[0].publicIpAddress.id | default('') }}
+          {{ (primary_ip_config.publicIPAddress
+              | default(primary_ip_config.publicIpAddress | default({}))).id
+             | default('') }}
+
+    - name: "Resolve private IP address (handle both casings)"
+      ansible.builtin.set_fact:
+        primary_private_ip: >-
+          {{ primary_ip_config.privateIPAddress
+             | default(primary_ip_config.privateIpAddress | default('unknown')) }}
 
     - name: "Fetch Public IP details"
       ansible.builtin.command: >
@@ -145,15 +162,17 @@
             id: "{{ azure_nic_raw.id | default('unknown') }}"
             name: "{{ azure_nic_raw.name | default('unknown') }}"
             mac: "{{ azure_nic_raw.macAddress | default('unknown') }}"
-            private_ip: "{{ (azure_nic_raw.ipConfigurations | default([]))[0].privateIpAddress | default('unknown') }}"
-            subnet_id: "{{ (azure_nic_raw.ipConfigurations | default([]))[0].subnet.id | default('unknown') }}"
-            nsg_id: "{{ azure_nic_raw.networkSecurityGroup.id | default('') }}"
+            private_ip: "{{ primary_private_ip }}"
+            subnet_id: "{{ (primary_ip_config.subnet | default({})).id | default('unknown') }}"
+            nsg_id: "{{ (azure_nic_raw.networkSecurityGroup | default({})).id | default('') }}"
           public_ip:
             id: "{{ azure_public_ip_raw.id | default('') }}"
             name: "{{ azure_public_ip_raw.name | default('') }}"
             address: "{{ azure_public_ip_raw.ipAddress | default('') }}"
-            allocation_method: "{{ azure_public_ip_raw.publicIpAllocationMethod | default('unknown') }}"
-            sku: "{{ azure_public_ip_raw.sku.name | default('unknown') }}"
+            allocation_method: >-
+              {{ azure_public_ip_raw.publicIPAllocationMethod
+                 | default(azure_public_ip_raw.publicIpAllocationMethod | default('unknown')) }}
+            sku: "{{ (azure_public_ip_raw.sku | default({})).name | default('unknown') }}"
 
     # ------------------------------------------------------------------
     # Disks (OS + data)

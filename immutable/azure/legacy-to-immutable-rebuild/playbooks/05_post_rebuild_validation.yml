@@ -74,12 +74,25 @@
       ansible.builtin.set_fact:
         post_nic: "{{ post_nic_show.stdout | from_json }}"
 
+    # Resolve post-rebuild IP fields handling both publicIPAddress (uppercase IP,
+    # modern az CLI) and publicIpAddress (lowercase Ip, older builds).
+    - name: "Resolve post-rebuild primary IP fields"
+      ansible.builtin.set_fact:
+        post_primary_public_ip_id: >-
+          {{ (cfg.publicIPAddress | default(cfg.publicIpAddress | default({}))).id
+             | default('') }}
+        post_primary_private_ip: >-
+          {{ cfg.privateIPAddress
+             | default(cfg.privateIpAddress | default('')) }}
+      vars:
+        cfg: "{{ (post_nic.ipConfigurations | default([{}]))[0] | default({}) }}"
+
     - name: "Re-fetch Public IP (post-rebuild)"
       ansible.builtin.command: >
-        az network public-ip show --ids {{ (post_nic.ipConfigurations | default([]))[0].publicIpAddress.id | default('') }} -o json
+        az network public-ip show --ids {{ post_primary_public_ip_id }} -o json
       register: post_pip_show
       changed_when: false
-      when: ((post_nic.ipConfigurations | default([]))[0].publicIpAddress.id | default('')) != ''
+      when: post_primary_public_ip_id != ''
 
     - name: "Parse post-rebuild Public IP JSON"
       ansible.builtin.set_fact:
@@ -105,8 +118,8 @@
             ok: "{{ (post_pip.ipAddress | default('')) == baseline_net.public_ip_address }}"
           - name: "private_ip_preserved"
             expected: "{{ baseline_net.private_ip }}"
-            actual: "{{ (post_nic.ipConfigurations | default([]))[0].privateIpAddress | default('') }}"
-            ok: "{{ ((post_nic.ipConfigurations | default([]))[0].privateIpAddress | default('')) == baseline_net.private_ip }}"
+            actual: "{{ post_primary_private_ip }}"
+            ok: "{{ post_primary_private_ip == baseline_net.private_ip }}"
           - name: "nic_preserved"
             expected: "{{ baseline_net.nic_id }}"
             actual: "{{ post_nic.id | default('') }}"
@@ -149,7 +162,7 @@
               after: "{{ post_nic.id | default('unknown') }}"
             private_ip:
               before: "{{ baseline_net.private_ip }}"
-              after: "{{ (post_nic.ipConfigurations | default([]))[0].privateIpAddress | default('unknown') }}"
+              after: "{{ post_primary_private_ip | default('unknown') }}"
             public_ip:
               before: "{{ baseline_net.public_ip_address }}"
               after: "{{ post_pip.ipAddress | default('unknown') }}"
