@@ -192,7 +192,8 @@
   become: "{{ (os_connection_type | default('ssh')) == 'ssh' }}"
   ignore_unreachable: true
   vars:
-    validation_dir: "{{ hostvars['localhost'].validation_dir }}"
+    # Recompute locally — play vars on play 1 are not exposed via hostvars.
+    validation_dir: "{{ artifact_output_dir }}/validation"
 
   tasks:
     - name: "Linux :: collect failed services post-rebuild"

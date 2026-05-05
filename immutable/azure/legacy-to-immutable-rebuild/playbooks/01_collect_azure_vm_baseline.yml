@@ -233,7 +233,10 @@
   gather_facts: true
   become: "{{ (os_connection_type | default('ssh')) == 'ssh' }}"
   vars:
-    baseline_dir: "{{ hostvars['localhost'].baseline_dir }}"
+    # baseline_dir is recomputed locally (play vars on play 1 are not
+    # accessible via hostvars — only facts set via set_fact/register).
+    # artifact_output_dir is an extra_var, available in every play.
+    baseline_dir: "{{ artifact_output_dir }}/baseline"
     execution_started_at: "{{ hostvars['localhost'].execution_started_at }}"
 
   tasks:
