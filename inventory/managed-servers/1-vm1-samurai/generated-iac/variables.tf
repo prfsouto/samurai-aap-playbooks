@@ -78,6 +78,6 @@ variable "tags" {
   type        = map(string)
   default     = {
     "samurai_shield_origin" = "legacy-to-immutable-rebuild"
-    "samurai_shield_baseline_at" = "2026-05-05T05:31:48Z"
+    "samurai_shield_baseline_at" = "2026-05-05T05:46:08Z"
   }
 }

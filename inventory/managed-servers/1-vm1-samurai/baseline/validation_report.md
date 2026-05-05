@@ -1,6 +1,6 @@
 # Baseline Validation Report — vm1-samurai
 
-**Generated at (UTC):** 2026-05-05T05:30:25Z
+**Generated at (UTC):** 2026-05-05T05:44:46Z
 **Subscription:** `8a46e231-771b-40d7-90f5-6a8e17682197`
 **Resource group:** `Samurai`
 **Flow:** SamurAI Shield :: Legacy-to-Immutable Rebuild

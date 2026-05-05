@@ -1,6 +1,6 @@
 {
     "allocation_method": "Static",
-    "captured_at": "2026-05-05T05:31:19Z",
+    "captured_at": "2026-05-05T05:45:40Z",
     "nic_id": "/subscriptions/8a46e231-771b-40d7-90f5-6a8e17682197/resourceGroups/Samurai/providers/Microsoft.Network/networkInterfaces/vm1-samurai814_z1",
     "nic_name": "vm1-samurai814_z1",
     "nsg_id": "/subscriptions/8a46e231-771b-40d7-90f5-6a8e17682197/resourceGroups/Samurai/providers/Microsoft.Network/networkSecurityGroups/vm1-samurai-nsg",

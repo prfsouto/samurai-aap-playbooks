@@ -1,7 +1,7 @@
 {
     "architecture": "x86_64",
-    "collected_at": "2026-05-05T05:30:25Z",
-    "cron_linux": "### /etc/crontab\nSHELL=/bin/bash\nPATH=/sbin:/bin:/usr/sbin:/usr/bin\nMAILTO=root\n\n# For details see man 4 crontabs\n\n# Example of job definition:\n# .---------------- minute (0 - 59)\n# |  .------------- hour (0 - 23)\n# |  |  .---------- day of month (1 - 31)\n# |  |  |  .------- month (1 - 12) OR jan,feb,mar,apr ...\n# |  |  |  |  .---- day of week (0 - 6) (Sunday=0 or 7) OR sun,mon,tue,wed,thu,fri,sat\n# |  |  |  |  |\n# *  *  *  *  * user-name  command to be executed\n\n### /etc/cron.d\ntotal 20\ndrwxr-xr-x.   2 root root   39 May 23  2025 .\ndrwxr-xr-x. 102 root root 8192 May  5 04:05 ..\n-rw-r--r--.   1 root root  128 Nov 30  2023 0hourly\n-rw-r--r--.   1 root root  108 Oct 30  2024 raid-check\n### systemd timers\nTue 2026-05-05 06:02:24 UTC  31min left Tue 2026-05-05 04:56:44 UTC  34min ago    dnf-makecache.timer          dnf-makecache.service\nTue 2026-05-05 23:37:44 UTC  18h left   Mon 2026-05-04 23:37:44 UTC  5h 53min ago systemd-tmpfiles-clean.timer systemd-tmpfiles-clean.service\nWed 2026-05-06 00:00:00 UTC  18h left   Tue 2026-05-05 00:00:00 UTC  5h 30min ago mlocate-updatedb.timer       mlocate-updatedb.service\nWed 2026-05-06 00:00:00 UTC  18h left   Tue 2026-05-05 00:00:00 UTC  5h 30min ago unbound-anchor.timer         unbound-anchor.service\nn/a                          n/a        Mon 2026-05-04 23:23:44 UTC  6h ago       update-client-package.timer  update-client-package.service",
+    "collected_at": "2026-05-05T05:44:46Z",
+    "cron_linux": "### /etc/crontab\nSHELL=/bin/bash\nPATH=/sbin:/bin:/usr/sbin:/usr/bin\nMAILTO=root\n\n# For details see man 4 crontabs\n\n# Example of job definition:\n# .---------------- minute (0 - 59)\n# |  .------------- hour (0 - 23)\n# |  |  .---------- day of month (1 - 31)\n# |  |  |  .------- month (1 - 12) OR jan,feb,mar,apr ...\n# |  |  |  |  .---- day of week (0 - 6) (Sunday=0 or 7) OR sun,mon,tue,wed,thu,fri,sat\n# |  |  |  |  |\n# *  *  *  *  * user-name  command to be executed\n\n### /etc/cron.d\ntotal 20\ndrwxr-xr-x.   2 root root   39 May 23  2025 .\ndrwxr-xr-x. 102 root root 8192 May  5 04:05 ..\n-rw-r--r--.   1 root root  128 Nov 30  2023 0hourly\n-rw-r--r--.   1 root root  108 Oct 30  2024 raid-check\n### systemd timers\nTue 2026-05-05 06:02:24 UTC  17min left Tue 2026-05-05 04:56:44 UTC  48min ago    dnf-makecache.timer          dnf-makecache.service\nTue 2026-05-05 23:37:44 UTC  17h left   Mon 2026-05-04 23:37:44 UTC  6h ago       systemd-tmpfiles-clean.timer systemd-tmpfiles-clean.service\nWed 2026-05-06 00:00:00 UTC  18h left   Tue 2026-05-05 00:00:00 UTC  5h 45min ago mlocate-updatedb.timer       mlocate-updatedb.service\nWed 2026-05-06 00:00:00 UTC  18h left   Tue 2026-05-05 00:00:00 UTC  5h 45min ago unbound-anchor.timer         unbound-anchor.service\nn/a                          n/a        Mon 2026-05-04 23:23:44 UTC  6h ago       update-client-package.timer  update-client-package.service",
     "distribution": "RedHat",
     "distribution_version": "8.10",
     "firewall_linux": "tool=firewalld\nrunning\npublic (active)\n  target: default\n  icmp-block-inversion: no\n  interfaces: eth0\n  sources: \n  services: cockpit dhcpv6-client ssh\n  ports: \n  protocols: \n  forward: no\n  masquerade: no\n  forward-ports: \n  source-ports: \n  icmp-blocks: \n  rich rules: ",
@@ -120,10 +120,10 @@
             "uuid": "6E66-F38E"
         },
         {
-            "block_available": 1883187,
+            "block_available": 1883043,
             "block_size": 4096,
             "block_total": 2094592,
-            "block_used": 211405,
+            "block_used": 211549,
             "device": "/dev/mapper/rootvg-varlv",
             "dump": 0,
             "fstype": "xfs",
@@ -133,7 +133,7 @@
             "mount": "/var",
             "options": "rw,seclabel,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota",
             "passno": 0,
-            "size_available": 7713533952,
+            "size_available": 7712944128,
             "size_total": 8579448832,
             "uuid": "ed97133b-c5c2-4b02-9f73-74bece8c4af8"
         },

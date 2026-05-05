@@ -1,6 +1,6 @@
 # Generated Terraform baseline — vm1-samurai
 
-Generated at: 2026-05-05T05:31:48Z
+Generated at: 2026-05-05T05:46:08Z
 Source: SamurAI Shield :: Legacy-to-Immutable Rebuild
 Subscription: 8a46e231-771b-40d7-90f5-6a8e17682197
 Resource group: Samurai

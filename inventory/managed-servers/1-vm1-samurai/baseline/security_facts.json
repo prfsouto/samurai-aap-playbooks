@@ -2,7 +2,7 @@
     "boot_diagnostics": {
         "enabled": true
     },
-    "collected_at": "2026-05-05T05:30:25Z",
+    "collected_at": "2026-05-05T05:44:46Z",
     "extensions": [
         {
             "autoUpgradeMinorVersion": true,

@@ -1,12 +1,12 @@
 {
-    "collected_at": "2026-05-05T05:30:55Z",
+    "collected_at": "2026-05-05T05:45:14Z",
     "resource_group": "Samurai",
     "snapshots": [
         {
-            "created_at": "2026-05-05T05:30:55Z",
+            "created_at": "2026-05-05T05:45:14Z",
             "role": "os",
-            "snapshot_id": "/subscriptions/8a46e231-771b-40d7-90f5-6a8e17682197/resourceGroups/Samurai/providers/Microsoft.Compute/snapshots/samurai-vm1-samurai-os-20260505T053055Z",
-            "snapshot_name": "samurai-vm1-samurai-os-20260505T053055Z",
+            "snapshot_id": "/subscriptions/8a46e231-771b-40d7-90f5-6a8e17682197/resourceGroups/Samurai/providers/Microsoft.Compute/snapshots/samurai-vm1-samurai-os-20260505T054514Z",
+            "snapshot_name": "samurai-vm1-samurai-os-20260505T054514Z",
             "source_disk_id": "/subscriptions/8a46e231-771b-40d7-90f5-6a8e17682197/resourceGroups/SAMURAI/providers/Microsoft.Compute/disks/vm1-samurai_OsDisk_1_2d9c0ae602e947aebbeb03c4d4eb1d47",
             "source_disk_name": "vm1-samurai_OsDisk_1_2d9c0ae602e947aebbeb03c4d4eb1d47"
         }

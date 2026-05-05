@@ -1,25 +1,25 @@
 {
     "actions": [
         {
-            "at": "2026-05-05T05:31:26Z",
+            "at": "2026-05-05T05:45:47Z",
             "dry_run": true,
             "rc": 0,
             "samurai_action": "deallocate"
         },
         {
-            "at": "2026-05-05T05:31:27Z",
+            "at": "2026-05-05T05:45:47Z",
             "dry_run": true,
             "rc": 0,
             "samurai_action": "delete_vm_resource"
         },
         {
-            "at": "2026-05-05T05:31:27Z",
+            "at": "2026-05-05T05:45:47Z",
             "dry_run": true,
             "rc": 0,
             "samurai_action": "create_vm_from_os_disk"
         },
         {
-            "at": "2026-05-05T05:31:27Z",
+            "at": "2026-05-05T05:45:47Z",
             "dry_run": true,
             "rc": 0,
             "samurai_action": "start_vm"
@@ -27,7 +27,7 @@
     ],
     "confirm_destructive_action": false,
     "dry_run": true,
-    "finished_at": "2026-05-05T05:31:27Z",
+    "finished_at": "2026-05-05T05:45:48Z",
     "gates": {
         "confirm_destructive_action": false,
         "dry_run": true,
@@ -39,7 +39,7 @@
     "os_disk_id_used": "/subscriptions/8a46e231-771b-40d7-90f5-6a8e17682197/resourceGroups/SAMURAI/providers/Microsoft.Compute/disks/vm1-samurai_OsDisk_1_2d9c0ae602e947aebbeb03c4d4eb1d47",
     "public_ip_preserved": "172.206.227.150",
     "resource_group": "Samurai",
-    "started_at": "2026-05-05T05:31:20Z",
+    "started_at": "2026-05-05T05:45:41Z",
     "status": "planned",
     "subscription_id": "8a46e231-771b-40d7-90f5-6a8e17682197",
     "vm_name": "vm1-samurai"

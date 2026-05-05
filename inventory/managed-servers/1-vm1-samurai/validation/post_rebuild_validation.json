@@ -44,7 +44,7 @@
         }
     ],
     "azure_status": "passed",
-    "generated_at": "2026-05-05T05:31:28Z",
+    "generated_at": "2026-05-05T05:45:48Z",
     "os_post_rebuild": {
         "failed_services": [],
         "fqdn": "vm1-samurai.internal.cloudapp.net",

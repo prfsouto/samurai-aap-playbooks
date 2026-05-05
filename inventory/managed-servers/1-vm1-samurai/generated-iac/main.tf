@@ -4,7 +4,7 @@
 # Source VM:   vm1-samurai
 # Subscription:8a46e231-771b-40d7-90f5-6a8e17682197
 # Resource group: Samurai
-# Generated at:2026-05-05T05:31:48Z
+# Generated at:2026-05-05T05:46:08Z
 #
 # WARNING: this is a generated baseline. Review every "TODO: review" comment
 # below before running terraform apply against any environment. No secrets,
