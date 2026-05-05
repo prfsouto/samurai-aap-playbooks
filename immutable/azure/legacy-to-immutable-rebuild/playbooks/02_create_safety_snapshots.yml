@@ -52,10 +52,8 @@
         state: directory
         mode: '0750'
 
-    - name: "Set Azure CLI subscription context"
-      ansible.builtin.command: >
-        az account set --subscription {{ azure_subscription_id }}
-      changed_when: false
+    - name: "Authenticate Azure CLI (Service Principal) and set subscription"
+      ansible.builtin.import_tasks: ../tasks/azure_cli_login.yml
 
     # ------------------------------------------------------------------
     # Build a flat list of disks to snapshot (OS first, then each data

@@ -52,6 +52,9 @@
         state: directory
         mode: '0750'
 
+    - name: "Authenticate Azure CLI (Service Principal) and set subscription"
+      ansible.builtin.import_tasks: ../tasks/azure_cli_login.yml
+
     - name: "Validate snapshots.json exists"
       ansible.builtin.stat:
         path: "{{ snapshots_dir }}/snapshots.json"
@@ -148,12 +151,8 @@
 
     # ------------------------------------------------------------------
     # 3) Real destructive sequence (only when not dry_run AND confirmed).
+    # Subscription context is already set by the login task above.
     # ------------------------------------------------------------------
-    - name: "Set Azure CLI subscription context"
-      ansible.builtin.command: >
-        az account set --subscription {{ azure_subscription_id }}
-      changed_when: false
-      when: not dry_run
 
     # 3a) Stop + deallocate ------------------------------------------------
     - name: "Stop and deallocate VM"
@@ -170,7 +169,7 @@
     - name: "Record deallocate action"
       ansible.builtin.set_fact:
         rebuild_actions_log: "{{ rebuild_actions_log + [{
-          'action': 'deallocate',
+          'samurai_action': 'deallocate',
           'rc': deallocate_result.rc | default(0),
           'at': lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ'),
           'dry_run': dry_run
@@ -212,7 +211,7 @@
     - name: "Record delete action"
       ansible.builtin.set_fact:
         rebuild_actions_log: "{{ rebuild_actions_log + [{
-          'action': 'delete_vm_resource',
+          'samurai_action': 'delete_vm_resource',
           'rc': delete_result.rc | default(0),
           'at': lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ'),
           'dry_run': dry_run
@@ -244,7 +243,7 @@
     - name: "Record create action"
       ansible.builtin.set_fact:
         rebuild_actions_log: "{{ rebuild_actions_log + [{
-          'action': 'create_vm_from_os_disk',
+          'samurai_action': 'create_vm_from_os_disk',
           'rc': create_result.rc | default(0),
           'at': lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ'),
           'dry_run': dry_run
@@ -286,7 +285,7 @@
     - name: "Record start action"
       ansible.builtin.set_fact:
         rebuild_actions_log: "{{ rebuild_actions_log + [{
-          'action': 'start_vm',
+          'samurai_action': 'start_vm',
           'rc': start_result.rc | default(0),
           'at': lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ'),
           'dry_run': dry_run

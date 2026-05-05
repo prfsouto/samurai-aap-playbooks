@@ -39,6 +39,11 @@
         state: directory
         mode: '0750'
 
+    # Authenticate Azure CLI for uniformity with the rest of the workflow,
+    # even though this play is template-rendering only.
+    - name: "Authenticate Azure CLI (Service Principal) and set subscription"
+      ansible.builtin.import_tasks: ../tasks/azure_cli_login.yml
+
     - name: "Load baseline azure_vm_facts.json"
       ansible.builtin.set_fact:
         azure_vm_facts: "{{ lookup('file', baseline_dir ~ '/azure_vm_facts.json') | from_json }}"
