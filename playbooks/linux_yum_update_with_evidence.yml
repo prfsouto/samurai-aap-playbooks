@@ -350,28 +350,51 @@
               }}
           when: ACTION == 'Apply'
 
-        - name: "Execute package update"
-          ansible.builtin.command: "{{ update_argv }}"
+        - name: "Execute package update with explicit stdout/stderr evidence capture"
+          ansible.builtin.shell: |
+            set -o pipefail
+            {{ update_argv | map('quote') | join(' ') }} > "{{ evidence_dir }}/update_stdout.txt" 2> "{{ evidence_dir }}/update_stderr.txt"
+          args:
+            executable: /bin/bash
           register: update_result
-          changed_when: ACTION == 'Apply' and update_result.rc == 0 and ('Nothing to do' not in (update_result.stdout | default('')))
+          changed_when: ACTION == 'Apply' and update_result.rc == 0
           failed_when: false
           when: ACTION == 'Apply'
 
-        - name: "Write update_stdout.txt"
+        - name: "Ensure update_stdout.txt exists in Check mode"
           ansible.builtin.copy:
             dest: "{{ evidence_dir }}/update_stdout.txt"
             mode: '0640'
-            content: "{{ (update_result.stdout | default('not_applicable_check_mode')) if ACTION == 'Apply' else 'not_applicable_check_mode' }}\n"
+            content: "not_applicable_check_mode\n"
+            force: false
+          when: ACTION != 'Apply'
 
-        - name: "Write update_stderr.txt"
+        - name: "Ensure update_stderr.txt exists in Check mode"
           ansible.builtin.copy:
             dest: "{{ evidence_dir }}/update_stderr.txt"
             mode: '0640'
-            content: "{{ (update_result.stderr | default('not_applicable_check_mode')) if ACTION == 'Apply' else 'not_applicable_check_mode' }}\n"
+            content: "not_applicable_check_mode\n"
+            force: false
+          when: ACTION != 'Apply'
+
+        - name: "Read update stdout/stderr tail on failure"
+          ansible.builtin.shell: |
+            echo "----- stdout tail -----"
+            tail -120 "{{ evidence_dir }}/update_stdout.txt" 2>/dev/null || true
+            echo "----- stderr tail -----"
+            tail -120 "{{ evidence_dir }}/update_stderr.txt" 2>/dev/null || true
+          args:
+            executable: /bin/bash
+          register: update_error_tail
+          changed_when: false
+          failed_when: false
+          when:
+            - ACTION == 'Apply'
+            - update_result.rc | default(0) != 0
 
         - name: "Fail playbook when update returned non-zero"
           ansible.builtin.fail:
-            msg: >-
+            msg: |
               {% if UPDATE_MODE == 'security' %}
               Security update failed (rc={{ update_result.rc }}) on {{ inventory_hostname }}.
               UPDATE_MODE=security requires that the package manager, the security plugin
@@ -380,11 +403,19 @@
               missing the command --security may be rejected, return no candidates, or
               fail with 'No such command' / 'unknown option'. The playbook deliberately
               does NOT fall back to a full update — fix the security metadata or relaunch
-              with UPDATE_MODE=all if a full update is acceptable. See
-              {{ evidence_dir }}/update_stderr.txt for the underlying error.
+              with UPDATE_MODE=all if a full update is acceptable.
+              Evidence files:
+              - {{ evidence_dir }}/update_stdout.txt
+              - {{ evidence_dir }}/update_stderr.txt
+              Diagnostic tail:
+              {{ update_error_tail.stdout | default('no diagnostic output captured') }}
               {% else %}
               Package update failed (rc={{ update_result.rc }}) on {{ inventory_hostname }}.
-              See {{ evidence_dir }}/update_stderr.txt for details.
+              Evidence files:
+              - {{ evidence_dir }}/update_stdout.txt
+              - {{ evidence_dir }}/update_stderr.txt
+              Diagnostic tail:
+              {{ update_error_tail.stdout | default('no diagnostic output captured') }}
               {% endif %}
           when:
             - ACTION == 'Apply'
