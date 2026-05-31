@@ -15,7 +15,16 @@
 # Extra-vars contract: HOSTNAMES (required), ACTION (Check|Apply, default Check),
 # UPDATE_MODE (all|security, default all), EXCLUDE_PACKAGES (csv, optional),
 # ALLOW_REBOOT (bool, default false), EVIDENCE_BASE_DIR (default
-# /var/tmp/samurai-shield/yum-update), SERIAL_BATCH (default 1).
+# /var/tmp/samurai-shield/yum-update), SERIAL_BATCH (default 1),
+# LOG_LEVEL (summary|package|full, default package). LOG_LEVEL controls how
+# much of the package-manager output is echoed into the AAP/Execution Center
+# job log (it never changes what is applied and never disables the structured
+# evidence files):
+#   - summary: approximate affected-package count + evidence_dir + reboot flags.
+#   - package: relevant transaction lines (Installing/Upgrading/Removing/...),
+#              capped at 300 lines.
+#   - full:    complete stdout + stderr, capped at 1000 lines each. WARNING:
+#              can produce very large job logs — use for deep troubleshooting.
 # See README.md at the repository root for full documentation.
 # ============================================================================
 
@@ -26,6 +35,7 @@
     HOSTNAMES: "{{ HOSTNAMES | default('') }}"
     ACTION: "{{ ACTION | default('Check') }}"
     UPDATE_MODE: "{{ UPDATE_MODE | default('all') }}"
+    LOG_LEVEL: "{{ LOG_LEVEL | default('package') }}"
   tasks:
     - name: "Validate HOSTNAMES is provided"
       ansible.builtin.fail:
@@ -42,6 +52,11 @@
         msg: "Invalid UPDATE_MODE '{{ UPDATE_MODE }}'. Allowed values: all, security."
       when: UPDATE_MODE not in ['all', 'security']
 
+    - name: "Validate LOG_LEVEL is summary, package or full"
+      ansible.builtin.fail:
+        msg: "Invalid LOG_LEVEL '{{ LOG_LEVEL }}'. Allowed values: summary, package, full."
+      when: LOG_LEVEL not in ['summary', 'package', 'full']
+
     - name: "Parse HOSTNAMES into a list"
       ansible.builtin.set_fact:
         samurai_target_hosts: >-
@@ -56,7 +71,7 @@
 
     - name: "Show resolved target hosts"
       ansible.builtin.debug:
-        msg: "Targets: {{ samurai_target_hosts | join(', ') }} | ACTION={{ ACTION }} | UPDATE_MODE={{ UPDATE_MODE }}"
+        msg: "Targets: {{ samurai_target_hosts | join(', ') }} | ACTION={{ ACTION }} | UPDATE_MODE={{ UPDATE_MODE }} | LOG_LEVEL={{ LOG_LEVEL }}"
 
 
 - name: "SamurAI :: yum-update :: pre-check, update and post-check"
@@ -68,9 +83,13 @@
   vars:
     ACTION: "{{ ACTION | default('Check') }}"
     UPDATE_MODE: "{{ UPDATE_MODE | default('all') }}"
+    LOG_LEVEL: "{{ LOG_LEVEL | default('package') }}"
     EXCLUDE_PACKAGES_RAW: "{{ EXCLUDE_PACKAGES | default('') }}"
     ALLOW_REBOOT: "{{ ALLOW_REBOOT | default(false) | bool }}"
     EVIDENCE_BASE_DIR: "{{ EVIDENCE_BASE_DIR | default('/var/tmp/samurai-shield/yum-update') }}"
+    log_package_max_lines: 300
+    log_full_max_lines: 1000
+    pkg_tx_regex: '^[[:space:]]*(Installing|Installed|Upgrading|Upgraded|Updating|Updated|Removing|Removed|Obsoleting|Replacing|Downgrading|Running scriptlet)\b'
 
     exclude_packages_list: >-
       {{
@@ -392,6 +411,87 @@
             - ACTION == 'Apply'
             - update_result.rc | default(0) != 0
 
+        # ------------------------------------------------------------------
+        # AAP / Execution Center observability (controlled by LOG_LEVEL).
+        # Renders the package-manager output into the job log WITHOUT touching
+        # the host and WITHOUT replacing the structured evidence files. Runs
+        # before the fail-on-error task so the operator still sees package and
+        # full detail even when the update returns non-zero.
+        # ------------------------------------------------------------------
+        - name: "Count package-transaction lines in update output (for AAP log)"
+          ansible.builtin.shell: |
+            set -o pipefail
+            f="{{ evidence_dir }}/update_stdout.txt"
+            if [ -f "$f" ]; then
+              grep -Ec '{{ pkg_tx_regex }}' "$f" || true
+            else
+              echo 0
+            fi
+          args:
+            executable: /bin/bash
+          register: pkg_tx_count
+          changed_when: false
+          failed_when: false
+
+        - name: "Compute approximate affected-package count"
+          ansible.builtin.set_fact:
+            approx_affected_packages: "{{ pkg_tx_count.stdout | default('0') | trim | int }}"
+
+        - name: "AAP log :: summary level"
+          ansible.builtin.debug:
+            msg:
+              - "SamurAI Shield :: yum-update :: SUMMARY"
+              - "host={{ inventory_hostname }} action={{ ACTION }} update_mode={{ UPDATE_MODE }}"
+              - "approx_affected_packages={{ approx_affected_packages }}"
+              - "updates_available_before={{ updates_available_count | default('unknown') }}"
+              - "evidence_dir={{ evidence_dir }}"
+              - "reboot_required_before={{ reboot_required_before | default('unknown') }}"
+              - "reboot_required_after={{ reboot_required_after | default('not_yet_computed') }}"
+          when: LOG_LEVEL == 'summary'
+
+        - name: "Extract package-transaction lines (capped) for AAP log"
+          ansible.builtin.shell: |
+            set -o pipefail
+            f="{{ evidence_dir }}/update_stdout.txt"
+            if [ -f "$f" ]; then
+              grep -E '{{ pkg_tx_regex }}' "$f" | head -n {{ log_package_max_lines | int }} || true
+            fi
+          args:
+            executable: /bin/bash
+          register: pkg_transaction_lines
+          changed_when: false
+          failed_when: false
+          when: LOG_LEVEL == 'package'
+
+        - name: "AAP log :: package level (max {{ log_package_max_lines }} lines)"
+          ansible.builtin.debug:
+            msg: >-
+              {{
+                pkg_transaction_lines.stdout_lines
+                if (pkg_transaction_lines.stdout_lines | default([]) | length) > 0
+                else ['no package-transaction lines found (Check mode, nothing to do, or update failed before any transaction)']
+              }}
+          when: LOG_LEVEL == 'package'
+
+        - name: "Read full update stdout/stderr (capped) for AAP log"
+          ansible.builtin.shell: |
+            echo "===== update_stdout.txt (max {{ log_full_max_lines }} lines) ====="
+            head -n {{ log_full_max_lines | int }} "{{ evidence_dir }}/update_stdout.txt" 2>/dev/null || echo "(update_stdout.txt not available)"
+            echo ""
+            echo "===== update_stderr.txt (max {{ log_full_max_lines }} lines) ====="
+            head -n {{ log_full_max_lines | int }} "{{ evidence_dir }}/update_stderr.txt" 2>/dev/null || echo "(update_stderr.txt not available)"
+          args:
+            executable: /bin/bash
+          register: full_update_log
+          changed_when: false
+          failed_when: false
+          when: LOG_LEVEL == 'full'
+
+        - name: "AAP log :: full level"
+          ansible.builtin.debug:
+            msg: "{{ full_update_log.stdout_lines | default(['(no update output captured)']) }}"
+          when: LOG_LEVEL == 'full'
+
         - name: "Fail playbook when update returned non-zero"
           ansible.builtin.fail:
             msg: |
@@ -623,6 +723,7 @@
               package_manager: "{{ pkg_manager | default('unknown') }}"
               action: "{{ ACTION }}"
               update_mode: "{{ UPDATE_MODE }}"
+              log_level: "{{ LOG_LEVEL }}"
               exclude_packages: "{{ exclude_packages_list }}"
               updates_available_before_count: "{{ updates_available_count | default(0) | int }}"
               packages_updated_count: "{{ (packages_updated | default([])) | length }}"
@@ -679,6 +780,7 @@
           playbook: "linux_yum_update_with_evidence"
           action: "{{ ACTION | default('Check') }}"
           update_mode: "{{ UPDATE_MODE | default('all') }}"
+          log_level: "{{ LOG_LEVEL | default('package') }}"
           status: "{{ consolidated_status }}"
           host_count: "{{ all_host_summaries | length }}"
           hosts: "{{ all_host_summaries }}"
