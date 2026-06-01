@@ -35,7 +35,11 @@
     HOSTNAMES: "{{ HOSTNAMES | default('') }}"
     ACTION: "{{ ACTION | default('Check') }}"
     UPDATE_MODE: "{{ UPDATE_MODE | default('all') }}"
-    LOG_LEVEL: "{{ LOG_LEVEL | default('package') }}"
+    # NOTE: must NOT redeclare LOG_LEVEL with a default referencing itself
+    # in vars — when the extra-var is absent the right-hand side resolves
+    # to the play-var itself and Ansible recurses. Use a distinct internal
+    # name (effective_log_level) seeded from the optional extra-var.
+    effective_log_level: "{{ LOG_LEVEL | default('package') }}"
   tasks:
     - name: "Validate HOSTNAMES is provided"
       ansible.builtin.fail:
@@ -54,8 +58,8 @@
 
     - name: "Validate LOG_LEVEL is summary, package or full"
       ansible.builtin.fail:
-        msg: "Invalid LOG_LEVEL '{{ LOG_LEVEL }}'. Allowed values: summary, package, full."
-      when: LOG_LEVEL not in ['summary', 'package', 'full']
+        msg: "Invalid LOG_LEVEL '{{ effective_log_level }}'. Allowed values: summary, package, full."
+      when: effective_log_level not in ['summary', 'package', 'full']
 
     - name: "Parse HOSTNAMES into a list"
       ansible.builtin.set_fact:
@@ -71,7 +75,7 @@
 
     - name: "Show resolved target hosts"
       ansible.builtin.debug:
-        msg: "Targets: {{ samurai_target_hosts | join(', ') }} | ACTION={{ ACTION }} | UPDATE_MODE={{ UPDATE_MODE }} | LOG_LEVEL={{ LOG_LEVEL }}"
+        msg: "Targets: {{ samurai_target_hosts | join(', ') }} | ACTION={{ ACTION }} | UPDATE_MODE={{ UPDATE_MODE }} | LOG_LEVEL={{ effective_log_level }}"
 
 
 - name: "SamurAI :: yum-update :: pre-check, update and post-check"
@@ -83,7 +87,8 @@
   vars:
     ACTION: "{{ ACTION | default('Check') }}"
     UPDATE_MODE: "{{ UPDATE_MODE | default('all') }}"
-    LOG_LEVEL: "{{ LOG_LEVEL | default('package') }}"
+    # see comment in play 1 — avoid LOG_LEVEL self-reference
+    effective_log_level: "{{ LOG_LEVEL | default('package') }}"
     EXCLUDE_PACKAGES_RAW: "{{ EXCLUDE_PACKAGES | default('') }}"
     ALLOW_REBOOT: "{{ ALLOW_REBOOT | default(false) | bool }}"
     EVIDENCE_BASE_DIR: "{{ EVIDENCE_BASE_DIR | default('/var/tmp/samurai-shield/yum-update') }}"
@@ -447,7 +452,7 @@
               - "evidence_dir={{ evidence_dir }}"
               - "reboot_required_before={{ reboot_required_before | default('unknown') }}"
               - "reboot_required_after={{ reboot_required_after | default('not_yet_computed') }}"
-          when: LOG_LEVEL == 'summary'
+          when: effective_log_level == 'summary'
 
         - name: "Extract package-transaction lines (capped) for AAP log"
           ansible.builtin.shell: |
@@ -461,7 +466,7 @@
           register: pkg_transaction_lines
           changed_when: false
           failed_when: false
-          when: LOG_LEVEL == 'package'
+          when: effective_log_level == 'package'
 
         - name: "AAP log :: package level (max {{ log_package_max_lines }} lines)"
           ansible.builtin.debug:
@@ -471,7 +476,7 @@
                 if (pkg_transaction_lines.stdout_lines | default([]) | length) > 0
                 else ['no package-transaction lines found (Check mode, nothing to do, or update failed before any transaction)']
               }}
-          when: LOG_LEVEL == 'package'
+          when: effective_log_level == 'package'
 
         - name: "Read full update stdout/stderr (capped) for AAP log"
           ansible.builtin.shell: |
@@ -485,12 +490,12 @@
           register: full_update_log
           changed_when: false
           failed_when: false
-          when: LOG_LEVEL == 'full'
+          when: effective_log_level == 'full'
 
         - name: "AAP log :: full level"
           ansible.builtin.debug:
             msg: "{{ full_update_log.stdout_lines | default(['(no update output captured)']) }}"
-          when: LOG_LEVEL == 'full'
+          when: effective_log_level == 'full'
 
         - name: "Fail playbook when update returned non-zero"
           ansible.builtin.fail:
@@ -723,7 +728,7 @@
               package_manager: "{{ pkg_manager | default('unknown') }}"
               action: "{{ ACTION }}"
               update_mode: "{{ UPDATE_MODE }}"
-              log_level: "{{ LOG_LEVEL }}"
+              log_level: "{{ effective_log_level }}"
               exclude_packages: "{{ exclude_packages_list }}"
               updates_available_before_count: "{{ updates_available_count | default(0) | int }}"
               packages_updated_count: "{{ (packages_updated | default([])) | length }}"
