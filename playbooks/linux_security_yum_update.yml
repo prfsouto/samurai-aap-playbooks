@@ -1,0 +1,26 @@
+---
+- name: Montando grupo de hosts a partir de parametro informado na survey
+  hosts: localhost
+  gather_facts: false
+  vars:
+    ACTION: "Check"
+    ENVIRONMENT: "dev"
+  tasks:
+    - name: Adding hosts to survey_hosts group
+      ansible.builtin.add_host:
+        name: "{{ item }}"
+        ansible_host: "{{ item }}"
+        ansible_user: "{{ target_user | default('oracle') }}"
+        ansible_port: "{{ target_port | default(22) }}"
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        groups: survey_hosts
+      with_items: "{{ HOSTNAMES.split(' ') }}"
+
+- name: Yum Security Update
+  hosts: survey_hosts
+  gather_facts: false
+  vars:
+    ACTION: "Check"
+  roles:
+    - { role: yum_security/check_updates }
+    - { role: yum_security/update, when: ACTION == "Apply" }

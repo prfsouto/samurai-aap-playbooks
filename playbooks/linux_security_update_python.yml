@@ -1,0 +1,63 @@
+---
+- name: Montando grupo de hosts a partir de parametro informado na survey
+  hosts: localhost
+  gather_facts: false
+  vars:
+    ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+  tasks:
+    - name: Adding hosts to survey_hosts group
+      add_host:
+        hostname: "{{ item }}"
+        groups: survey_hosts
+      with_items: "{{ HOSTNAMES.split(' ') }}"
+
+- name: Descobrir pacote Python mais recente no S3
+  hosts: localhost
+  gather_facts: false
+  vars:
+    S3_TECHNOLOGY_PATH: "linux/python"
+  tasks:
+    - name: Listar objetos no S3 path linux/python/
+      amazon.aws.s3_object:
+        bucket: "{{ S3_BUCKET }}"
+        prefix: "{{ S3_TECHNOLOGY_PATH }}/"
+        mode: list
+      register: S3_PYTHON_OBJECTS
+      when: PACKAGE_VERSION is not defined or PACKAGE_VERSION == ""
+
+    - name: Selecionar pacote mais recente
+      set_fact:
+        RESOLVED_PACKAGE: "{{ S3_PYTHON_OBJECTS.s3_keys | select('match', '.*\\.(rpm|tar\\.gz|tgz)$') | sort | last | basename }}"
+      when: PACKAGE_VERSION is not defined or PACKAGE_VERSION == ""
+
+    - name: Usar pacote informado na survey
+      set_fact:
+        RESOLVED_PACKAGE: "{{ PACKAGE_VERSION }}"
+      when: PACKAGE_VERSION is defined and PACKAGE_VERSION != ""
+
+    - name: Pacote Python selecionado - output
+      debug:
+        msg: "Pacote selecionado: {{ RESOLVED_PACKAGE }}"
+
+    - name: Propagar variavel para todos os hosts
+      add_host:
+        hostname: "{{ item }}"
+        groups: survey_hosts
+        RESOLVED_PACKAGE: "{{ RESOLVED_PACKAGE }}"
+      with_items: "{{ groups['survey_hosts'] }}"
+
+- name: Tratativa de vulnerabilidade Python
+  hosts: survey_hosts
+  gather_facts: false
+  vars:
+    ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+    DEFAULT_WORKDIR: /u02/ansible-job-tmp
+    S3_TECHNOLOGY_PATH: "linux/python"
+    S3_FULL_OBJECT: "{{ S3_TECHNOLOGY_PATH }}/{{ RESOLVED_PACKAGE }}"
+  roles:
+    - { role: common/clear_workdir, when: ACTION == "Install" }
+    - { role: common/s3_download, when: ACTION == "Install", vars: { s3_bucket: "{{ S3_BUCKET }}", s3_object: "{{ S3_FULL_OBJECT }}" } }
+    - { role: python/remove, when: ACTION == "Install" or ACTION == "Uninstall" }
+    - { role: python/install, when: ACTION == "Install", vars: { python_package_path: "{{ DEFAULT_WORKDIR }}/{{ RESOLVED_PACKAGE }}" } }
+    - { role: common/clear_workdir, when: ACTION == "Install" }
+    - { role: python/check_version }

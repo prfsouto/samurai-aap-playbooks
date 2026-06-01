@@ -1,0 +1,377 @@
+---
+# =============================================================================
+# Playbook: Tratativa de Vulnerabilidade .NET (WINDOWS) — via SSM Run Command
+# Conexao via AWS SSM (sem WinRM / sem porta 5985). Para uso no AAP sandbox.
+# Survey vars: HOSTNAMES (IPs ou instance IDs separados por espaco),
+#              ACTION (Install/Uninstall), S3_BUCKET
+#              PACKAGE_VERSION: opcional - se nao informado, pega o mais recente do S3
+# =============================================================================
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PLAY 1 — Resolver instance IDs e pacote .NET
+# ══════════════════════════════════════════════════════════════════════════════
+- name: Resolver instance IDs e pacote .NET
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    S3_TECHNOLOGY_PATH: "windows/dotnet"
+    S3_REGION: "sa-east-1"
+    AWS_REGION: "us-east-1"
+    WIN_WORKDIR: 'C:\Temp\ansible-job-tmp'
+
+  tasks:
+    - name: Resolver instance IDs a partir dos hosts informados
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import boto3, sys
+            ec2 = boto3.client('ec2', region_name='{{ AWS_REGION }}')
+            hosts = '{{ HOSTNAMES }}'.split()
+            instance_ids = []
+            for host in hosts:
+                if host.startswith('i-'):
+                    instance_ids.append(host)
+                else:
+                    resp = ec2.describe_instances(Filters=[
+                        {'Name': 'private-ip-address', 'Values': [host]},
+                        {'Name': 'instance-state-name', 'Values': ['running']}
+                    ])
+                    insts = [i for r in resp['Reservations'] for i in r['Instances']]
+                    if not insts:
+                        print(f"ERRO: nenhuma instancia encontrada para {host}", file=sys.stderr)
+                        sys.exit(1)
+                    instance_ids.append(insts[0]['InstanceId'])
+            print(' '.join(instance_ids))
+      register: resolved_ids_raw
+      changed_when: false
+
+    - name: Registrar instance IDs
+      ansible.builtin.set_fact:
+        instance_ids: "{{ resolved_ids_raw.stdout.strip().split() }}"
+
+    - name: Instancias resolvidas
+      ansible.builtin.debug:
+        msg: "Instance IDs: {{ instance_ids }}"
+
+    - name: Listar objetos no S3 path windows/dotnet/
+      amazon.aws.s3_object:
+        bucket: "{{ S3_BUCKET }}"
+        prefix: "{{ S3_TECHNOLOGY_PATH }}/"
+        mode: list
+      register: S3_DOTNET_OBJECTS
+      when: PACKAGE_VERSION is not defined or PACKAGE_VERSION == ""
+
+    - name: Selecionar pacote mais recente do S3
+      ansible.builtin.set_fact:
+        RESOLVED_PACKAGE: "{{ S3_DOTNET_OBJECTS.s3_keys | select('match', '.*\\.(exe|msi|zip)$') | sort | last | basename }}"
+      when: PACKAGE_VERSION is not defined or PACKAGE_VERSION == ""
+
+    - name: Usar pacote informado na survey
+      ansible.builtin.set_fact:
+        RESOLVED_PACKAGE: "{{ PACKAGE_VERSION }}"
+      when: PACKAGE_VERSION is defined and PACKAGE_VERSION != ""
+
+    - name: Pacote .NET selecionado
+      ansible.builtin.debug:
+        msg: "Pacote: {{ RESOLVED_PACKAGE }} | Action: {{ ACTION }} | Instancias: {{ instance_ids }}"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PLAY 2 — Executar operacoes via SSM Run Command
+# ══════════════════════════════════════════════════════════════════════════════
+- name: Executar tratativa .NET via SSM
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    S3_TECHNOLOGY_PATH: "windows/dotnet"
+    S3_REGION: "sa-east-1"
+    AWS_REGION: "us-east-1"
+    WIN_WORKDIR: 'C:\Temp\ansible-job-tmp'
+    SSM_TIMEOUT: 600
+
+  tasks:
+    - name: Checar versao .NET atual (pre-operacao)
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import boto3, time, sys
+            ssm = boto3.client('ssm', region_name='{{ AWS_REGION }}')
+            script = """
+            Write-Output '=== .NET SDKs ==='
+            try { dotnet --list-sdks } catch { Write-Output 'Nenhum SDK encontrado' }
+            Write-Output ''
+            Write-Output '=== .NET Runtimes ==='
+            try { dotnet --list-runtimes } catch { Write-Output 'Nenhum Runtime encontrado' }
+            Write-Output ''
+            Write-Output '=== dotnet --version ==='
+            try { dotnet --version } catch { Write-Output '.NET nao instalado' }
+            """
+            for iid in '{{ instance_ids | join(" ") }}'.split():
+                resp = ssm.send_command(
+                    InstanceIds=[iid],
+                    DocumentName='AWS-RunPowerShellScript',
+                    Parameters={'commands': [script]},
+                    TimeoutSeconds={{ SSM_TIMEOUT }}
+                )
+                cmd_id = resp['Command']['CommandId']
+                for _ in range(60):
+                    time.sleep(5)
+                    r = ssm.get_command_invocation(CommandId=cmd_id, InstanceId=iid)
+                    if r['Status'] not in ('Pending', 'InProgress'):
+                        print(f"[{iid}] {r['StandardOutputContent']}")
+                        if r['StandardErrorContent']:
+                            print(f"[{iid}] STDERR: {r['StandardErrorContent']}", file=sys.stderr)
+                        break
+      register: dotnet_pre_check
+      changed_when: false
+      ignore_errors: true
+
+    - name: Output versao pre-operacao
+      ansible.builtin.debug:
+        var: dotnet_pre_check.stdout_lines
+
+    - name: Limpar e criar diretorio de trabalho
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import boto3, time, sys
+            ssm = boto3.client('ssm', region_name='{{ AWS_REGION }}')
+            script = """
+            if (Test-Path '{{ WIN_WORKDIR }}') {
+                Remove-Item -Path '{{ WIN_WORKDIR }}' -Recurse -Force
+                Write-Output 'Diretorio removido'
+            }
+            New-Item -ItemType Directory -Path '{{ WIN_WORKDIR }}' -Force | Out-Null
+            Write-Output 'Diretorio criado: {{ WIN_WORKDIR }}'
+            """
+            for iid in '{{ instance_ids | join(" ") }}'.split():
+                resp = ssm.send_command(
+                    InstanceIds=[iid],
+                    DocumentName='AWS-RunPowerShellScript',
+                    Parameters={'commands': [script]},
+                    TimeoutSeconds={{ SSM_TIMEOUT }}
+                )
+                cmd_id = resp['Command']['CommandId']
+                for _ in range(60):
+                    time.sleep(5)
+                    r = ssm.get_command_invocation(CommandId=cmd_id, InstanceId=iid)
+                    if r['Status'] not in ('Pending', 'InProgress'):
+                        print(f"[{iid}] {r['StandardOutputContent']}")
+                        if r['Status'] != 'Success':
+                            print(f"[{iid}] ERRO: {r['StandardErrorContent']}", file=sys.stderr)
+                            sys.exit(1)
+                        break
+      when: ACTION == "Install"
+      changed_when: true
+
+    - name: Remover versoes .NET existentes
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import boto3, time, sys
+            ssm = boto3.client('ssm', region_name='{{ AWS_REGION }}')
+            script = """
+            $dotnetPkgs = Get-WmiObject -Class Win32_Product |
+                Where-Object { $_.Name -match 'dotnet|\.NET|ASP\.NET' } |
+                Select-Object -ExpandProperty IdentifyingNumber
+            foreach ($pkg in $dotnetPkgs) {
+                Write-Output "Removendo pacote MSI: $pkg"
+                Start-Process msiexec.exe -ArgumentList "/x $pkg /qn /norestart" -Wait
+            }
+            $dotnetPaths = @('C:\Program Files\dotnet', 'C:\Program Files (x86)\dotnet')
+            foreach ($path in $dotnetPaths) {
+                if (Test-Path $path) {
+                    Remove-Item -Path $path -Recurse -Force
+                    Write-Output "Removido: $path"
+                }
+            }
+            Write-Output 'Remocao .NET concluida'
+            """
+            for iid in '{{ instance_ids | join(" ") }}'.split():
+                resp = ssm.send_command(
+                    InstanceIds=[iid],
+                    DocumentName='AWS-RunPowerShellScript',
+                    Parameters={'commands': [script]},
+                    TimeoutSeconds={{ SSM_TIMEOUT }}
+                )
+                cmd_id = resp['Command']['CommandId']
+                for _ in range(60):
+                    time.sleep(5)
+                    r = ssm.get_command_invocation(CommandId=cmd_id, InstanceId=iid)
+                    if r['Status'] not in ('Pending', 'InProgress'):
+                        print(f"[{iid}] {r['StandardOutputContent']}")
+                        if r['StandardErrorContent']:
+                            print(f"[{iid}] STDERR: {r['StandardErrorContent']}", file=sys.stderr)
+                        break
+      changed_when: true
+      ignore_errors: true
+
+    - name: Baixar pacote .NET do S3 via SSM
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import boto3, time, sys
+            ssm = boto3.client('ssm', region_name='{{ AWS_REGION }}')
+            script = """
+            $aws = (Get-Command aws -ErrorAction SilentlyContinue).Source
+            if (-not $aws) { $aws = 'C:\Program Files\Amazon\AWSCLIV2\aws.exe' }
+            & $aws s3 cp s3://{{ S3_BUCKET }}/{{ S3_TECHNOLOGY_PATH }}/{{ RESOLVED_PACKAGE }} '{{ WIN_WORKDIR }}\{{ RESOLVED_PACKAGE }}' --region {{ S3_REGION }}
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+            Write-Output 'Download concluido: {{ RESOLVED_PACKAGE }}'
+            """
+            for iid in '{{ instance_ids | join(" ") }}'.split():
+                resp = ssm.send_command(
+                    InstanceIds=[iid],
+                    DocumentName='AWS-RunPowerShellScript',
+                    Parameters={'commands': [script]},
+                    TimeoutSeconds={{ SSM_TIMEOUT }}
+                )
+                cmd_id = resp['Command']['CommandId']
+                for _ in range(60):
+                    time.sleep(5)
+                    r = ssm.get_command_invocation(CommandId=cmd_id, InstanceId=iid)
+                    if r['Status'] not in ('Pending', 'InProgress'):
+                        print(f"[{iid}] {r['StandardOutputContent']}")
+                        if r['Status'] != 'Success':
+                            print(f"[{iid}] ERRO: {r['StandardErrorContent']}", file=sys.stderr)
+                            sys.exit(1)
+                        break
+      when: ACTION == "Install"
+      changed_when: true
+
+    - name: Instalar .NET via SSM
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import boto3, time, sys
+            ssm = boto3.client('ssm', region_name='{{ AWS_REGION }}')
+            pkg_path = '{{ WIN_WORKDIR }}\{{ RESOLVED_PACKAGE }}'
+            pkg = '{{ RESOLVED_PACKAGE }}'.lower()
+            if pkg.endswith('.exe'):
+                script = f"""
+                Start-Process -FilePath '{pkg_path}' -ArgumentList '/install /quiet /norestart' -Wait -PassThru
+                Write-Output 'Instalacao EXE concluida'
+                """
+            elif pkg.endswith('.msi'):
+                script = f"""
+                Start-Process msiexec.exe -ArgumentList '/i {pkg_path} /quiet /norestart' -Wait
+                Write-Output 'Instalacao MSI concluida'
+                """
+            else:
+                script = f"""
+                $installDir = 'C:\Program Files\dotnet'
+                New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+                Expand-Archive -Path '{pkg_path}' -DestinationPath $installDir -Force
+                $currentPath = [Environment]::GetEnvironmentVariable('PATH', 'Machine')
+                if ($currentPath -notlike '*dotnet*') {{
+                    [Environment]::SetEnvironmentVariable('PATH', $currentPath + ';' + $installDir, 'Machine')
+                    Write-Output 'dotnet adicionado ao PATH'
+                }}
+                Write-Output 'Instalacao ZIP concluida'
+                """
+            for iid in '{{ instance_ids | join(" ") }}'.split():
+                resp = ssm.send_command(
+                    InstanceIds=[iid],
+                    DocumentName='AWS-RunPowerShellScript',
+                    Parameters={'commands': [script]},
+                    TimeoutSeconds={{ SSM_TIMEOUT }}
+                )
+                cmd_id = resp['Command']['CommandId']
+                for _ in range(60):
+                    time.sleep(5)
+                    r = ssm.get_command_invocation(CommandId=cmd_id, InstanceId=iid)
+                    if r['Status'] not in ('Pending', 'InProgress'):
+                        print(f"[{iid}] {r['StandardOutputContent']}")
+                        if r['Status'] != 'Success':
+                            print(f"[{iid}] ERRO: {r['StandardErrorContent']}", file=sys.stderr)
+                            sys.exit(1)
+                        break
+      when: ACTION == "Install"
+      changed_when: true
+
+    - name: Limpar diretorio de trabalho (pos-install)
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import boto3, time, sys
+            ssm = boto3.client('ssm', region_name='{{ AWS_REGION }}')
+            script = """
+            if (Test-Path '{{ WIN_WORKDIR }}') {
+                Remove-Item -Path '{{ WIN_WORKDIR }}' -Recurse -Force
+                Write-Output 'Diretorio de trabalho removido'
+            }
+            """
+            for iid in '{{ instance_ids | join(" ") }}'.split():
+                resp = ssm.send_command(
+                    InstanceIds=[iid],
+                    DocumentName='AWS-RunPowerShellScript',
+                    Parameters={'commands': [script]},
+                    TimeoutSeconds={{ SSM_TIMEOUT }}
+                )
+                cmd_id = resp['Command']['CommandId']
+                for _ in range(60):
+                    time.sleep(5)
+                    r = ssm.get_command_invocation(CommandId=cmd_id, InstanceId=iid)
+                    if r['Status'] not in ('Pending', 'InProgress'):
+                        print(f"[{iid}] {r['StandardOutputContent']}")
+                        break
+      when: ACTION == "Install"
+      changed_when: true
+      ignore_errors: true
+
+    - name: Checar versao .NET pos-operacao
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import boto3, time, sys
+            ssm = boto3.client('ssm', region_name='{{ AWS_REGION }}')
+            script = """
+            Write-Output '=== .NET SDKs ==='
+            try { dotnet --list-sdks } catch { Write-Output 'Nenhum SDK encontrado' }
+            Write-Output ''
+            Write-Output '=== .NET Runtimes ==='
+            try { dotnet --list-runtimes } catch { Write-Output 'Nenhum Runtime encontrado' }
+            Write-Output ''
+            Write-Output '=== dotnet --version ==='
+            try { dotnet --version } catch { Write-Output '.NET nao instalado' }
+            """
+            for iid in '{{ instance_ids | join(" ") }}'.split():
+                resp = ssm.send_command(
+                    InstanceIds=[iid],
+                    DocumentName='AWS-RunPowerShellScript',
+                    Parameters={'commands': [script]},
+                    TimeoutSeconds={{ SSM_TIMEOUT }}
+                )
+                cmd_id = resp['Command']['CommandId']
+                for _ in range(60):
+                    time.sleep(5)
+                    r = ssm.get_command_invocation(CommandId=cmd_id, InstanceId=iid)
+                    if r['Status'] not in ('Pending', 'InProgress'):
+                        print(f"[{iid}] {r['StandardOutputContent']}")
+                        if r['StandardErrorContent']:
+                            print(f"[{iid}] STDERR: {r['StandardErrorContent']}", file=sys.stderr)
+                        break
+      register: dotnet_post_check
+      changed_when: false
+      ignore_errors: true
+
+    - name: Output versao pos-operacao
+      ansible.builtin.debug:
+        var: dotnet_post_check.stdout_lines
