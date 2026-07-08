@@ -1,0 +1,1088 @@
+---
+# ============================================================================
+# SamurAI Shield :: Oracle RAC rolling patch (opatchauto + datapatch)
+# ----------------------------------------------------------------------------
+# Rolling patch of Oracle Grid Infrastructure (GI) + all Oracle Database homes
+# on a Real Application Cluster (RAC), executed from Ansible Automation Platform
+# (AAP). One node is patched at a time (serial: 1). The cluster stays available
+# because the environment is only ever touched on a single node while the other
+# nodes keep serving the databases, services and listeners.
+#
+# Safety model ("deliver the environment exactly as it was found"):
+#   1. Health GATE before touching a node: refuse to start if the cluster is not
+#      fully healthy (avoids turning a degraded cluster into an outage).
+#   2. BASELINE capture: record every database instance, listener and service
+#      that is ONLINE on the local node before patching.
+#   3. PATCH: stage/unzip the patch, run `opatchauto apply -analyze` (always),
+#      and — in Apply mode — `opatchauto apply` (RAC-aware: it stops the local
+#      node's resources, patches GI + all DB homes, and restarts them).
+#   4. datapatch: on the LAST node of the rolling sequence (default), apply the
+#      SQL payload of the RU to each database (idempotent, run once per DB).
+#   5. RESTORE: bring back anything from the baseline that opatchauto did not
+#      restart, then RE-VALIDATE. If the node cannot be returned to its baseline
+#      state the play fails BEFORE moving to the next node (any_errors_fatal),
+#      so a bad node never cascades into a cluster-wide outage.
+#
+# Stages:
+#   Play 1 (localhost): validate extra-vars, stage source lookup, build the
+#                       dynamic in-memory inventory from HOSTNAMES.
+#   Play 2 (targets, serial: 1): gate -> baseline -> stage -> analyze -> apply
+#                       -> datapatch -> restore -> re-validate -> evidence.
+#   Play 3 (localhost): emit the consolidated samurai_shield_result JSON.
+#
+# Extra-vars contract:
+#   HOSTNAMES        (required) comma-separated RAC node hostnames. Order matters
+#                    - they are patched in this order, one at a time.
+#   ACTION           Check|Apply (default Check). Check = stage + opatchauto
+#                    -analyze (read-only prereq/conflict check, no downtime).
+#                    Apply = full rolling patch + datapatch + restore.
+#   PATCH_ID         (required) patch number, e.g. 36582629. After unzip the
+#                    patch top directory is <PATCH_STAGE_DIR>/<PATCH_ID>.
+#   PATCH_SRC        (required) path ON THE AAP CONTROLLER to the patch .zip
+#                    (e.g. /var/lib/awx/patches/p36582629_190000_Linux-x86-64.zip).
+#                    The playbook copies + unzips it onto each node.
+#   PATCH_STAGE_DIR  where to unzip on the node (default
+#                    /u01/stage/samurai-shield/patches).
+#   GRID_HOME        (optional) override GI home. Default: auto-detected from
+#                    /etc/oracle/olr.loc (crs_home=...).
+#   ORACLE_HOMES     (optional) csv of DB homes to restrict opatchauto to
+#                    (adds -oh). Default: empty = patch GI + ALL DB homes.
+#   GRID_USER        owner of the GI home (default grid).
+#   ORACLE_USER      fallback owner of the DB homes (default oracle). The real
+#                    owner is auto-detected per home; this is only a fallback.
+#   RUN_DATAPATCH    bool (default true). Run datapatch after the binary patch.
+#   DATAPATCH_ON     last|each|never (default last). "last" runs datapatch once,
+#                    on the final node of the rolling sequence (correct for RU).
+#   OPATCHAUTO_EXTRA_ARGS  (optional) extra flags appended to opatchauto.
+#   EVIDENCE_BASE_DIR      default /var/tmp/samurai-shield/oracle-rac-patch.
+#   LOG_LEVEL        summary|detail|full (default detail). Controls how much
+#                    opatch/opatchauto/datapatch output is echoed into the AAP
+#                    job log. It never changes what is applied and never
+#                    disables the structured evidence files.
+#
+# Assumptions / prerequisites:
+#   - Privilege escalation is configured (opatchauto runs as root; crsctl/srvctl
+#     as the GI owner; datapatch as each DB home owner).
+#   - `unzip` is available on the nodes.
+#   - The patch is a rolling-installable RU/RUR for the installed GI/DB version.
+#   - OPatch in each home already meets the patch's minimum OPatch version.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Play 1 :: input validation + dynamic inventory (controller-side)
+# ----------------------------------------------------------------------------
+- name: "SamurAI :: rac-patch :: validate inputs and build inventory"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    HOSTNAMES: "{{ HOSTNAMES | default('') }}"
+    ACTION: "{{ ACTION | default('Check') }}"
+    PATCH_ID: "{{ PATCH_ID | default('') }}"
+    PATCH_SRC: "{{ PATCH_SRC | default('') }}"
+    DATAPATCH_ON: "{{ DATAPATCH_ON | default('last') }}"
+    # See linux_yum_update_with_evidence.yml: never redeclare LOG_LEVEL with a
+    # self-referencing default in vars (Ansible would recurse). Seed a distinct
+    # internal name from the optional extra-var instead.
+    effective_log_level: "{{ LOG_LEVEL | default('detail') }}"
+  tasks:
+    - name: "Validate HOSTNAMES is provided"
+      ansible.builtin.fail:
+        msg: "HOSTNAMES extra-var is required (comma-separated RAC node hostnames, patched in order)."
+      when: HOSTNAMES is not defined or (HOSTNAMES | trim) == ''
+
+    - name: "Validate ACTION is Check or Apply"
+      ansible.builtin.fail:
+        msg: "Invalid ACTION '{{ ACTION }}'. Allowed values: Check, Apply."
+      when: ACTION not in ['Check', 'Apply']
+
+    - name: "Validate PATCH_ID is provided"
+      ansible.builtin.fail:
+        msg: "PATCH_ID extra-var is required (patch number, e.g. 36582629)."
+      when: (PATCH_ID | trim) == ''
+
+    - name: "Validate DATAPATCH_ON value"
+      ansible.builtin.fail:
+        msg: "Invalid DATAPATCH_ON '{{ DATAPATCH_ON }}'. Allowed values: last, each, never."
+      when: DATAPATCH_ON not in ['last', 'each', 'never']
+
+    - name: "Validate LOG_LEVEL value"
+      ansible.builtin.fail:
+        msg: "Invalid LOG_LEVEL '{{ effective_log_level }}'. Allowed values: summary, detail, full."
+      when: effective_log_level not in ['summary', 'detail', 'full']
+
+    - name: "Validate PATCH_SRC is provided"
+      ansible.builtin.fail:
+        msg: "PATCH_SRC extra-var is required (path on the AAP controller to the patch .zip)."
+      when: (PATCH_SRC | trim) == ''
+
+    - name: "Verify PATCH_SRC exists on the controller"
+      ansible.builtin.stat:
+        path: "{{ PATCH_SRC }}"
+      register: patch_src_stat
+
+    - name: "Fail when PATCH_SRC does not exist on the controller"
+      ansible.builtin.fail:
+        msg: "PATCH_SRC '{{ PATCH_SRC }}' not found on the AAP controller/execution node."
+      when: not patch_src_stat.stat.exists
+
+    - name: "Parse HOSTNAMES into an ordered list"
+      ansible.builtin.set_fact:
+        samurai_target_hosts: >-
+          {{ HOSTNAMES.split(',') | map('trim') | reject('equalto', '') | list }}
+
+    - name: "Add hosts to dynamic group samurai_oracle_rac_targets (ordered)"
+      ansible.builtin.add_host:
+        name: "{{ item }}"
+        groups: samurai_oracle_rac_targets
+      loop: "{{ samurai_target_hosts }}"
+      changed_when: false
+
+    - name: "Show resolved rolling patch plan"
+      ansible.builtin.debug:
+        msg: >-
+          Rolling patch plan (one node at a time): {{ samurai_target_hosts | join(' -> ') }}
+          | ACTION={{ ACTION }} | PATCH_ID={{ PATCH_ID }} | DATAPATCH_ON={{ DATAPATCH_ON }}
+          | LOG_LEVEL={{ effective_log_level }}
+
+
+# ----------------------------------------------------------------------------
+# Play 2 :: per-node rolling patch (ONE node at a time)
+# ----------------------------------------------------------------------------
+- name: "SamurAI :: rac-patch :: rolling patch per node"
+  hosts: samurai_oracle_rac_targets
+  gather_facts: true
+  become: true
+  # serial: 1 is the whole premise of RAC rolling patching - patch one node,
+  # fully restore + validate it, and only then move to the next node. Do NOT
+  # make this configurable.
+  serial: 1
+  # A failure on any node aborts the rollout BEFORE the next node is touched,
+  # so a node we could not return to its baseline never cascades cluster-wide.
+  any_errors_fatal: true
+
+  vars:
+    ACTION: "{{ ACTION | default('Check') }}"
+    PATCH_ID: "{{ PATCH_ID | default('') }}"
+    PATCH_SRC: "{{ PATCH_SRC | default('') }}"
+    PATCH_STAGE_DIR: "{{ PATCH_STAGE_DIR | default('/u01/stage/samurai-shield/patches') }}"
+    RUN_DATAPATCH: "{{ RUN_DATAPATCH | default(true) | bool }}"
+    DATAPATCH_ON: "{{ DATAPATCH_ON | default('last') }}"
+    ORACLE_HOMES_RAW: "{{ ORACLE_HOMES | default('') }}"
+    OPATCHAUTO_EXTRA_ARGS: "{{ OPATCHAUTO_EXTRA_ARGS | default('') }}"
+    EVIDENCE_BASE_DIR: "{{ EVIDENCE_BASE_DIR | default('/var/tmp/samurai-shield/oracle-rac-patch') }}"
+    oracle_grid_user: "{{ GRID_USER | default('grid') }}"
+    oracle_db_user: "{{ ORACLE_USER | default('oracle') }}"
+    effective_log_level: "{{ LOG_LEVEL | default('detail') }}"
+    log_full_max_lines: 1000
+
+    # This node is the last one of the ordered rolling sequence?
+    is_last_node: "{{ inventory_hostname == (ansible_play_hosts_all | last) }}"
+
+    restricted_homes_list: >-
+      {{ (ORACLE_HOMES_RAW | string).split(',') | map('trim') | reject('equalto', '') | list }}
+
+    samurai_warnings: []
+    samurai_errors: []
+
+  tasks:
+
+    # ------------------------------------------------------------------------
+    # Phase 0: timestamps + evidence dir
+    # ------------------------------------------------------------------------
+    - name: "Capture execution start timestamp (UTC, controller-side)"
+      ansible.builtin.set_fact:
+        execution_started_at: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+        execution_timestamp: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+
+    - name: "Build evidence directory path"
+      ansible.builtin.set_fact:
+        evidence_dir: "{{ EVIDENCE_BASE_DIR }}/{{ inventory_hostname }}/{{ execution_timestamp }}"
+
+    - name: "Create evidence directory"
+      ansible.builtin.file:
+        path: "{{ evidence_dir }}"
+        state: directory
+        mode: '0750'
+
+    # ------------------------------------------------------------------------
+    # Phase 1: resolve GI home / users / DB homes
+    # ------------------------------------------------------------------------
+    - name: "Detect unzip binary"
+      ansible.builtin.command: bash -lc 'command -v unzip'
+      register: unzip_bin
+      changed_when: false
+      failed_when: false
+
+    - name: "Fail when unzip is not available"
+      ansible.builtin.fail:
+        msg: "`unzip` not found on {{ inventory_hostname }} - required to stage the patch."
+      when: unzip_bin.rc != 0
+
+    - name: "Read /etc/oracle/olr.loc (for GI home auto-detection)"
+      ansible.builtin.slurp:
+        src: /etc/oracle/olr.loc
+      register: olr_loc
+      failed_when: false
+
+    - name: "Resolve GRID_HOME"
+      ansible.builtin.set_fact:
+        grid_home: >-
+          {{
+            GRID_HOME if (GRID_HOME is defined and (GRID_HOME | trim) != '')
+            else ((olr_loc.content | default('') | b64decode)
+                   | regex_search('crs_home=[^\\n\\r]+') | default('', true)
+                   | regex_replace('^crs_home=', '') | trim)
+          }}
+
+    - name: "Fail when GRID_HOME could not be resolved"
+      ansible.builtin.fail:
+        msg: >-
+          Could not resolve GRID_HOME on {{ inventory_hostname }}. Pass GRID_HOME as an
+          extra-var, or ensure /etc/oracle/olr.loc contains crs_home=...
+      when: (grid_home | trim) == ''
+
+    - name: "Verify GRID_HOME exists"
+      ansible.builtin.stat:
+        path: "{{ grid_home }}/bin/crsctl"
+      register: crsctl_stat
+
+    - name: "Fail when GRID_HOME is invalid"
+      ansible.builtin.fail:
+        msg: "GRID_HOME '{{ grid_home }}' is invalid ({{ grid_home }}/bin/crsctl not found)."
+      when: not crsctl_stat.stat.exists
+
+    - name: "Detect GI home owner"
+      ansible.builtin.stat:
+        path: "{{ grid_home }}"
+      register: grid_home_stat
+
+    - name: "Resolve GI owner user (fallback to GRID_USER)"
+      ansible.builtin.set_fact:
+        grid_owner: "{{ grid_home_stat.stat.pw_name | default(oracle_grid_user) }}"
+
+    - name: "Define GI run environment"
+      ansible.builtin.set_fact:
+        grid_env:
+          ORACLE_HOME: "{{ grid_home }}"
+          PATH: "{{ grid_home }}/bin:{{ grid_home }}/OPatch:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+    # ------------------------------------------------------------------------
+    # Phase 2: cluster health GATE (refuse to patch a degraded cluster)
+    # ------------------------------------------------------------------------
+    - name: "Check cluster health (all nodes)"
+      ansible.builtin.command: "{{ grid_home }}/bin/crsctl check cluster -all"
+      register: crs_check_all_before
+      changed_when: false
+      failed_when: false
+      become_user: "{{ grid_owner }}"
+      environment: "{{ grid_env }}"
+
+    - name: "Write cluster_check_before.txt"
+      ansible.builtin.copy:
+        dest: "{{ evidence_dir }}/cluster_check_before.txt"
+        mode: '0640'
+        content: "{{ crs_check_all_before.stdout }}\n---STDERR---\n{{ crs_check_all_before.stderr }}\n"
+
+    - name: "List node status (olsnodes)"
+      ansible.builtin.command: "{{ grid_home }}/bin/olsnodes -n -s -t"
+      register: olsnodes_before
+      changed_when: false
+      failed_when: false
+      become_user: "{{ grid_owner }}"
+      environment: "{{ grid_env }}"
+
+    - name: "Write nodes_before.txt"
+      ansible.builtin.copy:
+        dest: "{{ evidence_dir }}/nodes_before.txt"
+        mode: '0640'
+        content: "{{ olsnodes_before.stdout }}\n"
+
+    - name: "Fail when the cluster is not fully healthy before patching"
+      ansible.builtin.fail:
+        msg: >-
+          Cluster is NOT fully healthy on {{ inventory_hostname }} - refusing to start a
+          rolling patch on a degraded cluster. crsctl check cluster -all did not report
+          all services online. Review {{ evidence_dir }}/cluster_check_before.txt.
+      when: >-
+        crs_check_all_before.rc != 0
+        or ('offline' in (crs_check_all_before.stdout | lower))
+        or ('CRS-4535' in crs_check_all_before.stdout)
+        or ('CRS-4534' in crs_check_all_before.stdout)
+
+    - name: "Warn when olsnodes reports an Inactive node"
+      ansible.builtin.set_fact:
+        samurai_warnings: "{{ samurai_warnings + ['olsnodes reported an Inactive node before patching'] }}"
+      when: "'Inactive' in (olsnodes_before.stdout | default(''))"
+
+    # ------------------------------------------------------------------------
+    # Phase 3: BASELINE - what is ONLINE on THIS node right now
+    # ------------------------------------------------------------------------
+    - name: "Capture full cluster resource state (before)"
+      ansible.builtin.command: "{{ grid_home }}/bin/crsctl stat res -t"
+      register: crs_res_before
+      changed_when: false
+      failed_when: false
+      become_user: "{{ grid_owner }}"
+      environment: "{{ grid_env }}"
+
+    - name: "Write cluster_resources_before.txt"
+      ansible.builtin.copy:
+        dest: "{{ evidence_dir }}/cluster_resources_before.txt"
+        mode: '0640'
+        content: "{{ crs_res_before.stdout }}\n"
+
+    - name: "List cluster databases"
+      ansible.builtin.command: "{{ grid_home }}/bin/srvctl config database"
+      register: db_list_raw
+      changed_when: false
+      failed_when: false
+      become_user: "{{ grid_owner }}"
+      environment: "{{ grid_env }}"
+
+    - name: "Build database list"
+      ansible.builtin.set_fact:
+        cluster_databases: "{{ db_list_raw.stdout_lines | map('trim') | reject('equalto', '') | list }}"
+
+    - name: "Get per-database configuration (Oracle home per DB)"
+      ansible.builtin.command: "{{ grid_home }}/bin/srvctl config database -d {{ item }}"
+      register: db_config_before
+      changed_when: false
+      failed_when: false
+      become_user: "{{ grid_owner }}"
+      environment: "{{ grid_env }}"
+      loop: "{{ cluster_databases }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: "Get per-database status (before)"
+      ansible.builtin.command: "{{ grid_home }}/bin/srvctl status database -d {{ item }}"
+      register: db_status_before
+      changed_when: false
+      failed_when: false
+      become_user: "{{ grid_owner }}"
+      environment: "{{ grid_env }}"
+      loop: "{{ cluster_databases }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: "Get listener status (before)"
+      ansible.builtin.command: "{{ grid_home }}/bin/srvctl status listener"
+      register: lsnr_status_before
+      changed_when: false
+      failed_when: false
+      become_user: "{{ grid_owner }}"
+      environment: "{{ grid_env }}"
+
+    - name: "Get per-database service status (before)"
+      ansible.builtin.command: "{{ grid_home }}/bin/srvctl status service -d {{ item }}"
+      register: svc_status_before
+      changed_when: false
+      failed_when: false
+      become_user: "{{ grid_owner }}"
+      environment: "{{ grid_env }}"
+      loop: "{{ cluster_databases }}"
+      loop_control:
+        label: "{{ item }}"
+
+    # ---- parse the baseline (instances/listeners/services ONLINE on THIS node)
+    - name: "Resolve DB -> Oracle home map"
+      ansible.builtin.set_fact:
+        db_home_by_db: >-
+          {%- set m = {} -%}
+          {%- for r in db_config_before.results -%}
+          {%-   for l in (r.stdout_lines | default([])) -%}
+          {%-     if 'Oracle home:' in l -%}{%- set _ = m.update({r.item: (l.split('Oracle home:')[1] | trim)}) -%}{%- endif -%}
+          {%-   endfor -%}
+          {%- endfor -%}
+          {{ m }}
+
+    - name: "Resolve database instances running on THIS node (baseline)"
+      ansible.builtin.set_fact:
+        baseline_instances: >-
+          {%- set out = [] -%}
+          {%- for r in db_status_before.results -%}
+          {%-   for l in (r.stdout_lines | default([])) -%}
+          {%-     if ('is running on node ' ~ ansible_hostname) in l and 'Instance ' in l -%}
+          {%-       set _ = out.append({'db': r.item, 'instance': (l.split('Instance ')[1].split(' ')[0])}) -%}
+          {%-     endif -%}
+          {%-   endfor -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: "Build DB -> local instance lookup"
+      ansible.builtin.set_fact:
+        baseline_inst_by_db: >-
+          {%- set m = {} -%}
+          {%- for i in baseline_instances -%}{%- set _ = m.update({i.db: i.instance}) -%}{%- endfor -%}
+          {{ m }}
+
+    - name: "Resolve listeners running on THIS node (baseline)"
+      ansible.builtin.set_fact:
+        baseline_listeners: >-
+          {%- set out = [] -%}
+          {%- for l in (lsnr_status_before.stdout_lines | default([])) -%}
+          {%-   if 'is running on node(s):' in l and 'Listener ' in l -%}
+          {%-     set name = l.split('Listener ')[1].split(' ')[0] -%}
+          {%-     set nodes = l.split('node(s):')[1].split(',') | map('trim') | list -%}
+          {%-     if ansible_hostname in nodes -%}{%- set _ = out.append(name) -%}{%- endif -%}
+          {%-   endif -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: "Resolve services running on THIS node's instance (baseline)"
+      ansible.builtin.set_fact:
+        baseline_services: >-
+          {%- set out = [] -%}
+          {%- for r in svc_status_before.results -%}
+          {%-   set db = r.item -%}
+          {%-   set inst = baseline_inst_by_db.get(db, '') -%}
+          {%-   for l in (r.stdout_lines | default([])) -%}
+          {%-     if 'is running on instance(s)' in l and 'Service ' in l -%}
+          {%-       set name = l.split('Service ')[1].split(' ')[0] -%}
+          {%-       set insts = l.split('instance(s)')[1].replace(':', '').split(',') | map('trim') | list -%}
+          {%-       if inst != '' and inst in insts -%}{%- set _ = out.append({'db': db, 'service': name, 'instance': inst}) -%}{%- endif -%}
+          {%-     endif -%}
+          {%-   endfor -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: "Write baseline_state.json"
+      ansible.builtin.copy:
+        dest: "{{ evidence_dir }}/baseline_state.json"
+        mode: '0640'
+        content: "{{ {'node': ansible_hostname, 'databases': cluster_databases, 'db_home_by_db': db_home_by_db, 'instances_up': baseline_instances, 'listeners_up': baseline_listeners, 'services_up': baseline_services} | to_nice_json }}\n"
+
+    - name: "AAP log :: baseline captured"
+      ansible.builtin.debug:
+        msg:
+          - "SamurAI Shield :: rac-patch :: BASELINE for {{ inventory_hostname }}"
+          - "databases={{ cluster_databases | join(',') }}"
+          - "instances_up_here={{ baseline_instances | map(attribute='instance') | list | join(',') }}"
+          - "listeners_up_here={{ baseline_listeners | join(',') }}"
+          - "services_up_here={{ baseline_services | map(attribute='service') | list | join(',') }}"
+
+    # ------------------------------------------------------------------------
+    # Phase 4: stage + analyze + apply (wrapped in block/rescue/always)
+    # ------------------------------------------------------------------------
+    - name: "Patch node (stage -> analyze -> apply -> datapatch -> restore)"
+      block:
+
+        # ---- stage / unzip patch -----------------------------------------
+        - name: "Ensure patch stage directory exists"
+          ansible.builtin.file:
+            path: "{{ PATCH_STAGE_DIR }}"
+            state: directory
+            mode: '0755'
+            owner: "{{ grid_owner }}"
+
+        - name: "Copy + unzip patch onto the node"
+          ansible.builtin.unarchive:
+            src: "{{ PATCH_SRC }}"
+            dest: "{{ PATCH_STAGE_DIR }}"
+            remote_src: false
+            owner: "{{ grid_owner }}"
+            mode: '0755'
+
+        - name: "Resolve patch top directory"
+          ansible.builtin.set_fact:
+            patch_dir: "{{ PATCH_STAGE_DIR }}/{{ PATCH_ID }}"
+
+        - name: "Verify patch top directory exists after unzip"
+          ansible.builtin.stat:
+            path: "{{ patch_dir }}"
+          register: patch_dir_stat
+
+        - name: "Fail when the unzipped patch directory is missing"
+          ansible.builtin.fail:
+            msg: >-
+              Expected patch directory '{{ patch_dir }}' not found after unzipping
+              {{ PATCH_SRC }}. Confirm PATCH_ID matches the numbered top directory
+              inside the zip.
+          when: not patch_dir_stat.stat.exists
+
+        # ---- opatch inventory (before) -----------------------------------
+        - name: "Capture GI OPatch lsinventory (before)"
+          ansible.builtin.command: "{{ grid_home }}/OPatch/opatch lsinventory"
+          register: lsinv_gi_before
+          changed_when: false
+          failed_when: false
+          become_user: "{{ grid_owner }}"
+          environment: "{{ grid_env }}"
+
+        - name: "Write lsinventory_gi_before.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/lsinventory_gi_before.txt"
+            mode: '0640'
+            content: "{{ lsinv_gi_before.stdout }}\n"
+
+        # ---- build opatchauto argv ---------------------------------------
+        - name: "Build opatchauto -oh argument (when ORACLE_HOMES restricts scope)"
+          ansible.builtin.set_fact:
+            opatchauto_oh_arg: >-
+              {{ ('-oh ' ~ (restricted_homes_list | join(','))) if (restricted_homes_list | length) > 0 else '' }}
+
+        # ---- ANALYZE (always, read-only) ---------------------------------
+        - name: "Run opatchauto apply -analyze (prereq/conflict check, no downtime)"
+          ansible.builtin.shell: >-
+            {{ grid_home }}/OPatch/opatchauto apply {{ patch_dir }}
+            {{ opatchauto_oh_arg }} -analyze {{ OPATCHAUTO_EXTRA_ARGS }}
+            > "{{ evidence_dir }}/opatchauto_analyze.txt" 2>&1
+          args:
+            executable: /bin/bash
+          register: opatchauto_analyze
+          changed_when: false
+          failed_when: false
+          environment: "{{ grid_env }}"
+
+        - name: "Read opatchauto analyze tail"
+          ansible.builtin.command: tail -n 120 "{{ evidence_dir }}/opatchauto_analyze.txt"
+          register: analyze_tail
+          changed_when: false
+          failed_when: false
+
+        - name: "Fail when opatchauto analyze reported a problem"
+          ansible.builtin.fail:
+            msg: |
+              opatchauto -analyze failed (rc={{ opatchauto_analyze.rc }}) on {{ inventory_hostname }}.
+              This is a read-only prereq/conflict check - nothing was changed. Resolve the
+              conflict before running ACTION=Apply.
+              Evidence: {{ evidence_dir }}/opatchauto_analyze.txt
+              Tail:
+              {{ analyze_tail.stdout }}
+          when: opatchauto_analyze.rc != 0
+
+        - name: "AAP log :: analyze result"
+          ansible.builtin.debug:
+            msg: "{{ analyze_tail.stdout_lines | default(['(no analyze output)']) }}"
+          when: effective_log_level in ['detail', 'full']
+
+        # ---- APPLY (Apply mode only) -------------------------------------
+        - name: "Run opatchauto apply (RAC-aware: stops local resources, patches GI + DB homes, restarts)"
+          ansible.builtin.shell: >-
+            {{ grid_home }}/OPatch/opatchauto apply {{ patch_dir }}
+            {{ opatchauto_oh_arg }} {{ OPATCHAUTO_EXTRA_ARGS }}
+            > "{{ evidence_dir }}/opatchauto_apply.txt" 2>&1
+          args:
+            executable: /bin/bash
+          register: opatchauto_apply
+          changed_when: ACTION == 'Apply' and opatchauto_apply.rc == 0
+          failed_when: false
+          environment: "{{ grid_env }}"
+          when: ACTION == 'Apply'
+
+        - name: "Read opatchauto apply tail"
+          ansible.builtin.command: tail -n 200 "{{ evidence_dir }}/opatchauto_apply.txt"
+          register: apply_tail
+          changed_when: false
+          failed_when: false
+          when: ACTION == 'Apply'
+
+        - name: "AAP log :: apply full output (capped)"
+          ansible.builtin.command: head -n {{ log_full_max_lines | int }} "{{ evidence_dir }}/opatchauto_apply.txt"
+          register: apply_full
+          changed_when: false
+          failed_when: false
+          when:
+            - ACTION == 'Apply'
+            - effective_log_level == 'full'
+
+        - name: "AAP log :: apply output"
+          ansible.builtin.debug:
+            msg: >-
+              {{ (apply_full.stdout_lines | default([])) if effective_log_level == 'full'
+                 else (apply_tail.stdout_lines | default(['(no apply output)'])) }}
+          when: ACTION == 'Apply' and effective_log_level in ['detail', 'full']
+
+        - name: "Fail when opatchauto apply returned non-zero"
+          ansible.builtin.fail:
+            msg: |
+              opatchauto apply FAILED (rc={{ opatchauto_apply.rc }}) on {{ inventory_hostname }}.
+              The rollout is stopped so the next node is NOT touched. The local node may be
+              partially patched with resources down - review and recover manually.
+              Evidence: {{ evidence_dir }}/opatchauto_apply.txt
+              Tail:
+              {{ apply_tail.stdout | default('n/a') }}
+          when:
+            - ACTION == 'Apply'
+            - opatchauto_apply.rc != 0
+
+        # ---- wait for CRS to be healthy again ----------------------------
+        - name: "Wait for Cluster Ready Services to be online after apply"
+          ansible.builtin.command: "{{ grid_home }}/bin/crsctl check crs"
+          register: crs_wait
+          changed_when: false
+          failed_when: false
+          become_user: "{{ grid_owner }}"
+          environment: "{{ grid_env }}"
+          retries: 30
+          delay: 20
+          until: "'CRS-4537' in crs_wait.stdout and 'online' in (crs_wait.stdout | lower)"
+          when: ACTION == 'Apply'
+
+        - name: "Fail when CRS did not come back online after apply"
+          ansible.builtin.fail:
+            msg: "Cluster Ready Services did not return online within the timeout after opatchauto apply on {{ inventory_hostname }}."
+          when:
+            - ACTION == 'Apply'
+            - "'CRS-4537' not in (crs_wait.stdout | default(''))"
+
+        # ------------------------------------------------------------------
+        # Phase 5: RESTORE - re-establish anything from the baseline that is
+        # not back up, then RE-VALIDATE (deliver the node as it was found).
+        # Only meaningful in Apply mode.
+        # ------------------------------------------------------------------
+        - name: "Get per-database status (after apply)"
+          ansible.builtin.command: "{{ grid_home }}/bin/srvctl status database -d {{ item }}"
+          register: db_status_after
+          changed_when: false
+          failed_when: false
+          become_user: "{{ grid_owner }}"
+          environment: "{{ grid_env }}"
+          loop: "{{ cluster_databases }}"
+          loop_control:
+            label: "{{ item }}"
+          when: ACTION == 'Apply'
+
+        - name: "Get listener status (after apply)"
+          ansible.builtin.command: "{{ grid_home }}/bin/srvctl status listener"
+          register: lsnr_status_after
+          changed_when: false
+          failed_when: false
+          become_user: "{{ grid_owner }}"
+          environment: "{{ grid_env }}"
+          when: ACTION == 'Apply'
+
+        - name: "Get per-database service status (after apply)"
+          ansible.builtin.command: "{{ grid_home }}/bin/srvctl status service -d {{ item }}"
+          register: svc_status_after
+          changed_when: false
+          failed_when: false
+          become_user: "{{ grid_owner }}"
+          environment: "{{ grid_env }}"
+          loop: "{{ cluster_databases }}"
+          loop_control:
+            label: "{{ item }}"
+          when: ACTION == 'Apply'
+
+        - name: "Compute instances currently up on THIS node (after)"
+          ansible.builtin.set_fact:
+            after_instances: >-
+              {%- set out = [] -%}
+              {%- for r in db_status_after.results -%}
+              {%-   for l in (r.stdout_lines | default([])) -%}
+              {%-     if ('is running on node ' ~ ansible_hostname) in l and 'Instance ' in l -%}
+              {%-       set _ = out.append({'db': r.item, 'instance': (l.split('Instance ')[1].split(' ')[0])}) -%}
+              {%-     endif -%}
+              {%-   endfor -%}
+              {%- endfor -%}
+              {{ out }}
+          when: ACTION == 'Apply'
+
+        - name: "Compute listeners currently up on THIS node (after)"
+          ansible.builtin.set_fact:
+            after_listeners: >-
+              {%- set out = [] -%}
+              {%- for l in (lsnr_status_after.stdout_lines | default([])) -%}
+              {%-   if 'is running on node(s):' in l and 'Listener ' in l -%}
+              {%-     set name = l.split('Listener ')[1].split(' ')[0] -%}
+              {%-     set nodes = l.split('node(s):')[1].split(',') | map('trim') | list -%}
+              {%-     if ansible_hostname in nodes -%}{%- set _ = out.append(name) -%}{%- endif -%}
+              {%-   endif -%}
+              {%- endfor -%}
+              {{ out }}
+          when: ACTION == 'Apply'
+
+        - name: "Compute services currently up on THIS node's instance (after)"
+          ansible.builtin.set_fact:
+            after_services: >-
+              {%- set out = [] -%}
+              {%- for r in svc_status_after.results -%}
+              {%-   set db = r.item -%}
+              {%-   set inst = baseline_inst_by_db.get(db, '') -%}
+              {%-   for l in (r.stdout_lines | default([])) -%}
+              {%-     if 'is running on instance(s)' in l and 'Service ' in l -%}
+              {%-       set name = l.split('Service ')[1].split(' ')[0] -%}
+              {%-       set insts = l.split('instance(s)')[1].replace(':', '').split(',') | map('trim') | list -%}
+              {%-       if inst != '' and inst in insts -%}{%- set _ = out.append({'db': db, 'service': name, 'instance': inst}) -%}{%- endif -%}
+              {%-     endif -%}
+              {%-   endfor -%}
+              {%- endfor -%}
+              {{ out }}
+          when: ACTION == 'Apply'
+
+        - name: "Compute what must be restored (baseline minus current)"
+          ansible.builtin.set_fact:
+            instances_to_restore: "{{ baseline_instances | difference(after_instances | default([])) }}"
+            listeners_to_restore: "{{ baseline_listeners | difference(after_listeners | default([])) }}"
+            services_to_restore: "{{ baseline_services | difference(after_services | default([])) }}"
+          when: ACTION == 'Apply'
+
+        # ---- restore listeners, then instances, then services ------------
+        - name: "Restore listeners that were up before"
+          ansible.builtin.command: "{{ grid_home }}/bin/srvctl start listener -l {{ item }} -n {{ ansible_hostname }}"
+          register: restore_lsnr
+          changed_when: true
+          failed_when: false
+          become_user: "{{ grid_owner }}"
+          environment: "{{ grid_env }}"
+          loop: "{{ listeners_to_restore | default([]) }}"
+          when: ACTION == 'Apply'
+
+        - name: "Restore database instances that were up before"
+          ansible.builtin.command: "{{ grid_home }}/bin/srvctl start instance -d {{ item.db }} -i {{ item.instance }}"
+          register: restore_inst
+          changed_when: true
+          failed_when: false
+          become_user: "{{ grid_owner }}"
+          environment: "{{ grid_env }}"
+          loop: "{{ instances_to_restore | default([]) }}"
+          loop_control:
+            label: "{{ item.db }}/{{ item.instance }}"
+          when: ACTION == 'Apply'
+
+        - name: "Restore services that were up before"
+          ansible.builtin.command: "{{ grid_home }}/bin/srvctl start service -d {{ item.db }} -s {{ item.service }} -i {{ item.instance }}"
+          register: restore_svc
+          changed_when: true
+          failed_when: false
+          become_user: "{{ grid_owner }}"
+          environment: "{{ grid_env }}"
+          loop: "{{ services_to_restore | default([]) }}"
+          loop_control:
+            label: "{{ item.db }}/{{ item.service }}"
+          when: ACTION == 'Apply'
+
+        - name: "Write restore_actions.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/restore_actions.txt"
+            mode: '0640'
+            content: |
+              listeners_restored: {{ listeners_to_restore | default([]) | join(', ') }}
+              instances_restored: {{ (instances_to_restore | default([])) | map('to_json') | join(', ') }}
+              services_restored: {{ (services_to_restore | default([])) | map('to_json') | join(', ') }}
+          when: ACTION == 'Apply'
+
+        # ------------------------------------------------------------------
+        # Phase 6: datapatch (SQL payload) - once, on the LAST node by default
+        # ------------------------------------------------------------------
+        - name: "Determine whether datapatch runs on this node"
+          ansible.builtin.set_fact:
+            run_datapatch_here: >-
+              {{ (ACTION == 'Apply') and (RUN_DATAPATCH | bool)
+                 and (DATAPATCH_ON == 'each' or (DATAPATCH_ON == 'last' and (is_last_node | bool))) }}
+
+        - name: "Resolve DB home owners for datapatch"
+          ansible.builtin.stat:
+            path: "{{ item.value }}"
+          register: db_home_owner_stat
+          loop: "{{ db_home_by_db | dict2items }}"
+          loop_control:
+            label: "{{ item.key }} -> {{ item.value }}"
+          when: run_datapatch_here | default(false)
+
+        - name: "Build DB home owner lookup"
+          ansible.builtin.set_fact:
+            db_home_owner_by_db: >-
+              {%- set m = {} -%}
+              {%- for r in (db_home_owner_stat.results | default([])) -%}
+              {%-   set _ = m.update({r.item.key: (r.stat.pw_name | default(oracle_db_user))}) -%}
+              {%- endfor -%}
+              {{ m }}
+          when: run_datapatch_here | default(false)
+
+        - name: "Run datapatch for each database open on this node"
+          ansible.builtin.shell: >-
+            "{{ db_home_by_db[item.db] }}/OPatch/datapatch" -verbose
+            > "{{ evidence_dir }}/datapatch_{{ item.db }}.txt" 2>&1
+          args:
+            executable: /bin/bash
+          register: datapatch_run
+          changed_when: true
+          failed_when: false
+          become_user: "{{ db_home_owner_by_db[item.db] | default(oracle_db_user) }}"
+          environment:
+            ORACLE_HOME: "{{ db_home_by_db[item.db] }}"
+            ORACLE_SID: "{{ item.instance }}"
+            PATH: "{{ db_home_by_db[item.db] }}/bin:{{ db_home_by_db[item.db] }}/OPatch:/usr/bin:/bin"
+          loop: "{{ after_instances | default(baseline_instances) }}"
+          loop_control:
+            label: "{{ item.db }}/{{ item.instance }}"
+          when: run_datapatch_here | default(false)
+
+        - name: "Collect datapatch failures"
+          ansible.builtin.set_fact:
+            datapatch_failures: >-
+              {{ (datapatch_run.results | default([]))
+                 | selectattr('rc', 'defined') | selectattr('rc', 'ne', 0)
+                 | map(attribute='item') | map(attribute='db') | list }}
+          when: run_datapatch_here | default(false)
+
+        - name: "Fail when datapatch failed for any database"
+          ansible.builtin.fail:
+            msg: >-
+              datapatch failed for database(s): {{ datapatch_failures | join(', ') }}.
+              Review {{ evidence_dir }}/datapatch_<db>.txt on {{ inventory_hostname }}.
+          when:
+            - run_datapatch_here | default(false)
+            - (datapatch_failures | default([]) | length) > 0
+
+        # ------------------------------------------------------------------
+        # Phase 7: FINAL VALIDATION - the node must match its baseline and the
+        # cluster must be healthy before the rollout advances to the next node.
+        # ------------------------------------------------------------------
+        - name: "Re-check cluster health (after)"
+          ansible.builtin.command: "{{ grid_home }}/bin/crsctl check cluster -all"
+          register: crs_check_all_after
+          changed_when: false
+          failed_when: false
+          become_user: "{{ grid_owner }}"
+          environment: "{{ grid_env }}"
+          when: ACTION == 'Apply'
+
+        - name: "Re-capture cluster resource state (after)"
+          ansible.builtin.command: "{{ grid_home }}/bin/crsctl stat res -t"
+          register: crs_res_after
+          changed_when: false
+          failed_when: false
+          become_user: "{{ grid_owner }}"
+          environment: "{{ grid_env }}"
+          when: ACTION == 'Apply'
+
+        - name: "Write cluster_resources_after.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/cluster_resources_after.txt"
+            mode: '0640'
+            content: "{{ crs_res_after.stdout | default('not_applicable_check_mode') }}\n"
+
+        # ---- recompute post-restore state for the final gate -------------
+        - name: "Re-read status after restore (databases)"
+          ansible.builtin.command: "{{ grid_home }}/bin/srvctl status database -d {{ item }}"
+          register: db_status_final
+          changed_when: false
+          failed_when: false
+          become_user: "{{ grid_owner }}"
+          environment: "{{ grid_env }}"
+          loop: "{{ cluster_databases }}"
+          loop_control:
+            label: "{{ item }}"
+          when: ACTION == 'Apply'
+
+        - name: "Re-read status after restore (listeners)"
+          ansible.builtin.command: "{{ grid_home }}/bin/srvctl status listener"
+          register: lsnr_status_final
+          changed_when: false
+          failed_when: false
+          become_user: "{{ grid_owner }}"
+          environment: "{{ grid_env }}"
+          when: ACTION == 'Apply'
+
+        - name: "Re-read status after restore (services)"
+          ansible.builtin.command: "{{ grid_home }}/bin/srvctl status service -d {{ item }}"
+          register: svc_status_final
+          changed_when: false
+          failed_when: false
+          become_user: "{{ grid_owner }}"
+          environment: "{{ grid_env }}"
+          loop: "{{ cluster_databases }}"
+          loop_control:
+            label: "{{ item }}"
+          when: ACTION == 'Apply'
+
+        - name: "Compute final on-node state"
+          ansible.builtin.set_fact:
+            final_instances: >-
+              {%- set out = [] -%}
+              {%- for r in db_status_final.results -%}
+              {%-   for l in (r.stdout_lines | default([])) -%}
+              {%-     if ('is running on node ' ~ ansible_hostname) in l and 'Instance ' in l -%}
+              {%-       set _ = out.append({'db': r.item, 'instance': (l.split('Instance ')[1].split(' ')[0])}) -%}
+              {%-     endif -%}
+              {%-   endfor -%}
+              {%- endfor -%}
+              {{ out }}
+            final_listeners: >-
+              {%- set out = [] -%}
+              {%- for l in (lsnr_status_final.stdout_lines | default([])) -%}
+              {%-   if 'is running on node(s):' in l and 'Listener ' in l -%}
+              {%-     set name = l.split('Listener ')[1].split(' ')[0] -%}
+              {%-     set nodes = l.split('node(s):')[1].split(',') | map('trim') | list -%}
+              {%-     if ansible_hostname in nodes -%}{%- set _ = out.append(name) -%}{%- endif -%}
+              {%-   endif -%}
+              {%- endfor -%}
+              {{ out }}
+            final_services: >-
+              {%- set out = [] -%}
+              {%- for r in svc_status_final.results -%}
+              {%-   set db = r.item -%}
+              {%-   set inst = baseline_inst_by_db.get(db, '') -%}
+              {%-   for l in (r.stdout_lines | default([])) -%}
+              {%-     if 'is running on instance(s)' in l and 'Service ' in l -%}
+              {%-       set name = l.split('Service ')[1].split(' ')[0] -%}
+              {%-       set insts = l.split('instance(s)')[1].replace(':', '').split(',') | map('trim') | list -%}
+              {%-       if inst != '' and inst in insts -%}{%- set _ = out.append({'db': db, 'service': name, 'instance': inst}) -%}{%- endif -%}
+              {%-     endif -%}
+              {%-   endfor -%}
+              {%- endfor -%}
+              {{ out }}
+          when: ACTION == 'Apply'
+
+        - name: "Compute baseline items still missing after restore"
+          ansible.builtin.set_fact:
+            still_down_instances: "{{ baseline_instances | difference(final_instances | default([])) }}"
+            still_down_listeners: "{{ baseline_listeners | difference(final_listeners | default([])) }}"
+            still_down_services: "{{ baseline_services | difference(final_services | default([])) }}"
+          when: ACTION == 'Apply'
+
+        - name: "Fail when the node was not returned to its baseline state"
+          ansible.builtin.fail:
+            msg: |
+              {{ inventory_hostname }} could NOT be returned to its pre-patch baseline.
+              The rollout is stopped so the next node is NOT touched.
+                instances still down: {{ still_down_instances | default([]) | map('to_json') | join(', ') }}
+                listeners still down: {{ still_down_listeners | default([]) | join(', ') }}
+                services  still down: {{ still_down_services | default([]) | map('to_json') | join(', ') }}
+              Review the evidence in {{ evidence_dir }} and recover the node manually.
+          when:
+            - ACTION == 'Apply'
+            - >-
+              (still_down_instances | default([]) | length) > 0
+              or (still_down_listeners | default([]) | length) > 0
+              or (still_down_services | default([]) | length) > 0
+
+        - name: "Fail when the cluster is not healthy after patching this node"
+          ansible.builtin.fail:
+            msg: >-
+              Cluster is not fully healthy after patching {{ inventory_hostname }}. Rollout
+              stopped. Review {{ evidence_dir }}/cluster_resources_after.txt.
+          when:
+            - ACTION == 'Apply'
+            - crs_check_all_after.rc != 0 or ('offline' in (crs_check_all_after.stdout | default('') | lower))
+
+        - name: "AAP log :: node returned to baseline"
+          ansible.builtin.debug:
+            msg:
+              - "SamurAI Shield :: rac-patch :: {{ inventory_hostname }} restored to baseline"
+              - "instances_up={{ (final_instances | default(baseline_instances)) | map(attribute='instance') | list | join(',') }}"
+              - "listeners_up={{ final_listeners | default(baseline_listeners) | join(',') }}"
+              - "services_up={{ (final_services | default(baseline_services)) | map(attribute='service') | list | join(',') }}"
+
+      rescue:
+        - name: "Capture rescue error"
+          ansible.builtin.set_fact:
+            samurai_errors: "{{ samurai_errors + [ansible_failed_result.msg | default('unknown failure')] }}"
+            execution_status: "failed"
+
+        - name: "Re-raise to abort the rollout (any_errors_fatal)"
+          ansible.builtin.fail:
+            msg: "Patch failed on {{ inventory_hostname }} - aborting rollout. {{ ansible_failed_result.msg | default('') }}"
+
+      always:
+        # ------------------------------------------------------------------
+        # summary.json / run stat - runs even on failure
+        # ------------------------------------------------------------------
+        - name: "Compute final execution status"
+          ansible.builtin.set_fact:
+            execution_status: >-
+              {{
+                execution_status | default(
+                  'check_completed' if ACTION == 'Check' else 'patched'
+                )
+              }}
+
+        - name: "Capture finished_at timestamp (UTC, controller-side)"
+          ansible.builtin.set_fact:
+            execution_finished_at: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+
+        - name: "Build per-host summary"
+          ansible.builtin.set_fact:
+            host_summary:
+              tool: "SamurAI Shield"
+              playbook: "oracle_rac_patch_with_evidence"
+              host: "{{ inventory_hostname }}"
+              node: "{{ ansible_hostname }}"
+              is_last_node: "{{ is_last_node | bool }}"
+              action: "{{ ACTION }}"
+              patch_id: "{{ PATCH_ID }}"
+              grid_home: "{{ grid_home | default('unknown') }}"
+              databases: "{{ cluster_databases | default([]) }}"
+              baseline_instances_up: "{{ baseline_instances | default([]) }}"
+              baseline_listeners_up: "{{ baseline_listeners | default([]) }}"
+              baseline_services_up: "{{ baseline_services | default([]) }}"
+              restored_instances: "{{ instances_to_restore | default([]) }}"
+              restored_listeners: "{{ listeners_to_restore | default([]) }}"
+              restored_services: "{{ services_to_restore | default([]) }}"
+              datapatch_ran: "{{ run_datapatch_here | default(false) }}"
+              log_level: "{{ effective_log_level }}"
+              evidence_dir: "{{ evidence_dir | default('unknown') }}"
+              started_at: "{{ execution_started_at | default('unknown') }}"
+              finished_at: "{{ execution_finished_at }}"
+              status: "{{ execution_status }}"
+              warnings: "{{ samurai_warnings }}"
+              errors: "{{ samurai_errors }}"
+
+        - name: "Write summary.json"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/summary.json"
+            mode: '0640'
+            content: "{{ host_summary | to_nice_json }}\n"
+          when: evidence_dir is defined
+
+        - name: "Publish per-host summary as run stat"
+          ansible.builtin.set_stats:
+            data:
+              samurai_rac_patch_summary: "{{ host_summary }}"
+            per_host: true
+            aggregate: false
+
+
+# ----------------------------------------------------------------------------
+# Play 3 :: consolidated stdout JSON (controller-side)
+# ----------------------------------------------------------------------------
+- name: "SamurAI :: rac-patch :: emit consolidated stdout JSON"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: "Collect per-host summaries"
+      ansible.builtin.set_fact:
+        all_host_summaries: >-
+          {{
+            groups['samurai_oracle_rac_targets'] | default([])
+            | map('extract', hostvars, 'host_summary')
+            | select('defined') | list
+          }}
+
+    - name: "Compute consolidated status"
+      ansible.builtin.set_fact:
+        consolidated_status: >-
+          {{
+            'failed' if (all_host_summaries | selectattr('status', 'equalto', 'failed') | list | length) > 0
+            else 'completed'
+          }}
+
+    - name: "Build consolidated samurai_shield_result block"
+      ansible.builtin.set_fact:
+        samurai_shield_result:
+          playbook: "oracle_rac_patch_with_evidence"
+          action: "{{ ACTION | default('Check') }}"
+          patch_id: "{{ PATCH_ID | default('') }}"
+          datapatch_on: "{{ DATAPATCH_ON | default('last') }}"
+          log_level: "{{ LOG_LEVEL | default('detail') }}"
+          status: "{{ consolidated_status }}"
+          node_count: "{{ all_host_summaries | length }}"
+          nodes: "{{ all_host_summaries }}"
+
+    - name: "Print consolidated SamurAI Shield JSON to stdout"
+      ansible.builtin.debug:
+        msg: "{{ {'samurai_shield_result': samurai_shield_result} | to_nice_json }}"
+
+    - name: "Publish consolidated result as workflow stat"
+      ansible.builtin.set_stats:
+        data:
+          samurai_shield_result: "{{ samurai_shield_result }}"
+        aggregate: false
+        per_host: false
+
+    - name: "Fail job when one or more nodes failed"
+      ansible.builtin.fail:
+        msg: "One or more nodes failed during the RAC rolling patch. See samurai_shield_result in stdout."
+      when: consolidated_status == 'failed'
