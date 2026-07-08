@@ -84,11 +84,19 @@
 - name: "SamurAI :: restart-patch :: validate inputs and build inventory"
   hosts: localhost
   gather_facts: false
+  # localhost runs inside the AAP Execution Environment (a container with no
+  # sudo). Force become OFF here so a Job-Template-level "privilege escalation"
+  # toggle never tries to sudo on localhost. Host escalation is handled by
+  # Play 2's own `become: true`.
+  become: false
   vars:
     HOSTNAMES: "{{ HOSTNAMES | default('') }}"
     ACTION: "{{ ACTION | default('Check') }}"
     PATCH_ID: "{{ PATCH_ID | default('') }}"
     PATCH_SRC: "{{ PATCH_SRC | default('') }}"
+    # Where the patch .zip lives: 'node' (already staged on the target host, the
+    # default) or 'controller' (on the AAP controller/EE, copied to the host).
+    PATCH_SRC_LOCATION: "{{ PATCH_SRC_LOCATION | default('node') }}"
     # See linux_yum_update_with_evidence.yml: never redeclare LOG_LEVEL with a
     # self-referencing default in vars (Ansible would recurse). Seed a distinct
     # internal name from the optional extra-var instead.
@@ -114,20 +122,30 @@
         msg: "Invalid LOG_LEVEL '{{ effective_log_level }}'. Allowed values: summary, detail, full."
       when: effective_log_level not in ['summary', 'detail', 'full']
 
+    - name: "Validate PATCH_SRC_LOCATION value"
+      ansible.builtin.fail:
+        msg: "Invalid PATCH_SRC_LOCATION '{{ PATCH_SRC_LOCATION }}'. Allowed values: node, controller."
+      when: PATCH_SRC_LOCATION not in ['node', 'controller']
+
     - name: "Validate PATCH_SRC is provided"
       ansible.builtin.fail:
-        msg: "PATCH_SRC extra-var is required (path on the AAP controller to the patch .zip)."
+        msg: "PATCH_SRC extra-var is required (path to the patch .zip)."
       when: (PATCH_SRC | trim) == ''
 
-    - name: "Verify PATCH_SRC exists on the controller"
+    # Only the controller-side patch can be checked here. When the patch is
+    # pre-staged on the host (default), it is verified in Play 2 on the host.
+    - name: "Verify PATCH_SRC exists on the controller (controller mode only)"
       ansible.builtin.stat:
         path: "{{ PATCH_SRC }}"
       register: patch_src_stat
+      when: PATCH_SRC_LOCATION == 'controller'
 
     - name: "Fail when PATCH_SRC does not exist on the controller"
       ansible.builtin.fail:
         msg: "PATCH_SRC '{{ PATCH_SRC }}' not found on the AAP controller/execution node."
-      when: not patch_src_stat.stat.exists
+      when:
+        - PATCH_SRC_LOCATION == 'controller'
+        - not (patch_src_stat.stat.exists | default(false))
 
     - name: "Parse HOSTNAMES into a list"
       ansible.builtin.set_fact:
@@ -164,6 +182,7 @@
     ACTION: "{{ ACTION | default('Check') }}"
     PATCH_ID: "{{ PATCH_ID | default('') }}"
     PATCH_SRC: "{{ PATCH_SRC | default('') }}"
+    PATCH_SRC_LOCATION: "{{ PATCH_SRC_LOCATION | default('node') }}"
     PATCH_STAGE_DIR: "{{ PATCH_STAGE_DIR | default('/u01/stage/samurai-shield/patches') }}"
     RUN_DATAPATCH: "{{ RUN_DATAPATCH | default(true) | bool }}"
     ORACLE_HOMES_RAW: "{{ ORACLE_HOMES | default('') }}"
@@ -458,13 +477,41 @@
             mode: '0755'
             owner: "{{ grid_owner }}"
 
-        - name: "Copy + unzip patch onto the host"
+        # -- node mode (default): the .zip is already on the target host ----
+        - name: "Verify pre-staged patch .zip exists on the host"
+          ansible.builtin.stat:
+            path: "{{ PATCH_SRC }}"
+          register: node_patch_stat
+          when: PATCH_SRC_LOCATION == 'node'
+
+        - name: "Fail when the pre-staged patch .zip is missing on the host"
+          ansible.builtin.fail:
+            msg: >-
+              PATCH_SRC '{{ PATCH_SRC }}' not found on {{ inventory_hostname }}
+              (PATCH_SRC_LOCATION=node). Stage the .zip on the host first, or set
+              PATCH_SRC_LOCATION=controller to copy it from the AAP controller/EE.
+          when:
+            - PATCH_SRC_LOCATION == 'node'
+            - not (node_patch_stat.stat.exists | default(false))
+
+        - name: "Unzip the pre-staged patch on the host"
+          ansible.builtin.unarchive:
+            src: "{{ PATCH_SRC }}"
+            dest: "{{ PATCH_STAGE_DIR }}"
+            remote_src: true
+            owner: "{{ grid_owner }}"
+            mode: '0755'
+          when: PATCH_SRC_LOCATION == 'node'
+
+        # -- controller mode: copy the .zip from the AAP controller/EE ------
+        - name: "Copy + unzip patch from the controller onto the host"
           ansible.builtin.unarchive:
             src: "{{ PATCH_SRC }}"
             dest: "{{ PATCH_STAGE_DIR }}"
             remote_src: false
             owner: "{{ grid_owner }}"
             mode: '0755'
+          when: PATCH_SRC_LOCATION == 'controller'
 
         - name: "Resolve patch top directory"
           ansible.builtin.set_fact:
@@ -992,6 +1039,7 @@
 - name: "SamurAI :: restart-patch :: emit consolidated stdout JSON"
   hosts: localhost
   gather_facts: false
+  become: false
   tasks:
     - name: "Collect per-host summaries"
       ansible.builtin.set_fact:

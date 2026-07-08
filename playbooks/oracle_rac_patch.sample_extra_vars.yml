@@ -13,9 +13,15 @@ HOSTNAMES: "rac01,rac02"
 # Patch number. After unzip the top directory must be <PATCH_STAGE_DIR>/<PATCH_ID>.
 PATCH_ID: "36582629"
 
-# Path ON THE AAP CONTROLLER / execution node to the patch .zip. The playbook
-# copies it to each node and unzips it.
-PATCH_SRC: "/var/lib/awx/patches/p36582629_190000_Linux-x86-64.zip"
+# Full path to the patch .zip (including filename, NOT just the folder).
+# By default (PATCH_SRC_LOCATION=node) this path is ON THE TARGET NODE - the
+# .zip must already be staged there. Set PATCH_SRC_LOCATION=controller to
+# instead copy it from the AAP controller/EE (which then requires the path to
+# exist inside the Execution Environment).
+PATCH_SRC: "/u02/oracle/patches/p36582629_190000_Linux-x86-64.zip"
+
+# node (default) = .zip already on the target host | controller = copy from EE.
+PATCH_SRC_LOCATION: "node"
 
 # --- action -----------------------------------------------------------------
 # Check = stage + `opatchauto apply -analyze` only (read-only, no downtime).
