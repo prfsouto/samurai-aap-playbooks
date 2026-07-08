@@ -143,10 +143,14 @@
         - PATCH_SRC_LOCATION == 'controller'
         - not (patch_src_stat.stat.exists | default(false))
 
-    - name: "Parse HOSTNAMES into an ordered list"
+    # HOSTNAMES accepts BOTH the Oraex/SamurAI fleet contract (space-separated,
+    # the remediation-engine sends `" ".join(hostnames)`) AND comma-separated
+    # (manual survey input). Commas are normalized to spaces, then split on any
+    # whitespace. Order is preserved = the rolling order.
+    - name: "Parse HOSTNAMES into an ordered list (space- or comma-separated)"
       ansible.builtin.set_fact:
         samurai_target_hosts: >-
-          {{ HOSTNAMES.split(',') | map('trim') | reject('equalto', '') | list }}
+          {{ (HOSTNAMES | regex_replace(',', ' ')).split() | map('trim') | reject('equalto', '') | list }}
 
     - name: "Add hosts to dynamic group samurai_oracle_rac_targets (ordered)"
       ansible.builtin.add_host:

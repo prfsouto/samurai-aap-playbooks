@@ -6,9 +6,11 @@
 # ============================================================================
 
 # --- required ---------------------------------------------------------------
-# Ordered, comma-separated RAC node hostnames. They are patched ONE AT A TIME,
-# in this exact order. The last node runs datapatch (see DATAPATCH_ON).
-HOSTNAMES: "rac01,rac02"
+# Ordered RAC node hostnames, SPACE- or comma-separated. They are patched ONE
+# AT A TIME, in this exact order. The last node runs datapatch (see
+# DATAPATCH_ON). NOTE: the SamurAI remediation-engine sends this space-separated
+# (the Oraex fleet contract); both forms are accepted.
+HOSTNAMES: "rac01 rac02"
 
 # Patch number. After unzip the top directory must be <PATCH_STAGE_DIR>/<PATCH_ID>.
 PATCH_ID: "36582629"

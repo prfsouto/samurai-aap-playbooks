@@ -10,8 +10,9 @@
 # ============================================================================
 
 # --- required ---------------------------------------------------------------
-# Comma-separated standalone DB server hostnames. Independent hosts, batched
-# by SERIAL_BATCH.
+# Standalone DB server hostnames, SPACE- or comma-separated (the SamurAI
+# remediation-engine sends this space-separated; both forms are accepted).
+# Independent hosts, batched by SERIAL_BATCH.
 HOSTNAMES: "dbstd01"
 
 # Patch number. After unzip the top directory must be <PATCH_STAGE_DIR>/<PATCH_ID>.
