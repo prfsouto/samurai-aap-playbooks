@@ -1,0 +1,39 @@
+---
+# ============================================================================
+# Sample extra-vars for oracle_restart_patch_with_evidence.yml
+# ----------------------------------------------------------------------------
+# Oracle Restart (standalone server + single-node Grid Infrastructure).
+# Pass these through an AAP Job Template survey or --extra-vars.
+#
+# NOTE: a standalone host has no second node - `opatchauto apply` takes the
+# database DOWN during the patch window. Schedule a maintenance window.
+# ============================================================================
+
+# --- required ---------------------------------------------------------------
+# Comma-separated standalone DB server hostnames. Independent hosts, batched
+# by SERIAL_BATCH.
+HOSTNAMES: "dbstd01"
+
+# Patch number. After unzip the top directory must be <PATCH_STAGE_DIR>/<PATCH_ID>.
+PATCH_ID: "36582629"
+
+# Path ON THE AAP CONTROLLER / execution node to the patch .zip. The playbook
+# copies it to each host and unzips it.
+PATCH_SRC: "/var/lib/awx/patches/p36582629_190000_Linux-x86-64.zip"
+
+# --- action -----------------------------------------------------------------
+# Check = stage + `opatchauto apply -analyze` only (read-only, no downtime).
+# Apply = full patch + datapatch + restore of the baseline state.
+ACTION: "Check"
+
+# --- optional (shown with their defaults) -----------------------------------
+# PATCH_STAGE_DIR: "/u01/stage/samurai-shield/patches"
+# GRID_HOME: "/u01/app/19.0.0/grid"        # default: auto-detected from /etc/oracle/olr.loc
+# ORACLE_HOMES: ""                          # csv to restrict opatchauto (-oh); default = GI + ALL DB homes
+# GRID_USER: "grid"                         # fallback owner of the GI home (real owner is auto-detected)
+# ORACLE_USER: "oracle"                     # fallback owner of the DB homes (real owner is auto-detected)
+# RUN_DATAPATCH: true
+# SERIAL_BATCH: 1                           # how many independent hosts to patch at once
+# OPATCHAUTO_EXTRA_ARGS: ""
+# EVIDENCE_BASE_DIR: "/var/tmp/samurai-shield/oracle-restart-patch"
+# LOG_LEVEL: "detail"                       # summary | detail | full

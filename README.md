@@ -49,6 +49,33 @@ the patch's minimum version. See
 [oracle_rac_patch.sample_extra_vars.yml](playbooks/oracle_rac_patch.sample_extra_vars.yml)
 for the full extra-vars contract, and the header of the playbook for details.
 
+### oracle_restart_patch_with_evidence.yml
+
+Patch of Oracle Grid Infrastructure (**Oracle Restart / SIHA**) + all Oracle
+Database homes on a **standalone** server whose database, listener and ASM are
+managed by a single-node Grid Infrastructure, using `opatchauto` + `datapatch`.
+
+It follows the same safety premises as the RAC playbook — health gate, baseline
+capture, restore, re-validate, deliver the environment exactly as it was found —
+adapted to a single host: the health gate uses `crsctl check has` (Oracle High
+Availability Services), state is parsed as running/not-running (single instance),
+and each host in `HOSTNAMES` is patched independently (`any_errors_fatal: false`,
+batched by `SERIAL_BATCH`).
+
+> ⚠️ A standalone server has **no second node** — `opatchauto apply` takes the
+> database DOWN during the patch window. Unlike RAC there is no zero-downtime
+> option; schedule a maintenance window. The playbook still guarantees the host
+> is returned to its exact pre-patch baseline.
+
+Supported actions:
+
+- `Check`: stage + `opatchauto apply -analyze` only. Read-only, no downtime.
+- `Apply`: full patch, `datapatch`, and baseline restore/validation.
+
+See
+[oracle_restart_patch.sample_extra_vars.yml](playbooks/oracle_restart_patch.sample_extra_vars.yml)
+for the full extra-vars contract, and the header of the playbook for details.
+
 ## AAP Project Configuration
 
 Use this repository as a Git project in Ansible Automation Platform.
