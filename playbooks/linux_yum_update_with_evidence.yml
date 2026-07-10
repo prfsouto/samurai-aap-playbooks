@@ -61,10 +61,12 @@
         msg: "Invalid LOG_LEVEL '{{ effective_log_level }}'. Allowed values: summary, package, full."
       when: effective_log_level not in ['summary', 'package', 'full']
 
-    - name: "Parse HOSTNAMES into a list"
+    - name: "Parse HOSTNAMES into a list (tolerant: space OR comma) — samurai-shield#1418"
       ansible.builtin.set_fact:
+        # The engine sends HOSTNAMES space-separated (Oraex fleet convention);
+        # accept both delimiters so a space-joined wave never collapses to 1 host.
         samurai_target_hosts: >-
-          {{ HOSTNAMES.split(',') | map('trim') | reject('equalto', '') | list }}
+          {{ HOSTNAMES.replace(',', ' ').split() | reject('equalto', '') | list }}
 
     - name: "Add hosts to dynamic group samurai_yum_update_targets"
       ansible.builtin.add_host:

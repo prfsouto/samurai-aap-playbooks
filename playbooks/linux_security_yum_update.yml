@@ -14,7 +14,7 @@
         ansible_port: "{{ target_port | default(22) }}"
         ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
         groups: survey_hosts
-      with_items: "{{ HOSTNAMES.split(' ') }}"
+      with_items: "{{ HOSTNAMES.replace(',', ' ').split() }}"
 
 - name: Yum Security Update
   hosts: survey_hosts

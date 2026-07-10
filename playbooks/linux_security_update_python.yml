@@ -9,7 +9,7 @@
       add_host:
         hostname: "{{ item }}"
         groups: survey_hosts
-      with_items: "{{ HOSTNAMES.split(' ') }}"
+      with_items: "{{ HOSTNAMES.replace(',', ' ').split() }}"
 
 - name: Descobrir pacote Python mais recente no S3
   hosts: localhost
