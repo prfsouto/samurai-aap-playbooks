@@ -125,10 +125,13 @@
         msg: "PATCH_SRC '{{ PATCH_SRC }}' not found on the AAP controller/execution node."
       when: not patch_src_stat.stat.exists
 
-    - name: "Parse HOSTNAMES into an ordered list"
+    - name: "Parse HOSTNAMES into an ordered list (tolerant: space OR comma) — samurai-shield#1418"
       ansible.builtin.set_fact:
+        # The engine sends HOSTNAMES space-separated (Oraex fleet convention);
+        # accept both delimiters so a space-joined wave never collapses to 1 host.
+        # Order is preserved either way (RAC nodes patch in declared order).
         samurai_target_hosts: >-
-          {{ HOSTNAMES.split(',') | map('trim') | reject('equalto', '') | list }}
+          {{ HOSTNAMES.replace(',', ' ').split() | reject('equalto', '') | list }}
 
     - name: "Add hosts to dynamic group samurai_oracle_rac_targets (ordered)"
       ansible.builtin.add_host:
