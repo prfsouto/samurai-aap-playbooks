@@ -1,3 +1,7 @@
 ---
-collections: []
+collections:
+  # Required by windows_update_with_evidence.yml (win_updates, win_shell,
+  # win_copy, win_file, win_reboot).
+  - name: ansible.windows
+    version: ">=1.13.0"
 roles: []

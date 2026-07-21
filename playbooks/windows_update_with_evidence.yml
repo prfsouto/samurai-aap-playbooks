@@ -1,0 +1,781 @@
+---
+# ============================================================================
+# SamurAI Shield :: Windows Update with evidence
+# ----------------------------------------------------------------------------
+# Controlled Windows Update playbook for Windows Server targets, executed from
+# Ansible Automation Platform (AAP) over WinRM/PSRP. Performs pre-checks, an
+# optional install, post-checks and produces structured evidence files + a JSON
+# summary that the SamurAI Shield control plane can ingest from the AAP job
+# stdout.
+#
+# Stages:
+#   1. Build dynamic in-memory inventory from HOSTNAMES (localhost play).
+#   2. Run pre-check, optional update and post-check on each target host.
+#   3. Emit a consolidated samurai_shield_result JSON block on stdout.
+#
+# Extra-vars contract: HOSTNAMES (required), ACTION (Check|Apply, default
+# Check). Everything else is optional and has a working default, so the normal
+# remediation call only needs HOSTNAMES + ACTION:
+#   ALLOW_REBOOT (bool, default false) — reboot after Apply only when the host
+#     reports reboot_required. When false the host is left pending-reboot and
+#     the JSON reports reboot_required_after=yes.
+#   WU_CATEGORIES (csv, default "SecurityUpdates,CriticalUpdates,UpdateRollups,
+#     Updates") — Drivers / FeaturePacks / ServicePacks are NOT included by
+#     default; pass them explicitly if you want them.
+#   EXCLUDE_KB (csv, optional) — KB ids or title regexes to reject
+#     (e.g. "KB5001330,KB5003173"). Maps to win_updates reject_list.
+#   WU_SERVER_SELECTION (default|managed_server|windows_update, default
+#     "default") — "default" honours a configured WSUS server.
+#   BECOME_SYSTEM (bool, default true) — run the update tasks as SYSTEM via
+#     runas. Required to avoid the WinRM double-hop when the host must reach a
+#     WSUS server or Microsoft Update over the network. Set false only when the
+#     connection already uses CredSSP/Kerberos delegation.
+#   WIN_CONNECTION (winrm|psrp, default winrm), WIN_PORT (default: plugin
+#     default = 5986/HTTPS), WIN_TRANSPORT (winrm auth, e.g. ntlm/kerberos/
+#     credssp), WIN_CERT_VALIDATION (default "ignore") — connection settings
+#     applied to the hosts created from HOSTNAMES.
+#   MIN_FREE_GB (default 5), SERIAL_BATCH (default 1),
+#   EVIDENCE_BASE_DIR (default C:\ProgramData\samurai-shield\windows-update),
+#   REBOOT_TIMEOUT (seconds, default 1800),
+#   LOG_LEVEL (summary|package|full, default package). LOG_LEVEL controls how
+#   much Windows Update detail is echoed into the AAP/Execution Center job log
+#   (it never changes what is applied and never disables the evidence files):
+#     - summary: counts + evidence_dir + reboot flags.
+#     - package: one line per update (title/KB), capped at 300 lines.
+#     - full:    the complete win_updates result payload. WARNING: can produce
+#                very large job logs — use for deep troubleshooting.
+#
+# Requirements:
+#   - Collection ansible.windows (see requirements.yml).
+#   - AAP Machine credential for a member of the local Administrators group.
+#   - WinRM (5985/5986) or PSRP reachable from the execution node.
+#   - Windows Update service (wuauserv) not disabled on the target.
+#
+# NOTE: installing updates can take much longer than a default job timeout.
+# Size the AAP Job Template timeout accordingly (0 = no timeout) and keep
+# SERIAL_BATCH low so a wave never takes the whole fleet down at once.
+#
+# NOTE ON VAR NAMING: optional extra-vars are copied into distinct internal
+# names (wu_*) instead of being redeclared as `X: "{{ X | default(...) }}"`.
+# When the extra-var is absent that self-referencing form makes Ansible recurse
+# ("recursive loop detected in template string") — see fix/log-level-self-reference.
+#
+# See README.md at the repository root for full documentation.
+# ============================================================================
+
+- name: "SamurAI :: windows-update :: build dynamic inventory from HOSTNAMES"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    wu_hostnames: "{{ HOSTNAMES | default('') }}"
+    wu_action: "{{ ACTION | default('Check') }}"
+    wu_log_level: "{{ LOG_LEVEL | default('package') }}"
+  tasks:
+    - name: "Validate HOSTNAMES is provided"
+      ansible.builtin.fail:
+        msg: "HOSTNAMES extra-var is required (single host, IP, or space/comma-separated list)."
+      when: wu_hostnames is not defined or (wu_hostnames | trim) == ''
+
+    - name: "Validate ACTION is Check or Apply"
+      ansible.builtin.fail:
+        msg: "Invalid ACTION '{{ wu_action }}'. Allowed values: Check, Apply."
+      when: wu_action not in ['Check', 'Apply']
+
+    - name: "Validate LOG_LEVEL is summary, package or full"
+      ansible.builtin.fail:
+        msg: "Invalid LOG_LEVEL '{{ wu_log_level }}'. Allowed values: summary, package, full."
+      when: wu_log_level not in ['summary', 'package', 'full']
+
+    - name: "Validate WU_SERVER_SELECTION"
+      ansible.builtin.fail:
+        msg: >-
+          Invalid WU_SERVER_SELECTION '{{ WU_SERVER_SELECTION }}'.
+          Allowed values: default, managed_server, windows_update.
+      when:
+        - WU_SERVER_SELECTION is defined
+        - WU_SERVER_SELECTION not in ['default', 'managed_server', 'windows_update']
+
+    - name: "Parse HOSTNAMES into a list (tolerant: space OR comma) — samurai-shield#1418"
+      ansible.builtin.set_fact:
+        # The engine sends HOSTNAMES space-separated (Oraex fleet convention);
+        # accept both delimiters so a space-joined wave never collapses to 1 host.
+        samurai_target_hosts: >-
+          {{ wu_hostnames.replace(',', ' ').split() | reject('equalto', '') | list }}
+
+    - name: "Add hosts to dynamic group samurai_win_update_targets"
+      ansible.builtin.add_host:
+        name: "{{ item }}"
+        groups: samurai_win_update_targets
+        # Hosts created with add_host do not inherit connection vars from the
+        # AAP inventory, and the global default is SSH — so the Windows
+        # transport must be pinned here. User/password come from the AAP
+        # Machine credential (injected as ansible_user/ansible_password).
+        # For PSRP pass WIN_CONNECTION=psrp; the ansible_winrm_* vars below are
+        # then ignored (psrp uses ansible_psrp_*).
+        ansible_connection: "{{ WIN_CONNECTION | default('winrm') }}"
+        ansible_port: "{{ WIN_PORT | default(omit) }}"
+        ansible_winrm_transport: "{{ WIN_TRANSPORT | default(omit) }}"
+        ansible_winrm_server_cert_validation: "{{ WIN_CERT_VALIDATION | default('ignore') }}"
+      loop: "{{ samurai_target_hosts }}"
+      changed_when: false
+
+    - name: "Show resolved target hosts"
+      ansible.builtin.debug:
+        msg: "Targets: {{ samurai_target_hosts | join(', ') }} | ACTION={{ wu_action }} | LOG_LEVEL={{ wu_log_level }}"
+
+
+- name: "SamurAI :: windows-update :: pre-check, update and post-check"
+  hosts: samurai_win_update_targets
+  gather_facts: true
+  serial: "{{ SERIAL_BATCH | default(1) }}"
+
+  vars:
+    wu_action: "{{ ACTION | default('Check') }}"
+    wu_log_level: "{{ LOG_LEVEL | default('package') }}"
+    wu_allow_reboot: "{{ ALLOW_REBOOT | default(false) | bool }}"
+    wu_become_system: "{{ BECOME_SYSTEM | default(true) | bool }}"
+    wu_server_selection: "{{ WU_SERVER_SELECTION | default('default') }}"
+    wu_min_free_gb: "{{ MIN_FREE_GB | default(5) | float }}"
+    wu_reboot_timeout: "{{ REBOOT_TIMEOUT | default(1800) | int }}"
+    wu_evidence_base_default: 'C:\ProgramData\samurai-shield\windows-update'
+    wu_evidence_base: "{{ EVIDENCE_BASE_DIR | default(wu_evidence_base_default) }}"
+    wu_categories_default: "SecurityUpdates,CriticalUpdates,UpdateRollups,Updates"
+    log_package_max_lines: 300
+
+    wu_category_list: >-
+      {{
+        ((WU_CATEGORIES | default(wu_categories_default)) | string).split(',')
+        | map('trim') | reject('equalto', '') | list
+      }}
+
+    wu_reject_list: >-
+      {{
+        ((EXCLUDE_KB | default('')) | string).split(',')
+        | map('trim') | reject('equalto', '') | list
+      }}
+
+    samurai_warnings: []
+    samurai_errors: []
+
+  tasks:
+
+    # ------------------------------------------------------------------------
+    # Phase 1: Input + OS compatibility validation
+    # ------------------------------------------------------------------------
+    - name: "Capture execution start timestamp (UTC, controller-side)"
+      # lookup() always runs on the execution node (Linux), never on the target.
+      ansible.builtin.set_fact:
+        execution_started_at: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+        execution_timestamp: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+
+    - name: "Fail when target OS family is not Windows"
+      ansible.builtin.fail:
+        msg: >-
+          Unsupported OS family '{{ ansible_os_family }}' on host {{ inventory_hostname }}.
+          This playbook only supports Windows targets reached over WinRM/PSRP.
+      when: ansible_os_family != 'Windows'
+
+    - name: "Inspect Windows Update service (wuauserv)"
+      ansible.windows.win_shell: |
+        $svc = Get-Service -Name wuauserv -ErrorAction SilentlyContinue
+        if (-not $svc) {
+            Write-Output "present=no"
+            exit 0
+        }
+        $wmi = Get-CimInstance -ClassName Win32_Service -Filter "Name='wuauserv'"
+        Write-Output "present=yes"
+        Write-Output ("status=" + $svc.Status)
+        Write-Output ("start_mode=" + $wmi.StartMode)
+      register: wuauserv_state
+      changed_when: false
+
+    - name: "Fail when the Windows Update service is missing or disabled"
+      ansible.builtin.fail:
+        msg: >-
+          Windows Update service (wuauserv) is not usable on {{ inventory_hostname }}:
+          {{ wuauserv_state.stdout | trim }}
+      when: >-
+        'present=no' in wuauserv_state.stdout
+        or 'start_mode=Disabled' in wuauserv_state.stdout
+
+    - name: "Build evidence directory path"
+      ansible.builtin.set_fact:
+        evidence_dir: "{{ wu_evidence_base }}\\{{ inventory_hostname }}\\{{ execution_timestamp }}"
+
+    - name: "Create evidence directory"
+      ansible.windows.win_file:
+        path: "{{ evidence_dir }}"
+        state: directory
+
+    # ------------------------------------------------------------------------
+    # Phase 2: Pre-check (always runs, even when ACTION=Check)
+    # ------------------------------------------------------------------------
+    - name: "Pre-check + optional update + post-check"
+      block:
+
+        # ---- system info --------------------------------------------------
+        - name: "Capture system info"
+          ansible.builtin.set_fact:
+            system_info:
+              hostname: "{{ ansible_hostname }}"
+              fqdn: "{{ ansible_fqdn | default(inventory_hostname) }}"
+              primary_ip: "{{ (ansible_ip_addresses | default([]) | first) | default('unknown') }}"
+              distribution: "{{ ansible_distribution }}"
+              distribution_version: "{{ ansible_distribution_version }}"
+              os_build: "{{ ansible_kernel | default('unknown') }}"
+              architecture: "{{ ansible_architecture | default('unknown') }}"
+              started_at: "{{ execution_started_at }}"
+              run_user: "{{ ansible_user_id | default('unknown') }}"
+
+        - name: "Write system_before.txt"
+          ansible.windows.win_copy:
+            dest: "{{ evidence_dir }}\\system_before.txt"
+            content: |
+              hostname: {{ system_info.hostname }}
+              fqdn: {{ system_info.fqdn }}
+              primary_ip: {{ system_info.primary_ip }}
+              distribution: {{ system_info.distribution }} {{ system_info.distribution_version }}
+              os_build: {{ system_info.os_build }}
+              architecture: {{ system_info.architecture }}
+              wuauserv: {{ wuauserv_state.stdout | trim | replace('\n', ' ') | replace('\r', '') }}
+              server_selection: {{ wu_server_selection }}
+              categories: {{ wu_category_list | join(',') }}
+              started_at: {{ system_info.started_at }}
+              run_user: {{ system_info.run_user }}
+
+        # ---- disk space ---------------------------------------------------
+        - name: "Collect disk usage"
+          ansible.windows.win_shell: |
+            Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType=3" |
+              Select-Object DeviceID,
+                @{N='SizeGB';E={[math]::Round($_.Size/1GB,2)}},
+                @{N='FreeGB';E={[math]::Round($_.FreeSpace/1GB,2)}},
+                @{N='FreePct';E={ if ($_.Size -gt 0) { [math]::Round(($_.FreeSpace/$_.Size)*100,1) } else { 0 } }} |
+              Format-Table -AutoSize | Out-String -Width 200
+          register: disk_before
+          changed_when: false
+
+        - name: "Write disk_before.txt"
+          ansible.windows.win_copy:
+            dest: "{{ evidence_dir }}\\disk_before.txt"
+            content: "{{ disk_before.stdout }}\n"
+
+        - name: "Measure free space on the system drive"
+          ansible.windows.win_shell: |
+            $disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$env:SystemDrive'"
+            Write-Output ([math]::Round($disk.FreeSpace/1GB,2))
+          register: system_drive_free
+          changed_when: false
+
+        - name: "Register system drive free space"
+          ansible.builtin.set_fact:
+            system_drive_free_gb: "{{ system_drive_free.stdout | trim | float }}"
+
+        - name: "Fail when the system drive has less free space than MIN_FREE_GB"
+          ansible.builtin.fail:
+            msg: >-
+              System drive has only {{ system_drive_free_gb }} GB free on {{ inventory_hostname }}
+              — refusing to update (threshold {{ wu_min_free_gb }} GB).
+          when: system_drive_free_gb | float < wu_min_free_gb | float
+
+        - name: "Warn when the system drive has less than twice MIN_FREE_GB"
+          ansible.builtin.set_fact:
+            samurai_warnings: >-
+              {{ samurai_warnings + ['system drive has ' + (system_drive_free_gb | string)
+                 + ' GB free, below the ' + ((wu_min_free_gb | float * 2) | string) + ' GB warning threshold'] }}
+          when:
+            - system_drive_free_gb | float >= wu_min_free_gb | float
+            - system_drive_free_gb | float < (wu_min_free_gb | float * 2)
+
+        # ---- installed hotfixes before -----------------------------------
+        - name: "List installed hotfixes (before)"
+          ansible.windows.win_shell: |
+            Get-HotFix | Sort-Object HotFixID |
+              ForEach-Object { "{0}|{1}|{2}" -f $_.HotFixID, $_.Description, $_.InstalledOn }
+          register: hotfixes_before
+          changed_when: false
+
+        - name: "Write hotfixes_before.txt"
+          ansible.windows.win_copy:
+            dest: "{{ evidence_dir }}\\hotfixes_before.txt"
+            content: "{{ hotfixes_before.stdout }}\n"
+
+        # ---- pending reboot before ---------------------------------------
+        - name: "Detect pending reboot (before)"
+          ansible.windows.win_shell: |
+            $reasons = @()
+            if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') {
+                $reasons += 'CBS:RebootPending'
+            }
+            if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') {
+                $reasons += 'WindowsUpdate:RebootRequired'
+            }
+            $sm = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue
+            if ($sm -and $sm.PendingFileRenameOperations) { $reasons += 'SessionManager:PendingFileRenameOperations' }
+            $cn = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon' -Name JoinDomain -ErrorAction SilentlyContinue
+            if ($cn -and $cn.JoinDomain) { $reasons += 'Netlogon:JoinDomain' }
+            if ($reasons.Count -gt 0) { Write-Output 'status=yes' } else { Write-Output 'status=no' }
+            $reasons | ForEach-Object { Write-Output ('reason=' + $_) }
+          register: reboot_before_raw
+          changed_when: false
+
+        - name: "Compute reboot_required_before status"
+          ansible.builtin.set_fact:
+            reboot_required_before: "{{ 'yes' if 'status=yes' in reboot_before_raw.stdout else 'no' }}"
+
+        - name: "Write pending_reboot_before.txt"
+          ansible.windows.win_copy:
+            dest: "{{ evidence_dir }}\\pending_reboot_before.txt"
+            content: |
+              status: {{ reboot_required_before }}
+              ---
+              {{ reboot_before_raw.stdout }}
+
+        - name: "Warn when the host already had a pending reboot before the run"
+          ansible.builtin.set_fact:
+            samurai_warnings: >-
+              {{ samurai_warnings + ['host had a pending reboot BEFORE this run; Windows Update
+                 results may be incomplete until it is rebooted'] }}
+          when: reboot_required_before == 'yes'
+
+        # ---- updates available before ------------------------------------
+        - name: "Search available Windows Updates (before)"
+          ansible.windows.win_updates:
+            state: searched
+            category_names: "{{ wu_category_list }}"
+            reject_list: "{{ wu_reject_list if (wu_reject_list | length) > 0 else omit }}"
+            server_selection: "{{ wu_server_selection }}"
+          become: "{{ wu_become_system }}"
+          become_method: ansible.builtin.runas
+          become_user: SYSTEM
+          register: wu_search_before
+
+        - name: "Normalize the search result into a list"
+          ansible.builtin.set_fact:
+            # ansible.windows < 2.0 returns `updates` as a dict keyed by update
+            # id; >= 2.0 returns a list. Accept both.
+            updates_available_before: >-
+              {{
+                (wu_search_before.updates | default({})).values() | list
+                if (wu_search_before.updates | default({})) is mapping
+                else (wu_search_before.updates | default([]) | list)
+              }}
+
+        - name: "Write updates_available_before.txt"
+          ansible.windows.win_copy:
+            dest: "{{ evidence_dir }}\\updates_available_before.txt"
+            content: |
+              found_update_count: {{ wu_search_before.found_update_count | default(updates_available_before | length) }}
+              categories: {{ wu_category_list | join(',') }}
+              reject_list: {{ wu_reject_list | join(',') if (wu_reject_list | length) > 0 else 'none' }}
+              server_selection: {{ wu_server_selection }}
+              ---
+              {% for u in updates_available_before %}
+              {{ (u.kb | default([]) | join(',')) | default('no-kb', true) }} | {{ u.title | default('unknown') }}
+              {% endfor %}
+
+        # ------------------------------------------------------------------
+        # Phase 3: Install updates (skipped in Check mode)
+        # ------------------------------------------------------------------
+        - name: "Install Windows Updates"
+          ansible.windows.win_updates:
+            state: installed
+            category_names: "{{ wu_category_list }}"
+            reject_list: "{{ wu_reject_list if (wu_reject_list | length) > 0 else omit }}"
+            server_selection: "{{ wu_server_selection }}"
+            # The reboot decision belongs to the playbook (ALLOW_REBOOT), not
+            # to the module — never let it bounce a host on its own.
+            reboot: false
+          become: "{{ wu_become_system }}"
+          become_method: ansible.builtin.runas
+          become_user: SYSTEM
+          register: wu_install
+          changed_when: wu_install.installed_update_count | default(0) | int > 0
+          failed_when: false
+          when: wu_action == 'Apply'
+
+        - name: "Normalize the install result into a list"
+          ansible.builtin.set_fact:
+            updates_installed: >-
+              {{
+                ((wu_install.updates | default({})).values() | list
+                 if (wu_install.updates | default({})) is mapping
+                 else (wu_install.updates | default([]) | list))
+                | selectattr('installed', 'defined') | selectattr('installed') | list
+              }}
+          when: wu_action == 'Apply'
+
+        - name: "Write update_result.json"
+          ansible.windows.win_copy:
+            dest: "{{ evidence_dir }}\\update_result.json"
+            content: |
+              {% if wu_action == 'Apply' %}
+              {{ {
+                   'found_update_count': wu_install.found_update_count | default(0),
+                   'installed_update_count': wu_install.installed_update_count | default(0),
+                   'failed_update_count': wu_install.failed_update_count | default(0),
+                   'reboot_required': wu_install.reboot_required | default(false),
+                   'failed': wu_install.failed | default(false),
+                   'msg': wu_install.msg | default(''),
+                   'updates': updates_installed | default([])
+                 } | to_nice_json }}
+              {% else %}
+              {"status": "not_applicable_check_mode"}
+              {% endif %}
+
+        # ------------------------------------------------------------------
+        # AAP / Execution Center observability (controlled by LOG_LEVEL).
+        # Renders the Windows Update detail into the job log WITHOUT touching
+        # the host and WITHOUT replacing the structured evidence files. Runs
+        # before the fail-on-error task so the operator still sees the update
+        # list even when the install reports failures.
+        # ------------------------------------------------------------------
+        - name: "AAP log :: summary level"
+          ansible.builtin.debug:
+            msg:
+              - "SamurAI Shield :: windows-update :: SUMMARY"
+              - "host={{ inventory_hostname }} action={{ wu_action }} categories={{ wu_category_list | join(',') }}"
+              - "updates_available_before={{ updates_available_before | length }}"
+              - "updates_installed={{ (updates_installed | default([])) | length }}"
+              - "updates_failed={{ wu_install.failed_update_count | default(0) }}"
+              - "evidence_dir={{ evidence_dir }}"
+              - "reboot_required_before={{ reboot_required_before }}"
+              - "reboot_required_after={{ wu_install.reboot_required | default('not_yet_computed') }}"
+          when: wu_log_level == 'summary'
+
+        - name: "Build capped update title list for the AAP log"
+          ansible.builtin.set_fact:
+            log_update_titles: >-
+              {{
+                (updates_installed | default([]) if wu_action == 'Apply' else (updates_available_before | default([])))
+                | map(attribute='title') | list
+              }}
+          when: wu_log_level == 'package'
+
+        - name: "AAP log :: package level (max {{ log_package_max_lines }} lines)"
+          ansible.builtin.debug:
+            msg: >-
+              {{
+                log_update_titles[0:(log_package_max_lines | int)]
+                if (log_update_titles | length) > 0
+                else ['no updates ' + ('installed' if wu_action == 'Apply' else 'found')]
+              }}
+          when: wu_log_level == 'package'
+
+        - name: "AAP log :: full level"
+          ansible.builtin.debug:
+            msg:
+              - "===== search result (before) ====="
+              - "{{ wu_search_before | default({}) | to_nice_json }}"
+              - "===== install result ====="
+              - "{{ (wu_install | default({'status': 'not_applicable_check_mode'})) | to_nice_json }}"
+          when: wu_log_level == 'full'
+
+        - name: "Fail playbook when the update run reported failures"
+          ansible.builtin.fail:
+            msg: |
+              Windows Update failed on {{ inventory_hostname }}
+              (failed_update_count={{ wu_install.failed_update_count | default(0) }},
+               installed={{ wu_install.installed_update_count | default(0) }}).
+              Module message: {{ wu_install.msg | default('no message returned') }}
+              Evidence files:
+              - {{ evidence_dir }}\update_result.json
+              - {{ evidence_dir }}\updates_available_before.txt
+              Windows Update log on the host: Get-WindowsUpdateLog (writes to the desktop).
+          when:
+            - wu_action == 'Apply'
+            - (wu_install.failed | default(false)) | bool or (wu_install.failed_update_count | default(0) | int) > 0
+
+        # ------------------------------------------------------------------
+        # Phase 4: Optional reboot (only after a successful Apply)
+        # ------------------------------------------------------------------
+        - name: "Reboot host when ALLOW_REBOOT and a reboot is required"
+          ansible.windows.win_reboot:
+            msg: "SamurAI Shield :: post Windows Update reboot"
+            reboot_timeout: "{{ wu_reboot_timeout | int }}"
+            post_reboot_delay: 30
+          when:
+            - wu_action == 'Apply'
+            - wu_allow_reboot | bool
+            - (wu_install.reboot_required | default(false)) | bool
+          register: reboot_action
+
+        # ------------------------------------------------------------------
+        # Phase 5: Post-check (only runs after Apply)
+        # ------------------------------------------------------------------
+        - name: "List installed hotfixes (after)"
+          ansible.windows.win_shell: |
+            Get-HotFix | Sort-Object HotFixID |
+              ForEach-Object { "{0}|{1}|{2}" -f $_.HotFixID, $_.Description, $_.InstalledOn }
+          register: hotfixes_after
+          changed_when: false
+          when: wu_action == 'Apply'
+
+        - name: "Write hotfixes_after.txt"
+          ansible.windows.win_copy:
+            dest: "{{ evidence_dir }}\\hotfixes_after.txt"
+            content: "{{ (hotfixes_after.stdout | default('')) if wu_action == 'Apply' else 'not_applicable_check_mode' }}\n"
+
+        - name: "Compute hotfix diff before/after"
+          ansible.builtin.set_fact:
+            hotfixes_added: >-
+              {{
+                (hotfixes_after.stdout_lines | default([]))
+                | difference(hotfixes_before.stdout_lines | default([]))
+                | map('regex_replace', '^([^|]+)\\|.*$', '\\1') | unique | list
+              }}
+          when: wu_action == 'Apply'
+
+        - name: "Write hotfixes_diff.txt"
+          ansible.windows.win_copy:
+            dest: "{{ evidence_dir }}\\hotfixes_diff.txt"
+            content: |
+              {% if wu_action == 'Apply' %}
+              # Hotfix IDs added ({{ hotfixes_added | length }}):
+              {% for kb in hotfixes_added %}
+              {{ kb }}
+              {% endfor %}
+              {% else %}
+              not_applicable_check_mode
+              {% endif %}
+
+        # ---- pending reboot after ----------------------------------------
+        - name: "Detect pending reboot (after)"
+          ansible.windows.win_shell: |
+            $reasons = @()
+            if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') {
+                $reasons += 'CBS:RebootPending'
+            }
+            if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') {
+                $reasons += 'WindowsUpdate:RebootRequired'
+            }
+            $sm = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue
+            if ($sm -and $sm.PendingFileRenameOperations) { $reasons += 'SessionManager:PendingFileRenameOperations' }
+            if ($reasons.Count -gt 0) { Write-Output 'status=yes' } else { Write-Output 'status=no' }
+            $reasons | ForEach-Object { Write-Output ('reason=' + $_) }
+          register: reboot_after_raw
+          changed_when: false
+          when: wu_action == 'Apply'
+
+        - name: "Compute reboot_required_after status"
+          ansible.builtin.set_fact:
+            reboot_required_after: >-
+              {{
+                'not_applicable_check_mode' if wu_action != 'Apply'
+                else ('yes' if 'status=yes' in (reboot_after_raw.stdout | default('')) else 'no')
+              }}
+
+        - name: "Write pending_reboot_after.txt"
+          ansible.windows.win_copy:
+            dest: "{{ evidence_dir }}\\pending_reboot_after.txt"
+            content: |
+              status: {{ reboot_required_after }}
+              rebooted: {{ (reboot_action.rebooted | default(false)) | bool }}
+              ---
+              {{ reboot_after_raw.stdout | default('not_applicable') }}
+
+        # ---- remaining updates after -------------------------------------
+        - name: "Search remaining Windows Updates (after)"
+          ansible.windows.win_updates:
+            state: searched
+            category_names: "{{ wu_category_list }}"
+            reject_list: "{{ wu_reject_list if (wu_reject_list | length) > 0 else omit }}"
+            server_selection: "{{ wu_server_selection }}"
+          become: "{{ wu_become_system }}"
+          become_method: ansible.builtin.runas
+          become_user: SYSTEM
+          register: wu_search_after
+          failed_when: false
+          when: wu_action == 'Apply'
+
+        - name: "Normalize the post-run search result into a list"
+          ansible.builtin.set_fact:
+            updates_remaining_after: >-
+              {{
+                (wu_search_after.updates | default({})).values() | list
+                if (wu_search_after.updates | default({})) is mapping
+                else (wu_search_after.updates | default([]) | list)
+              }}
+          when: wu_action == 'Apply'
+
+        - name: "Write updates_remaining_after.txt"
+          ansible.windows.win_copy:
+            dest: "{{ evidence_dir }}\\updates_remaining_after.txt"
+            content: |
+              {% if wu_action == 'Apply' %}
+              remaining_update_count: {{ updates_remaining_after | default([]) | length }}
+              note: a host still pending reboot can report updates that are already staged
+              ---
+              {% for u in updates_remaining_after | default([]) %}
+              {{ (u.kb | default([]) | join(',')) | default('no-kb', true) }} | {{ u.title | default('unknown') }}
+              {% endfor %}
+              {% else %}
+              not_applicable_check_mode
+              {% endif %}
+
+        # ---- failed services after ---------------------------------------
+        - name: "List automatic services that are not running (after)"
+          ansible.windows.win_shell: |
+            Get-CimInstance -ClassName Win32_Service -Filter "StartMode='Auto' AND State!='Running'" |
+              Where-Object { $_.Name -notin @('sppsvc','RemoteRegistry','gupdate','MapsBroker') } |
+              ForEach-Object { $_.Name }
+          register: failed_services_raw
+          changed_when: false
+          failed_when: false
+          when: wu_action == 'Apply'
+
+        - name: "Build failed services list"
+          ansible.builtin.set_fact:
+            failed_services_list: "{{ failed_services_raw.stdout_lines | default([]) | map('trim') | reject('equalto', '') | list }}"
+          when: wu_action == 'Apply'
+
+        - name: "Write failed_services_after.txt"
+          ansible.windows.win_copy:
+            dest: "{{ evidence_dir }}\\failed_services_after.txt"
+            content: |
+              {% if wu_action != 'Apply' %}
+              not_applicable_check_mode
+              {% else %}
+              {{ failed_services_raw.stdout | default('') }}
+              {% endif %}
+
+      rescue:
+        - name: "Capture rescue error"
+          ansible.builtin.set_fact:
+            samurai_errors: "{{ samurai_errors + [ansible_failed_result.msg | default('unknown failure')] }}"
+
+        - name: "Mark execution status as failed"
+          ansible.builtin.set_fact:
+            execution_status: "failed"
+
+      always:
+        # ------------------------------------------------------------------
+        # summary.json — runs even on failure
+        # ------------------------------------------------------------------
+        - name: "Compute final execution status"
+          ansible.builtin.set_fact:
+            execution_status: >-
+              {{
+                execution_status | default(
+                  'check_completed' if wu_action == 'Check'
+                  else ('updated' if (updates_installed | default([]) | length) > 0
+                        else 'no_updates')
+                )
+              }}
+
+        - name: "Capture finished_at timestamp (UTC, controller-side)"
+          ansible.builtin.set_fact:
+            execution_finished_at: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+
+        - name: "Build per-host summary"
+          ansible.builtin.set_fact:
+            host_summary:
+              tool: "SamurAI Shield"
+              playbook: "windows_update_with_evidence"
+              host: "{{ inventory_hostname }}"
+              fqdn: "{{ ansible_fqdn | default(inventory_hostname) }}"
+              primary_ip: "{{ (ansible_ip_addresses | default([]) | first) | default('unknown') }}"
+              os_family: "{{ ansible_os_family | default('unknown') }}"
+              distribution: "{{ ansible_distribution | default('unknown') }}"
+              distribution_version: "{{ ansible_distribution_version | default('unknown') }}"
+              os_build: "{{ ansible_kernel | default('unknown') }}"
+              action: "{{ wu_action }}"
+              categories: "{{ wu_category_list }}"
+              exclude_kb: "{{ wu_reject_list }}"
+              server_selection: "{{ wu_server_selection }}"
+              log_level: "{{ wu_log_level }}"
+              updates_available_before_count: "{{ updates_available_before | default([]) | length }}"
+              updates_available_before: "{{ updates_available_before | default([]) | map(attribute='title') | list }}"
+              updates_installed_count: "{{ updates_installed | default([]) | length }}"
+              updates_installed: "{{ updates_installed | default([]) | map(attribute='title') | list }}"
+              updates_failed_count: "{{ wu_install.failed_update_count | default(0) | int }}"
+              updates_remaining_after_count: "{{ updates_remaining_after | default([]) | length }}"
+              hotfixes_added: "{{ hotfixes_added | default([]) }}"
+              reboot_required_before: "{{ reboot_required_before | default('unknown') }}"
+              reboot_required_after: "{{ reboot_required_after | default('not_applicable_check_mode') }}"
+              allow_reboot: "{{ wu_allow_reboot | bool }}"
+              rebooted: "{{ (reboot_action.rebooted | default(false)) | bool }}"
+              failed_services_after: "{{ failed_services_list | default([]) }}"
+              evidence_dir: "{{ evidence_dir | default('not_created') }}"
+              started_at: "{{ execution_started_at }}"
+              finished_at: "{{ execution_finished_at }}"
+              status: "{{ execution_status }}"
+              warnings: "{{ samurai_warnings }}"
+              errors: "{{ samurai_errors }}"
+
+        - name: "Write summary.json"
+          ansible.windows.win_copy:
+            dest: "{{ evidence_dir }}\\summary.json"
+            content: "{{ host_summary | to_nice_json }}\n"
+          when: evidence_dir is defined
+
+        - name: "Publish per-host summary as run stat"
+          ansible.builtin.set_stats:
+            data:
+              samurai_win_update_summary: "{{ host_summary }}"
+            per_host: true
+            aggregate: false
+
+
+- name: "SamurAI :: windows-update :: emit consolidated stdout JSON"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: "Collect per-host summaries"
+      ansible.builtin.set_fact:
+        all_host_summaries: >-
+          {{
+            groups['samurai_win_update_targets'] | default([])
+            | map('extract', hostvars, 'host_summary')
+            | select('defined') | list
+          }}
+
+    - name: "Detect targets that produced no summary (unreachable or failed a pre-flight gate)"
+      # A host that dies before the rescue/always block — unreachable, non-Windows,
+      # wuauserv disabled — never publishes host_summary. Without this it would
+      # silently disappear from the JSON and the run would still read 'completed'.
+      ansible.builtin.set_fact:
+        missing_hosts: >-
+          {{
+            groups['samurai_win_update_targets'] | default([])
+            | difference(all_host_summaries | map(attribute='host') | list)
+          }}
+
+    - name: "Compute consolidated status"
+      ansible.builtin.set_fact:
+        consolidated_status: >-
+          {{
+            'failed' if ((all_host_summaries | selectattr('status', 'equalto', 'failed') | list | length) > 0
+                         or (missing_hosts | length) > 0)
+            else 'completed'
+          }}
+
+    - name: "Build consolidated samurai_shield_result block"
+      ansible.builtin.set_fact:
+        samurai_shield_result:
+          playbook: "windows_update_with_evidence"
+          action: "{{ ACTION | default('Check') }}"
+          log_level: "{{ LOG_LEVEL | default('package') }}"
+          status: "{{ consolidated_status }}"
+          host_count: "{{ all_host_summaries | length }}"
+          hosts: "{{ all_host_summaries }}"
+          hosts_without_summary: "{{ missing_hosts }}"
+
+    - name: "Print consolidated SamurAI Shield JSON to stdout"
+      ansible.builtin.debug:
+        msg: "{{ {'samurai_shield_result': samurai_shield_result} | to_nice_json }}"
+
+    - name: "Publish consolidated result as workflow stat"
+      ansible.builtin.set_stats:
+        data:
+          samurai_shield_result: "{{ samurai_shield_result }}"
+        aggregate: false
+        per_host: false
+
+    - name: "Fail job when one or more hosts failed"
+      ansible.builtin.fail:
+        msg: >-
+          One or more hosts failed during Windows Update
+          {{ ('(no summary from: ' + (missing_hosts | join(', ')) + ')') if (missing_hosts | length) > 0 else '' }}.
+          See samurai_shield_result in stdout.
+      when: consolidated_status == 'failed'

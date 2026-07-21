@@ -1,0 +1,40 @@
+---
+# ============================================================================
+# Sample extra-vars for windows_update_with_evidence.yml
+# ----------------------------------------------------------------------------
+# Pass these through an AAP Job Template survey or --extra-vars.
+# In the normal remediation flow only HOSTNAMES + ACTION are sent.
+# ============================================================================
+
+# --- required ---------------------------------------------------------------
+# Target Windows hosts. The SamurAI Shield engine sends them space-separated;
+# commas are also accepted.
+HOSTNAMES: "win01 win02"
+
+# --- action -----------------------------------------------------------------
+# Check = search Windows Update only (read-only, nothing is downloaded or
+#         installed).
+# Apply = install the updates found, then re-check the host.
+ACTION: "Check"
+
+# --- optional (shown with their defaults) -----------------------------------
+# ALLOW_REBOOT: false                 # reboot after Apply only if the host asks for it
+# REBOOT_TIMEOUT: 1800                # seconds to wait for the host to come back
+# WU_CATEGORIES: "SecurityUpdates,CriticalUpdates,UpdateRollups,Updates"
+#                                     # add "Drivers,FeaturePacks,ServicePacks,Tools,
+#                                     # DefinitionUpdates,Guidance,Application" if needed
+# EXCLUDE_KB: ""                      # csv of KB ids / title regexes -> win_updates reject_list
+# WU_SERVER_SELECTION: "default"      # default (honours WSUS) | managed_server | windows_update
+# BECOME_SYSTEM: true                 # run as SYSTEM (runas) to avoid the WinRM double hop
+# MIN_FREE_GB: 5                      # refuse to update below this free space on the system drive
+# SERIAL_BATCH: 1                     # hosts patched at a time
+# EVIDENCE_BASE_DIR: 'C:\ProgramData\samurai-shield\windows-update'
+# LOG_LEVEL: "package"                # summary | package | full
+
+# --- optional connection settings -------------------------------------------
+# Applied to the hosts built from HOSTNAMES (they do not inherit connection
+# vars from the AAP inventory). Credentials come from the Machine credential.
+# WIN_CONNECTION: "winrm"             # winrm | psrp
+# WIN_PORT: 5986                      # default: connection plugin default (5986/HTTPS)
+# WIN_TRANSPORT: "ntlm"               # winrm auth: basic | ntlm | kerberos | credssp
+# WIN_CERT_VALIDATION: "ignore"       # ignore | validate
