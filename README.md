@@ -85,6 +85,35 @@ default — see
 [windows_update.sample_extra_vars.yml](playbooks/windows_update.sample_extra_vars.yml)
 for the full contract and the header of the playbook for details.
 
+#### Job Template survey
+
+[windows_update.survey_spec.json](playbooks/windows_update.survey_spec.json) is the
+survey definition for the Job Template, kept in git so it is versioned and
+reviewable instead of living only in the AAP UI. Apply it with:
+
+```bash
+curl -k -X POST \
+  -H "Authorization: Bearer $AAP_TOKEN" -H "Content-Type: application/json" \
+  -d @playbooks/windows_update.survey_spec.json \
+  https://<aap-host>/api/v2/job_templates/<ID>/survey_spec/
+```
+
+Then enable **Prompt on launch → Survey** on the Job Template.
+
+Two reasons the survey matters beyond convenience:
+
+- `HOSTNAMES` is recognized by SamurAI Shield as a target-entry field, so it is
+  **hidden from the operator form and auto-filled from the governed asset** — it
+  is never typed by hand. The remediation engine also re-asserts it server-side,
+  so a value set anywhere else is ignored.
+- A survey takes precedence over the dashboard's heuristic playbook parse, which
+  otherwise scrapes internal `set_fact` names out of the YAML and sends them as
+  extra-vars — and extra-vars outrank `set_fact`, which breaks the run.
+
+Because AAP sends a blank optional survey answer as an **empty string** (not as
+an absent variable), every optional var is resolved with
+`(X | default('') | trim) or <default>` rather than a plain `| default()`.
+
 Requirements: the `ansible.windows` collection (declared in `requirements.yml`),
 an AAP Machine credential for a member of the local Administrators group, and
 WinRM/PSRP reachable from the execution node. Installing updates can far exceed

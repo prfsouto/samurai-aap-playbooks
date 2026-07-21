@@ -1,0 +1,125 @@
+{
+  "name": "SamurAI Shield :: Windows Update",
+  "description": "Input contract for playbooks/windows_update_with_evidence.yml (repo: prfsouto/samurai-aap-playbooks). HOSTNAMES is auto-filled by SamurAI Shield from the governed asset and hidden from the operator form.",
+  "spec": [
+    {
+      "question_name": "Target host(s)",
+      "question_description": "Space-separated list of Windows hosts (comma also accepted). Filled automatically by SamurAI Shield from the selected asset — do not type it by hand.",
+      "variable": "HOSTNAMES",
+      "type": "text",
+      "required": true,
+      "default": "",
+      "new_question": true
+    },
+    {
+      "question_name": "Action",
+      "question_description": "Check searches Windows Update and reports what is applicable. Apply installs the updates found.",
+      "variable": "ACTION",
+      "type": "multiplechoice",
+      "choices": "Check\nApply",
+      "required": true,
+      "default": "Check",
+      "new_question": true
+    },
+    {
+      "question_name": "Allow reboot",
+      "question_description": "true lets the playbook restart the target after Apply, and only when the host reports a pending reboot.",
+      "variable": "ALLOW_REBOOT",
+      "type": "multiplechoice",
+      "choices": "false\ntrue",
+      "required": false,
+      "default": "false",
+      "new_question": true
+    },
+    {
+      "question_name": "Update categories",
+      "question_description": "Comma-separated Windows Update categories. Drivers, FeaturePacks and ServicePacks are NOT included unless added here.",
+      "variable": "WU_CATEGORIES",
+      "type": "text",
+      "required": false,
+      "default": "SecurityUpdates,CriticalUpdates,UpdateRollups,Updates",
+      "new_question": true
+    },
+    {
+      "question_name": "Exclude KBs",
+      "question_description": "Comma-separated KB ids or title regexes to skip (e.g. KB5001330,KB5003173). Leave blank to install everything in the selected categories.",
+      "variable": "EXCLUDE_KB",
+      "type": "text",
+      "required": false,
+      "default": "",
+      "new_question": true
+    },
+    {
+      "question_name": "Update source",
+      "question_description": "default honours the WSUS server configured on the host; windows_update goes straight to Microsoft.",
+      "variable": "WU_SERVER_SELECTION",
+      "type": "multiplechoice",
+      "choices": "default\nmanaged_server\nwindows_update",
+      "required": false,
+      "default": "default",
+      "new_question": true
+    },
+    {
+      "question_name": "Job log detail",
+      "question_description": "summary = counts only; package = one line per update (max 300); full = complete win_updates payload (very large logs).",
+      "variable": "LOG_LEVEL",
+      "type": "multiplechoice",
+      "choices": "summary\npackage\nfull",
+      "required": false,
+      "default": "package",
+      "new_question": true
+    },
+    {
+      "question_name": "Hosts at a time",
+      "question_description": "Rolling batch size. 1 patches the wave strictly one host at a time.",
+      "variable": "SERIAL_BATCH",
+      "type": "integer",
+      "min": 1,
+      "max": 100,
+      "required": false,
+      "default": 1,
+      "new_question": true
+    },
+    {
+      "question_name": "Minimum free space (GB)",
+      "question_description": "Refuse to update when the system drive has less than this much free space.",
+      "variable": "MIN_FREE_GB",
+      "type": "integer",
+      "min": 1,
+      "max": 500,
+      "required": false,
+      "default": 5,
+      "new_question": true
+    },
+    {
+      "question_name": "Reboot timeout (seconds)",
+      "question_description": "How long to wait for the host to come back when ALLOW_REBOOT actually reboots it.",
+      "variable": "REBOOT_TIMEOUT",
+      "type": "integer",
+      "min": 300,
+      "max": 7200,
+      "required": false,
+      "default": 1800,
+      "new_question": true
+    },
+    {
+      "question_name": "Run as SYSTEM",
+      "question_description": "true runs the update tasks as SYSTEM (runas) to avoid the WinRM double hop when reaching WSUS. Set false only when the connection already uses CredSSP or Kerberos delegation.",
+      "variable": "BECOME_SYSTEM",
+      "type": "multiplechoice",
+      "choices": "true\nfalse",
+      "required": false,
+      "default": "true",
+      "new_question": true
+    },
+    {
+      "question_name": "Evidence base directory",
+      "question_description": "Base directory on the target where the structured evidence files are written.",
+      "variable": "EVIDENCE_BASE_DIR",
+      "type": "text",
+      "required": false,
+      "default": "C:\\ProgramData\\samurai-shield\\windows-update",
+      "new_question": true
+    }
+  ]
+}
