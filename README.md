@@ -114,10 +114,78 @@ Because AAP sends a blank optional survey answer as an **empty string** (not as
 an absent variable), every optional var is resolved with
 `(X | default('') | trim) or <default>` rather than a plain `| default()`.
 
-Requirements: the `ansible.windows` collection (declared in `requirements.yml`),
-an AAP Machine credential for a member of the local Administrators group, and
-WinRM/PSRP reachable from the execution node. Installing updates can far exceed
-a default job timeout — size the Job Template timeout accordingly.
+#### AAP setup checklist
+
+Suggested order: check the Execution Environment first, since it is the only
+step that can require building an image. Then validate with `ACTION=Check`
+against a single host before allowing `Apply`.
+
+**1. Execution Environment.** The `winrm` connection plugin needs the **`pywinrm`**
+Python library, and `ansible-galaxy` cannot install Python dependencies — so
+`requirements.yml` does not cover this. If the EE lacks it, no Job Template
+setting can compensate; a custom EE is required.
+
+```bash
+podman run --rm <ee-image> python3 -c "import winrm; print(winrm.__version__)"
+podman run --rm <ee-image> ansible-galaxy collection list ansible.windows
+```
+
+`awx-ee` normally ships both; `ee-minimal` ships neither. `WIN_CONNECTION=psrp`
+needs `pypsrp` instead, and Kerberos auth needs `requests-kerberos`.
+
+**2. Project.** Sync the project after merging (or enable *Update Revision on
+Launch*). The root `requirements.yml` IS honoured — the controller stats
+`roles/requirements.yml`, `collections/requirements.yml` **and** the root
+`requirements.yml`, installing the last one with `ansible-galaxy install -r`,
+which handles roles and collections alike. It only runs when
+**Settings → Jobs → Enable Collection(s) Download** is on.
+
+**3. Credential.** A Machine credential whose user belongs to the local
+Administrators group on the targets. It injects `ansible_user` /
+`ansible_password`; the playbook's `add_host` pins only the transport, never
+credentials.
+
+**4. Job Template.**
+
+| Field | Value |
+| --- | --- |
+| Playbook | `playbooks/windows_update_with_evidence.yml` |
+| Inventory | any (e.g. `samurai_managed`) — required by AAP, but the playbook builds its own inventory and the targets need not be in it |
+| Credentials | the Windows Machine credential |
+| `ask_variables_on_launch` | **`true`** |
+| `survey_enabled` | `true`, plus the survey spec above |
+| Timeout | `0`, or well above a full update run |
+| `job_slice_count` | **`1`** |
+
+```bash
+curl -k -X PATCH \
+  -H "Authorization: Bearer $AAP_TOKEN" -H "Content-Type: application/json" \
+  -d '{"ask_variables_on_launch": true, "survey_enabled": true, "timeout": 0, "job_slice_count": 1}' \
+  https://<aap-host>/api/v2/job_templates/<ID>/
+```
+
+Two settings there are load-bearing:
+
+- **`ask_variables_on_launch: true`** — the remediation engine launches with
+  `{"extra_vars": json.dumps(...)}`. Without this flag the Controller *silently
+  discards* the extra-vars and reports them under `ignored_fields` — no error.
+  `HOSTNAMES` would never arrive and the job would end with "no hosts to target".
+- **`job_slice_count: 1`** — slicing partitions the *Job Template inventory*,
+  which this playbook ignores: play 1 runs on `localhost` and re-adds every host
+  from `HOSTNAMES` in **every** slice. With 3 slices, all 3 would patch the whole
+  fleet concurrently. Use the playbook's `SERIAL_BATCH` for batching instead.
+
+Privilege escalation does not need to be enabled on the template — `become` is
+declared per task (`runas` / SYSTEM).
+
+**5. Windows targets** (outside AAP). WinRM listener reachable from the execution
+node, `wuauserv` not disabled (the playbook refuses to run otherwise), and enough
+free space on the system drive.
+
+**6. SamurAI Shield.** Point the playbook mapping at the new Job Template id. Do
+**not** put `HOSTNAMES` in the mapping's `extra_vars_template`: the engine always
+derives it from the governed asset and the merge only fills keys it has not already
+set, so the value is silently discarded.
 
 ## AAP Project Configuration
 
