@@ -49,6 +49,47 @@ the patch's minimum version. See
 [oracle_rac_patch.sample_extra_vars.yml](playbooks/oracle_rac_patch.sample_extra_vars.yml)
 for the full extra-vars contract, and the header of the playbook for details.
 
+### windows_update_with_evidence.yml
+
+Controlled Windows Update run on Windows Server targets, reached over WinRM/PSRP.
+Same shape as the Linux update playbook: pre-checks, optional install, post-checks,
+evidence files under `C:\ProgramData\samurai-shield\windows-update\<host>\<timestamp>`
+and a consolidated `samurai_shield_result` JSON block on stdout.
+
+Supported actions:
+
+- `Check`: searches Windows Update and lists what is applicable. Nothing is
+  downloaded or installed.
+- `Apply`: installs the updates found, re-checks the host (hotfix diff, pending
+  reboot, remaining updates, stopped automatic services) and optionally reboots.
+
+Safety model:
+
+1. **Gates before touching anything** — refuses to run when the OS is not
+   Windows, when the Windows Update service is missing/disabled, or when the
+   system drive has less than `MIN_FREE_GB` (default 5 GB) free.
+2. **Reboot is the playbook's decision, never the module's** — `win_updates` is
+   always called with `reboot: false`. The host is rebooted only when
+   `ALLOW_REBOOT=true` *and* it actually reports a pending reboot; otherwise it
+   is left pending and `reboot_required_after=yes` is reported in the JSON.
+3. **Drivers are opt-in** — the default categories are
+   `SecurityUpdates,CriticalUpdates,UpdateRollups,Updates`. Drivers, Feature
+   Packs and Service Packs are only installed if `WU_CATEGORIES` asks for them.
+4. **Serial by default** (`SERIAL_BATCH=1`) so a wave never takes a whole fleet
+   down at once.
+
+The normal remediation call only needs `HOSTNAMES` + `ACTION`. Everything else
+(`ALLOW_REBOOT`, `WU_CATEGORIES`, `EXCLUDE_KB`, `WU_SERVER_SELECTION`,
+`BECOME_SYSTEM`, `LOG_LEVEL`, connection overrides, …) is optional with a working
+default — see
+[windows_update.sample_extra_vars.yml](playbooks/windows_update.sample_extra_vars.yml)
+for the full contract and the header of the playbook for details.
+
+Requirements: the `ansible.windows` collection (declared in `requirements.yml`),
+an AAP Machine credential for a member of the local Administrators group, and
+WinRM/PSRP reachable from the execution node. Installing updates can far exceed
+a default job timeout — size the Job Template timeout accordingly.
+
 ## AAP Project Configuration
 
 Use this repository as a Git project in Ansible Automation Platform.
