@@ -18,7 +18,11 @@
 # remediation call only needs HOSTNAMES + ACTION:
 #   ALLOW_REBOOT (bool, default false) — reboot after Apply only when the host
 #     reports reboot_required. When false the host is left pending-reboot and
-#     the JSON reports reboot_required_after=yes.
+#     the JSON reports reboot_required_after=yes. On the SamurAI governed path
+#     the engine instead injects a lowercase `allow_reboot` (from job.allow_reboot)
+#     which takes precedence over ALLOW_REBOOT — see wu_reboot_governed below.
+#     summary.json records which source won as allow_reboot_source
+#     (governed | survey | default).
 #   WU_CATEGORIES (csv, default "SecurityUpdates,CriticalUpdates,UpdateRollups,
 #     Updates") — Drivers / FeaturePacks / ServicePacks are NOT included by
 #     default; pass them explicitly if you want them.
@@ -148,7 +152,28 @@
     # blank optional field, which `| default(Y)` would NOT catch.
     wu_action: "{{ (ACTION | default('') | string | trim) or 'Check' }}"
     wu_log_level: "{{ (LOG_LEVEL | default('') | string | trim) or 'package' }}"
-    wu_allow_reboot: "{{ ((ALLOW_REBOOT | default('') | string | trim) or 'false') | bool }}"
+    # Reboot decision — two sources, distinct precedence:
+    #   * allow_reboot (lowercase) is injected by the SamurAI engine from
+    #     job.allow_reboot (execution_service.py build_extra_vars) and ONLY exists
+    #     on the governed path — its mere presence means "the governed job decided
+    #     this", so it WINS.
+    #   * ALLOW_REBOOT (uppercase) is the survey/manual operator knob (and the
+    #     survey default false that AAP also injects on the governed path).
+    # Coalesce on "defined and non-blank", NOT with `or`: a governed
+    # allow_reboot=false is a legitimate explicit "no" and is falsy — an `or`
+    # chain would wrongly fall through to the uppercase survey default.
+    wu_reboot_governed: "{{ allow_reboot | default('') | string | trim }}"
+    wu_reboot_survey: "{{ ALLOW_REBOOT | default('') | string | trim }}"
+    wu_allow_reboot: >-
+      {{
+        (wu_reboot_governed if wu_reboot_governed != ''
+         else (wu_reboot_survey if wu_reboot_survey != '' else 'false')) | bool
+      }}
+    wu_reboot_source: >-
+      {{
+        'governed' if wu_reboot_governed != ''
+        else ('survey' if wu_reboot_survey != '' else 'default')
+      }}
     wu_become_system: "{{ ((BECOME_SYSTEM | default('') | string | trim) or 'true') | bool }}"
     wu_server_selection: "{{ (WU_SERVER_SELECTION | default('') | string | trim) or 'default' }}"
     wu_min_free_gb: "{{ ((MIN_FREE_GB | default('') | string | trim) or '5') | float }}"
@@ -710,6 +735,7 @@
               reboot_required_before: "{{ reboot_required_before | default('unknown') }}"
               reboot_required_after: "{{ reboot_required_after | default('not_applicable_check_mode') }}"
               allow_reboot: "{{ wu_allow_reboot | bool }}"
+              allow_reboot_source: "{{ wu_reboot_source }}"
               rebooted: "{{ (reboot_action.rebooted | default(false)) | bool }}"
               failed_services_after: "{{ failed_services_list | default([]) }}"
               evidence_dir: "{{ evidence_dir | default('not_created') }}"

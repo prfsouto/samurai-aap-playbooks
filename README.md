@@ -69,9 +69,16 @@ Safety model:
    Windows, when the Windows Update service is missing/disabled, or when the
    system drive has less than `MIN_FREE_GB` (default 5 GB) free.
 2. **Reboot is the playbook's decision, never the module's** — `win_updates` is
-   always called with `reboot: false`. The host is rebooted only when
-   `ALLOW_REBOOT=true` *and* it actually reports a pending reboot; otherwise it
-   is left pending and `reboot_required_after=yes` is reported in the JSON.
+   always called with `reboot: false`. The host is rebooted only when reboot is
+   allowed *and* it actually reports a pending reboot; otherwise it is left
+   pending and `reboot_required_after=yes` is reported in the JSON. The "allowed"
+   flag has two sources: the SamurAI engine injects a lowercase `allow_reboot`
+   from the governed job, which **takes precedence**; the uppercase `ALLOW_REBOOT`
+   is the survey/manual knob (and the fallback default `false`). `summary.json`
+   records which source won as `allow_reboot_source` (`governed` | `survey` |
+   `default`). The coalescing keys on "defined", not "truthy", so a governed
+   `allow_reboot=false` is honoured as an explicit *no* rather than falling
+   through to the survey default.
 3. **Drivers are opt-in** — the default categories are
    `SecurityUpdates,CriticalUpdates,UpdateRollups,Updates`. Drivers, Feature
    Packs and Service Packs are only installed if `WU_CATEGORIES` asks for them.

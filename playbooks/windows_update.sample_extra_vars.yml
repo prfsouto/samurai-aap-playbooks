@@ -18,7 +18,11 @@ HOSTNAMES: "win01 win02"
 ACTION: "Check"
 
 # --- optional (shown with their defaults) -----------------------------------
-# ALLOW_REBOOT: false                 # reboot after Apply only if the host asks for it
+# ALLOW_REBOOT: false                 # reboot after Apply only if the host asks for it.
+#                                     # On the SamurAI governed path the engine sends a
+#                                     # lowercase `allow_reboot` (from the job) that takes
+#                                     # precedence over this; summary.json records the
+#                                     # winner as allow_reboot_source.
 # REBOOT_TIMEOUT: 1800                # seconds to wait for the host to come back
 # WU_CATEGORIES: "SecurityUpdates,CriticalUpdates,UpdateRollups,Updates"
 #                                     # add "Drivers,FeaturePacks,ServicePacks,Tools,
