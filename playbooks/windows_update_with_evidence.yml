@@ -18,7 +18,11 @@
 # remediation call only needs HOSTNAMES + ACTION:
 #   ALLOW_REBOOT (bool, default false) — reboot after Apply only when the host
 #     reports reboot_required. When false the host is left pending-reboot and
-#     the JSON reports reboot_required_after=yes.
+#     the JSON reports reboot_required_after=yes. On the SamurAI governed path
+#     the engine instead injects a lowercase `allow_reboot` (from job.allow_reboot)
+#     which takes precedence over ALLOW_REBOOT — see wu_reboot_governed below.
+#     summary.json records which source won as allow_reboot_source
+#     (governed | survey | default).
 #   WU_CATEGORIES (csv, default "SecurityUpdates,CriticalUpdates,UpdateRollups,
 #     Updates") — Drivers / FeaturePacks / ServicePacks are NOT included by
 #     default; pass them explicitly if you want them.
@@ -55,6 +59,13 @@
 # Size the AAP Job Template timeout accordingly (0 = no timeout) and keep
 # SERIAL_BATCH low so a wave never takes the whole fleet down at once.
 #
+# NOTE ON BLANK SURVEY FIELDS: when the Job Template has a survey, AAP sends a
+# blank optional answer as an empty STRING — the var IS defined, so a plain
+# `X | default(Y)` would keep '' instead of Y (an empty EVIDENCE_BASE_DIR or
+# WIN_TRANSPORT is enough to break the run). Every optional var is therefore
+# resolved with `(X | default('') | string | trim) or Y`, and the connection
+# overrides use `or omit` so a blank field drops the parameter entirely.
+#
 # NOTE ON VAR NAMING: optional extra-vars are copied into distinct internal
 # names (wu_*) instead of being redeclared as `X: "{{ X | default(...) }}"`.
 # When the extra-var is absent that self-referencing form makes Ansible recurse
@@ -66,10 +77,21 @@
 - name: "SamurAI :: windows-update :: build dynamic inventory from HOSTNAMES"
   hosts: localhost
   gather_facts: false
+  # Defensive: this localhost play needs no privilege escalation. If the Job
+  # Template has "Privilege Escalation Enabled" (adds a global --become) and the
+  # inventory carries ansible_become_method=runas (a Windows-oriented inventory),
+  # the runas become plugin loads on localhost and dies "required ... become
+  # plugin: runas setting: become_user". Forcing become:false here (and on the
+  # other localhost play) makes the playbook immune to that config.
+  become: false
   vars:
-    wu_hostnames: "{{ HOSTNAMES | default('') }}"
-    wu_action: "{{ ACTION | default('Check') }}"
-    wu_log_level: "{{ LOG_LEVEL | default('package') }}"
+    # `X | default(Y)` only fires when X is UNDEFINED. An AAP survey sends an
+    # empty STRING for a blank optional field, which is *defined* — so the
+    # default would never apply and '' would win. `(X | default('') | trim) or Y`
+    # covers both "absent" and "present but blank".
+    wu_hostnames: "{{ HOSTNAMES | default('') | string | trim }}"
+    wu_action: "{{ (ACTION | default('') | string | trim) or 'Check' }}"
+    wu_log_level: "{{ (LOG_LEVEL | default('') | string | trim) or 'package' }}"
   tasks:
     - name: "Validate HOSTNAMES is provided"
       ansible.builtin.fail:
@@ -112,10 +134,13 @@
         # Machine credential (injected as ansible_user/ansible_password).
         # For PSRP pass WIN_CONNECTION=psrp; the ansible_winrm_* vars below are
         # then ignored (psrp uses ansible_psrp_*).
-        ansible_connection: "{{ WIN_CONNECTION | default('winrm') }}"
-        ansible_port: "{{ WIN_PORT | default(omit) }}"
-        ansible_winrm_transport: "{{ WIN_TRANSPORT | default(omit) }}"
-        ansible_winrm_server_cert_validation: "{{ WIN_CERT_VALIDATION | default('ignore') }}"
+        # `or omit` (not `default(omit)`) so a blank survey field drops the
+        # param instead of setting it to '' — ansible_port: '' would break the
+        # connection outright.
+        ansible_connection: "{{ (WIN_CONNECTION | default('') | string | trim) or 'winrm' }}"
+        ansible_port: "{{ (WIN_PORT | default('') | string | trim) or omit }}"
+        ansible_winrm_transport: "{{ (WIN_TRANSPORT | default('') | string | trim) or omit }}"
+        ansible_winrm_server_cert_validation: "{{ (WIN_CERT_VALIDATION | default('') | string | trim) or 'ignore' }}"
       loop: "{{ samurai_target_hosts }}"
       changed_when: false
 
@@ -127,24 +152,54 @@
 - name: "SamurAI :: windows-update :: pre-check, update and post-check"
   hosts: samurai_win_update_targets
   gather_facts: true
-  serial: "{{ SERIAL_BATCH | default(1) }}"
+  serial: "{{ (SERIAL_BATCH | default('') | string | trim) or 1 }}"
+  # Default OFF for the whole play: the pre/post-check win_shell/win_copy tasks
+  # run as the connection user (a local admin) and need no elevation. Only the
+  # win_updates tasks opt back in with become_user: SYSTEM (task-level overrides
+  # play-level), which avoids the WinRM double hop to WSUS. This also neutralizes
+  # a globally-forced --become that would otherwise hit the win tasks with a
+  # runas plugin missing become_user.
+  become: false
 
   vars:
-    wu_action: "{{ ACTION | default('Check') }}"
-    wu_log_level: "{{ LOG_LEVEL | default('package') }}"
-    wu_allow_reboot: "{{ ALLOW_REBOOT | default(false) | bool }}"
-    wu_become_system: "{{ BECOME_SYSTEM | default(true) | bool }}"
-    wu_server_selection: "{{ WU_SERVER_SELECTION | default('default') }}"
-    wu_min_free_gb: "{{ MIN_FREE_GB | default(5) | float }}"
-    wu_reboot_timeout: "{{ REBOOT_TIMEOUT | default(1800) | int }}"
+    # See play 1: `(X | default('') | trim) or Y` — an AAP survey sends '' for a
+    # blank optional field, which `| default(Y)` would NOT catch.
+    wu_action: "{{ (ACTION | default('') | string | trim) or 'Check' }}"
+    wu_log_level: "{{ (LOG_LEVEL | default('') | string | trim) or 'package' }}"
+    # Reboot decision — two sources, distinct precedence:
+    #   * allow_reboot (lowercase) is injected by the SamurAI engine from
+    #     job.allow_reboot (execution_service.py build_extra_vars) and ONLY exists
+    #     on the governed path — its mere presence means "the governed job decided
+    #     this", so it WINS.
+    #   * ALLOW_REBOOT (uppercase) is the survey/manual operator knob (and the
+    #     survey default false that AAP also injects on the governed path).
+    # Coalesce on "defined and non-blank", NOT with `or`: a governed
+    # allow_reboot=false is a legitimate explicit "no" and is falsy — an `or`
+    # chain would wrongly fall through to the uppercase survey default.
+    wu_reboot_governed: "{{ allow_reboot | default('') | string | trim }}"
+    wu_reboot_survey: "{{ ALLOW_REBOOT | default('') | string | trim }}"
+    wu_allow_reboot: >-
+      {{
+        (wu_reboot_governed if wu_reboot_governed != ''
+         else (wu_reboot_survey if wu_reboot_survey != '' else 'false')) | bool
+      }}
+    wu_reboot_source: >-
+      {{
+        'governed' if wu_reboot_governed != ''
+        else ('survey' if wu_reboot_survey != '' else 'default')
+      }}
+    wu_become_system: "{{ ((BECOME_SYSTEM | default('') | string | trim) or 'true') | bool }}"
+    wu_server_selection: "{{ (WU_SERVER_SELECTION | default('') | string | trim) or 'default' }}"
+    wu_min_free_gb: "{{ ((MIN_FREE_GB | default('') | string | trim) or '5') | float }}"
+    wu_reboot_timeout: "{{ ((REBOOT_TIMEOUT | default('') | string | trim) or '1800') | int }}"
     wu_evidence_base_default: 'C:\ProgramData\samurai-shield\windows-update'
-    wu_evidence_base: "{{ EVIDENCE_BASE_DIR | default(wu_evidence_base_default) }}"
+    wu_evidence_base: "{{ (EVIDENCE_BASE_DIR | default('') | string | trim) or wu_evidence_base_default }}"
     wu_categories_default: "SecurityUpdates,CriticalUpdates,UpdateRollups,Updates"
     log_package_max_lines: 300
 
     wu_category_list: >-
       {{
-        ((WU_CATEGORIES | default(wu_categories_default)) | string).split(',')
+        (((WU_CATEGORIES | default('') | string | trim) or wu_categories_default)).split(',')
         | map('trim') | reject('equalto', '') | list
       }}
 
@@ -694,6 +749,7 @@
               reboot_required_before: "{{ reboot_required_before | default('unknown') }}"
               reboot_required_after: "{{ reboot_required_after | default('not_applicable_check_mode') }}"
               allow_reboot: "{{ wu_allow_reboot | bool }}"
+              allow_reboot_source: "{{ wu_reboot_source }}"
               rebooted: "{{ (reboot_action.rebooted | default(false)) | bool }}"
               failed_services_after: "{{ failed_services_list | default([]) }}"
               evidence_dir: "{{ evidence_dir | default('not_created') }}"
@@ -720,6 +776,7 @@
 - name: "SamurAI :: windows-update :: emit consolidated stdout JSON"
   hosts: localhost
   gather_facts: false
+  become: false  # localhost aggregation — no privilege escalation (see play 1)
   tasks:
     - name: "Collect per-host summaries"
       ansible.builtin.set_fact:
@@ -754,8 +811,8 @@
       ansible.builtin.set_fact:
         samurai_shield_result:
           playbook: "windows_update_with_evidence"
-          action: "{{ ACTION | default('Check') }}"
-          log_level: "{{ LOG_LEVEL | default('package') }}"
+          action: "{{ (ACTION | default('') | string | trim) or 'Check' }}"
+          log_level: "{{ (LOG_LEVEL | default('') | string | trim) or 'package' }}"
           status: "{{ consolidated_status }}"
           host_count: "{{ all_host_summaries | length }}"
           hosts: "{{ all_host_summaries }}"
