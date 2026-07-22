@@ -1,0 +1,105 @@
+{
+  "name": "SamurAI Shield :: Linux apt update (Ubuntu/Debian)",
+  "description": "Input contract for playbooks/linux_apt_update_with_evidence.yml (repo: prfsouto/samurai-aap-playbooks). HOSTNAMES is auto-filled by SamurAI Shield from the governed asset and hidden from the operator form.",
+  "spec": [
+    {
+      "question_name": "Target host(s)",
+      "question_description": "Space-separated list of Ubuntu/Debian hosts (comma also accepted). Filled automatically by SamurAI Shield from the selected asset — do not type it by hand.",
+      "variable": "HOSTNAMES",
+      "type": "text",
+      "required": true,
+      "default": "",
+      "new_question": true
+    },
+    {
+      "question_name": "Action",
+      "question_description": "Check simulates the upgrade and reports what would change. Apply performs the upgrade on the target.",
+      "variable": "ACTION",
+      "type": "multiplechoice",
+      "choices": "Check\nApply",
+      "required": true,
+      "default": "Check",
+      "new_question": true
+    },
+    {
+      "question_name": "Update mode",
+      "question_description": "all upgrades every upgradable package. security drives unattended-upgrade (the -security pocket only) and requires the unattended-upgrades package.",
+      "variable": "UPDATE_MODE",
+      "type": "multiplechoice",
+      "choices": "all\nsecurity",
+      "required": false,
+      "default": "all",
+      "new_question": true
+    },
+    {
+      "question_name": "APT upgrade strategy",
+      "question_description": "Only used when Update mode = all. upgrade installs new dependencies but NEVER removes a package. dist-upgrade is the full resolver and MAY remove packages.",
+      "variable": "APT_UPGRADE_MODE",
+      "type": "multiplechoice",
+      "choices": "upgrade\ndist-upgrade",
+      "required": false,
+      "default": "upgrade",
+      "new_question": true
+    },
+    {
+      "question_name": "Exclude packages",
+      "question_description": "Comma-separated package names to keep at their current version. They are put on apt-mark hold for the run; packages already held by an operator stay held.",
+      "variable": "EXCLUDE_PACKAGES",
+      "type": "text",
+      "required": false,
+      "default": "",
+      "new_question": true
+    },
+    {
+      "question_name": "Allow reboot",
+      "question_description": "true lets the playbook reboot the target after Apply, and only when /var/run/reboot-required is present.",
+      "variable": "ALLOW_REBOOT",
+      "type": "multiplechoice",
+      "choices": "false\ntrue",
+      "required": false,
+      "default": "false",
+      "new_question": true
+    },
+    {
+      "question_name": "Job log detail",
+      "question_description": "summary = counts only; package = one line per apt transaction (max 300); full = complete stdout/stderr (very large logs).",
+      "variable": "LOG_LEVEL",
+      "type": "multiplechoice",
+      "choices": "summary\npackage\nfull",
+      "required": false,
+      "default": "package",
+      "new_question": true
+    },
+    {
+      "question_name": "Hosts at a time",
+      "question_description": "Rolling batch size. 1 updates the wave strictly one host at a time.",
+      "variable": "SERIAL_BATCH",
+      "type": "integer",
+      "min": 1,
+      "max": 100,
+      "required": false,
+      "default": 1,
+      "new_question": true
+    },
+    {
+      "question_name": "Minimum free space on /boot (MB)",
+      "question_description": "Refuse to update when /boot has less than this much free space — a kernel upgrade with a full /boot can leave the host unbootable.",
+      "variable": "MIN_FREE_MB_BOOT",
+      "type": "integer",
+      "min": 50,
+      "max": 5000,
+      "required": false,
+      "default": 200,
+      "new_question": true
+    },
+    {
+      "question_name": "Evidence base directory",
+      "question_description": "Base directory on the target where the structured evidence files are written.",
+      "variable": "EVIDENCE_BASE_DIR",
+      "type": "text",
+      "required": false,
+      "default": "/var/tmp/samurai-shield/apt-update",
+      "new_question": true
+    }
+  ]
+}
