@@ -1,0 +1,43 @@
+---
+# ============================================================================
+# Sample extra-vars for linux_apt_update_with_evidence.yml (Ubuntu / Debian)
+# ----------------------------------------------------------------------------
+# Pass these through an AAP Job Template survey or --extra-vars.
+# In the normal remediation flow only HOSTNAMES + ACTION are sent.
+# ============================================================================
+
+# --- required ---------------------------------------------------------------
+# Target hosts. The SamurAI Shield engine sends them space-separated;
+# commas are also accepted.
+HOSTNAMES: "ubuntu01 ubuntu02"
+
+# --- action -----------------------------------------------------------------
+# Check = refresh metadata and report what WOULD be upgraded (simulation only,
+#         nothing is downloaded or installed).
+# Apply = perform the upgrade, then re-check the host.
+ACTION: "Check"
+
+# --- optional (shown with their defaults) -----------------------------------
+# UPDATE_MODE: "all"                  # all | security
+#                                     # security drives `unattended-upgrade`
+#                                     # (the -security pocket). Requires the
+#                                     # unattended-upgrades package; the run
+#                                     # FAILS rather than silently doing a full
+#                                     # upgrade if it is missing.
+# APT_UPGRADE_MODE: "upgrade"         # upgrade | dist-upgrade — only for UPDATE_MODE=all.
+#                                     # upgrade  -> `apt-get upgrade --with-new-pkgs`
+#                                     #             installs new deps, NEVER removes.
+#                                     # dist-upgrade -> full resolver, MAY REMOVE packages.
+# EXCLUDE_PACKAGES: ""                # csv. apt has no --exclude, so these are put on
+#                                     # `apt-mark hold` for the run; a package the
+#                                     # operator had already held stays held afterwards.
+# ALLOW_REBOOT: false                 # reboot after Apply only if /var/run/reboot-required.
+#                                     # On the SamurAI governed path the engine sends a
+#                                     # lowercase `allow_reboot` that takes precedence;
+#                                     # summary.json records the winner as allow_reboot_source.
+# MIN_FREE_MB_BOOT: 200               # refuse to update below this free space on /boot
+#                                     # (a kernel upgrade with a full /boot can leave
+#                                     # the host unbootable)
+# SERIAL_BATCH: 1                     # hosts updated at a time
+# EVIDENCE_BASE_DIR: "/var/tmp/samurai-shield/apt-update"
+# LOG_LEVEL: "package"                # summary | package | full
