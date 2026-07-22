@@ -182,12 +182,26 @@ Two settings there are load-bearing:
   from `HOSTNAMES` in **every** slice. With 3 slices, all 3 would patch the whole
   fleet concurrently. Use the playbook's `SERIAL_BATCH` for batching instead.
 
-Privilege escalation does not need to be enabled on the template — `become` is
-declared per task (`runas` / SYSTEM).
+**Do NOT enable "Privilege Escalation" on the template.** It adds a global
+`--become`; combined with a Windows inventory that carries
+`ansible_become_method=runas`, the `runas` become plugin then loads on the
+`localhost` bootstrap play and fails with *"required ... become plugin: runas
+setting: become_user"*. The playbook declares `become` per task (`runas` /
+SYSTEM) and defensively pins `become: false` on every play, so an accidental
+global become no longer breaks it — but leaving the checkbox off is still the
+correct configuration.
 
-**5. Windows targets** (outside AAP). WinRM listener reachable from the execution
-node, `wuauserv` not disabled (the playbook refuses to run otherwise), and enough
-free space on the system drive.
+**5. Windows targets** (outside AAP). A WinRM listener reachable from the
+execution node on the port the playbook connects to. The default is **HTTPS
+5986**; `winrm quickconfig` only creates the **HTTP 5985** listener and opens
+5985 — an HTTPS listener plus a firewall rule for 5986 must be set up
+explicitly (see the header of `windows_update.sample_extra_vars.yml` for the
+`WIN_PORT` / `WIN_TRANSPORT` overrides if you must fall back to 5985/HTTP).
+Because the target hosts are built with `add_host`, they do NOT inherit
+connection vars from the AAP inventory — any `WIN_PORT` override must arrive as
+an extra-var (JT extra-vars or the mapping's `extra_vars_template`), not via the
+inventory. Also required: `wuauserv` not disabled (the playbook refuses to run
+otherwise) and enough free space on the system drive.
 
 **6. SamurAI Shield.** Point the playbook mapping at the new Job Template id. Do
 **not** put `HOSTNAMES` in the mapping's `extra_vars_template`: the engine always

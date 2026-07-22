@@ -77,6 +77,13 @@
 - name: "SamurAI :: windows-update :: build dynamic inventory from HOSTNAMES"
   hosts: localhost
   gather_facts: false
+  # Defensive: this localhost play needs no privilege escalation. If the Job
+  # Template has "Privilege Escalation Enabled" (adds a global --become) and the
+  # inventory carries ansible_become_method=runas (a Windows-oriented inventory),
+  # the runas become plugin loads on localhost and dies "required ... become
+  # plugin: runas setting: become_user". Forcing become:false here (and on the
+  # other localhost play) makes the playbook immune to that config.
+  become: false
   vars:
     # `X | default(Y)` only fires when X is UNDEFINED. An AAP survey sends an
     # empty STRING for a blank optional field, which is *defined* — so the
@@ -146,6 +153,13 @@
   hosts: samurai_win_update_targets
   gather_facts: true
   serial: "{{ (SERIAL_BATCH | default('') | string | trim) or 1 }}"
+  # Default OFF for the whole play: the pre/post-check win_shell/win_copy tasks
+  # run as the connection user (a local admin) and need no elevation. Only the
+  # win_updates tasks opt back in with become_user: SYSTEM (task-level overrides
+  # play-level), which avoids the WinRM double hop to WSUS. This also neutralizes
+  # a globally-forced --become that would otherwise hit the win tasks with a
+  # runas plugin missing become_user.
+  become: false
 
   vars:
     # See play 1: `(X | default('') | trim) or Y` — an AAP survey sends '' for a
@@ -762,6 +776,7 @@
 - name: "SamurAI :: windows-update :: emit consolidated stdout JSON"
   hosts: localhost
   gather_facts: false
+  become: false  # localhost aggregation — no privilege escalation (see play 1)
   tasks:
     - name: "Collect per-host summaries"
       ansible.builtin.set_fact:
