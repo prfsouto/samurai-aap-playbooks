@@ -1,0 +1,27 @@
+---
+# ============================================================================
+# SamurAI Shield :: utility :: show the AAP execution-node egress IP
+# ----------------------------------------------------------------------------
+# Runs on localhost (the AAP execution node) and prints the PUBLIC source IP the
+# job uses to reach the internet. Use it to scope an Azure NSG / host firewall
+# rule (e.g. WinRM 5986) to the AAP egress instead of opening it to the world.
+#
+# Run it a few times: a stable IP means the cluster has a single egress and a
+# /32 rule is safe; a varying IP means an egress pool — allow the published
+# range, pin an OpenShift EgressIP for the namespace, or use private
+# connectivity (VNet peering / VPN) instead of public WinRM.
+# ============================================================================
+- name: "SamurAI :: util :: show AAP egress IP"
+  hosts: localhost
+  gather_facts: false
+  become: false
+  tasks:
+    - name: "Query a public IP echo service"
+      ansible.builtin.uri:
+        url: https://api.ipify.org?format=json
+        return_content: true
+      register: egress
+
+    - name: "Show the egress IP"
+      ansible.builtin.debug:
+        msg: "AAP egress IP (scope your NSG source to this /32): {{ egress.json.ip }}"
