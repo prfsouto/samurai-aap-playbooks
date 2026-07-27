@@ -372,7 +372,7 @@
               {{
                 [pkg_manager, 'update', '-y']
                 + (['--security'] if UPDATE_MODE == 'security' else [])
-                + (exclude_packages_list | map('regex_replace', '^(.*)$', '--exclude=\\1') | list)
+                + (exclude_packages_list | map('regex_replace', '^', '--exclude=') | list)
               }}
           when: ACTION == 'Apply'
 
@@ -470,23 +470,48 @@
           failed_when: false
           when: effective_log_level == 'package'
 
+        # In Check mode nothing is installed, so update_stdout.txt is empty and the
+        # grep above finds nothing. The packages that WOULD be updated are in the
+        # `check-update` output — its lines (pkg.arch  version  repo) do NOT match
+        # the transaction regex, so show them directly instead of reporting "none".
+        - name: "Build available-updates lines for the AAP log (Check mode)"
+          ansible.builtin.set_fact:
+            yum_available_lines: >-
+              {{
+                check_update_out.stdout_lines | default([])
+                | reject('match', '^\\s*$') | reject('match', '^Obsoleting')
+                | reject('match', '^Last metadata') | reject('match', '^Loaded plugins')
+                | reject('match', '^Loading mirror') | list
+              }}
+          when: effective_log_level == 'package'
+
         - name: "AAP log :: package level (max {{ log_package_max_lines }} lines)"
           ansible.builtin.debug:
             msg: >-
               {{
-                pkg_transaction_lines.stdout_lines
-                if (pkg_transaction_lines.stdout_lines | default([]) | length) > 0
-                else ['no package-transaction lines found (Check mode, nothing to do, or update failed before any transaction)']
+                (pkg_transaction_lines.stdout_lines | default([]))[0:(log_package_max_lines | int)]
+                if (ACTION == 'Apply' and (pkg_transaction_lines.stdout_lines | default([]) | length) > 0)
+                else (
+                  (yum_available_lines | default([]))[0:(log_package_max_lines | int)]
+                  if (ACTION != 'Apply' and (yum_available_lines | default([]) | length) > 0)
+                  else [('no packages to install (host already up to date)') if ACTION == 'Apply'
+                        else ('no updates available (host already up to date)')]
+                )
               }}
           when: effective_log_level == 'package'
 
         - name: "Read full update stdout/stderr (capped) for AAP log"
           ansible.builtin.shell: |
+            {% if ACTION == 'Apply' %}
             echo "===== update_stdout.txt (max {{ log_full_max_lines }} lines) ====="
             head -n {{ log_full_max_lines | int }} "{{ evidence_dir }}/update_stdout.txt" 2>/dev/null || echo "(update_stdout.txt not available)"
             echo ""
             echo "===== update_stderr.txt (max {{ log_full_max_lines }} lines) ====="
             head -n {{ log_full_max_lines | int }} "{{ evidence_dir }}/update_stderr.txt" 2>/dev/null || echo "(update_stderr.txt not available)"
+            {% else %}
+            echo "===== available updates (Check mode — {{ pkg_manager | default('yum') }} check-update) (max {{ log_full_max_lines }} lines) ====="
+            head -n {{ log_full_max_lines | int }} "{{ evidence_dir }}/updates_available_before.txt" 2>/dev/null || echo "(check-update output not available)"
+            {% endif %}
           args:
             executable: /bin/bash
           register: full_update_log
@@ -554,11 +579,15 @@
           when: ACTION == 'Apply'
 
         - name: "Identify updated packages (changed NVR)"
+          # Strip from the first '|' to end to leave just the package name. We do
+          # NOT use a capture-group backreference ('\1'): inside a YAML block
+          # scalar Ansible hands re.sub the replacement as a LITERAL '\1' (not
+          # group 1), so every line collapses to '\1' and the count becomes 1.
           ansible.builtin.set_fact:
             packages_updated: >-
               {{
                 (pkgs_after_set | difference(pkgs_before_set))
-                | map('regex_replace', '^([^|]+)\\|.*$', '\\1') | unique | list
+                | map('regex_replace', '\\|.*$', '') | unique | list
               }}
           when: ACTION == 'Apply'
 
@@ -601,11 +630,14 @@
             - systemctl_stat.stat.exists | default(false)
 
         - name: "Build failed services list"
+          # Same backreference caveat as packages_updated: trim, then strip from
+          # the first whitespace to end to keep the unit name (no '\1').
           ansible.builtin.set_fact:
             failed_services_list: >-
               {{
                 (failed_units.stdout_lines | default([]))
-                | map('regex_replace', '^\\s*(\\S+).*$', '\\1') | list
+                | map('trim') | map('regex_replace', '\\s.*$', '')
+                | reject('equalto', '') | list
               }}
           when: ACTION == 'Apply'
 
