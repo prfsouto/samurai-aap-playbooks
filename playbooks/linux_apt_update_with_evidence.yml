@@ -648,10 +648,21 @@
         # before the fail-on-error task so the operator still sees package and
         # full detail even when the update returns non-zero.
         # ------------------------------------------------------------------
+        # In Check mode nothing is installed, so update_stdout.txt is empty
+        # ("not_applicable_check_mode"). The packages that WOULD be installed live
+        # in the apt-get -s simulation (updates_available_before.txt). Point the
+        # observability at the simulation for Check and at the real transaction
+        # for Apply, so Check no longer reports "no packages" when there are 28.
+        - name: "Choose observability source file (simulation in Check, transaction in Apply)"
+          ansible.builtin.set_fact:
+            apt_log_source_file: >-
+              {{ (evidence_dir + '/update_stdout.txt') if apt_action == 'Apply'
+                 else (evidence_dir + '/updates_available_before.txt') }}
+
         - name: "Count package-transaction lines in update output (for AAP log)"
           ansible.builtin.shell: |
             set -o pipefail
-            f="{{ evidence_dir }}/update_stdout.txt"
+            f="{{ apt_log_source_file }}"
             if [ -f "$f" ]; then
               grep -Ec '{{ pkg_tx_regex }}' "$f" || true
             else
@@ -683,7 +694,7 @@
         - name: "Extract package-transaction lines (capped) for AAP log"
           ansible.builtin.shell: |
             set -o pipefail
-            f="{{ evidence_dir }}/update_stdout.txt"
+            f="{{ apt_log_source_file }}"
             if [ -f "$f" ]; then
               grep -E '{{ pkg_tx_regex }}' "$f" | head -n {{ log_package_max_lines | int }} || true
             fi
@@ -700,17 +711,23 @@
               {{
                 pkg_transaction_lines.stdout_lines
                 if (pkg_transaction_lines.stdout_lines | default([]) | length) > 0
-                else ['no package-transaction lines found (Check mode, nothing to do, or update failed before any transaction)']
+                else (['no packages to install (host already up to date)'] if apt_action == 'Apply'
+                      else ['no updates available (host already up to date)'])
               }}
           when: apt_log_level == 'package'
 
         - name: "Read full update stdout/stderr (capped) for AAP log"
           ansible.builtin.shell: |
+            {% if apt_action == 'Apply' %}
             echo "===== update_stdout.txt (max {{ log_full_max_lines }} lines) ====="
             head -n {{ log_full_max_lines | int }} "{{ evidence_dir }}/update_stdout.txt" 2>/dev/null || echo "(update_stdout.txt not available)"
             echo ""
             echo "===== update_stderr.txt (max {{ log_full_max_lines }} lines) ====="
             head -n {{ log_full_max_lines | int }} "{{ evidence_dir }}/update_stderr.txt" 2>/dev/null || echo "(update_stderr.txt not available)"
+            {% else %}
+            echo "===== simulated upgrade (Check mode — apt-get -s) (max {{ log_full_max_lines }} lines) ====="
+            head -n {{ log_full_max_lines | int }} "{{ evidence_dir }}/updates_available_before.txt" 2>/dev/null || echo "(simulation not available)"
+            {% endif %}
           args:
             executable: /bin/bash
           register: full_update_log
@@ -779,11 +796,16 @@
           when: apt_action == 'Apply'
 
         - name: "Identify updated packages (changed version)"
+          # Strip from the first '|' to end to leave just the package name. We do
+          # NOT use a capture-group backreference ('\1') here: inside a YAML block
+          # scalar Ansible hands re.sub the replacement as '\\1', which becomes a
+          # LITERAL '\1' instead of group 1 (every line collapses to '\1', count
+          # becomes 1). The pattern side is fine, so match-and-remove is robust.
           ansible.builtin.set_fact:
             packages_updated: >-
               {{
                 (pkgs_after_set | difference(pkgs_before_set))
-                | map('regex_replace', '^([^|]+)\\|.*$', '\\1') | unique | list
+                | map('regex_replace', '\\|.*$', '') | unique | list
               }}
           when: apt_action == 'Apply'
 
@@ -859,11 +881,14 @@
             - systemctl_stat.stat.exists | default(false)
 
         - name: "Build failed services list"
+          # Same backreference caveat as packages_updated: trim, then strip from
+          # the first whitespace to end to keep the unit name (no '\1').
           ansible.builtin.set_fact:
             failed_services_list: >-
               {{
                 (failed_units.stdout_lines | default([]))
-                | map('regex_replace', '^\\s*(\\S+).*$', '\\1') | list
+                | map('trim') | map('regex_replace', '\\s.*$', '')
+                | reject('equalto', '') | list
               }}
           when: apt_action == 'Apply'
 
