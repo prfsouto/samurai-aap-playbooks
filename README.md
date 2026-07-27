@@ -13,6 +13,55 @@ Supported actions:
 - `Check`: validates the host and lists available updates without changing packages.
 - `Apply`: applies yum/dnf updates and collects before/after evidence.
 
+### linux_apt_update_with_evidence.yml
+
+The Debian-family counterpart of the yum playbook — **Ubuntu** is the primary
+target, Debian works too. Same shape: dynamic inventory from `HOSTNAMES`,
+pre-checks, optional upgrade, post-checks, evidence files under
+`/var/tmp/samurai-shield/apt-update/<host>/<timestamp>` and a consolidated
+`samurai_shield_result` JSON block on stdout.
+
+Supported actions:
+
+- `Check`: refreshes the apt cache and **simulates** the upgrade (`apt-get -s`),
+  reporting what would change. Nothing is downloaded or installed.
+- `Apply`: performs the upgrade, then re-checks (package diff, dpkg health,
+  failed units, pending reboot, kernel) and optionally reboots.
+
+What differs from the yum playbook, because apt is not yum:
+
+1. **`security` mode uses `unattended-upgrade`.** Debian/Ubuntu have no
+   `apt --security`; the security pocket is selected by
+   `Unattended-Upgrade::Allowed-Origins`. Like the yum playbook with
+   `--security`, this one **refuses to fall back** to a full upgrade — if
+   `/usr/bin/unattended-upgrade` is missing the run fails with a clear message.
+2. **`EXCLUDE_PACKAGES` maps to `apt-mark hold`.** apt has no `--exclude`, so the
+   listed packages are held for the run and then unheld — except any package the
+   operator had **already** held, which stays held.
+3. **`APT_UPGRADE_MODE` (default `upgrade`)** runs `apt-get upgrade
+   --with-new-pkgs`: it installs new dependencies (so kernel meta-packages do
+   move) but **never removes** a package. `dist-upgrade` is the full resolver and
+   *may remove* packages — opt in deliberately.
+4. **`/boot` is gated in MB, not percent** (`MIN_FREE_MB_BOOT`, default 200). A
+   512 MB `/boot` at 84% has ~80 MB free — not enough for a new kernel +
+   initramfs, and a kernel upgrade that fails mid-transaction can leave the host
+   unbootable.
+5. **apt/dpkg locks are a hard gate.** Ubuntu runs `apt-daily` and
+   `unattended-upgrades` on timers; the playbook refuses to start when a lock is
+   actively held rather than colliding with them.
+6. **dpkg health is checked after Apply** — a half-configured dpkg state is the
+   apt-specific failure that a zero exit code can still hide.
+
+The normal remediation call only needs `HOSTNAMES` + `ACTION`. See
+[linux_apt_update.sample_extra_vars.yml](playbooks/linux_apt_update.sample_extra_vars.yml)
+for the full contract and
+[linux_apt_update.survey_spec.json](playbooks/linux_apt_update.survey_spec.json)
+for the Job Template survey (apply it the same way as the Windows one, below).
+
+Reboot follows the same two-source rule as the Windows playbook: the engine's
+lowercase `allow_reboot` wins over the survey's `ALLOW_REBOOT`, and
+`summary.json` records which one won as `allow_reboot_source`.
+
 ### oracle_rac_patch_with_evidence.yml
 
 Rolling patch of Oracle Grid Infrastructure (GI) + all Oracle Database homes on a

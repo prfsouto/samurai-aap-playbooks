@@ -1,0 +1,1098 @@
+---
+# ============================================================================
+# SamurAI Shield :: Linux apt update with evidence (Ubuntu / Debian)
+# ----------------------------------------------------------------------------
+# Controlled package update playbook for Debian-like Linux servers (Ubuntu is
+# the primary target), executed from Ansible Automation Platform (AAP). Mirrors
+# linux_yum_update_with_evidence.yml: pre-checks, optional update, post-checks
+# and a structured evidence set + JSON summary that the SamurAI Shield control
+# plane can ingest from the AAP job stdout.
+#
+# Stages:
+#   1. Build dynamic in-memory inventory from HOSTNAMES (localhost play).
+#   2. Run pre-check, optional update and post-check on each target host.
+#   3. Emit a consolidated samurai_shield_result JSON block on stdout.
+#
+# Extra-vars contract: HOSTNAMES (required), ACTION (Check|Apply, default Check).
+# Everything else is optional with a working default, so the normal remediation
+# call only needs HOSTNAMES + ACTION:
+#   UPDATE_MODE (all|security, default all) — see "security mode" below.
+#   APT_UPGRADE_MODE (upgrade|dist-upgrade, default upgrade) — only used when
+#     UPDATE_MODE=all. `upgrade` runs `apt-get upgrade --with-new-pkgs`, which
+#     installs new dependencies (so kernel meta-packages do move) but NEVER
+#     removes a package. `dist-upgrade` is the full resolver and MAY remove
+#     packages — opt in deliberately.
+#   EXCLUDE_PACKAGES (csv, optional) — apt has no --exclude, so these are put on
+#     `apt-mark hold` before the upgrade and their PREVIOUS hold state is
+#     restored afterwards (a package already held by the operator stays held).
+#   ALLOW_REBOOT (bool, default false) — reboot after Apply only when the host
+#     reports /var/run/reboot-required. On the SamurAI governed path the engine
+#     instead injects a lowercase `allow_reboot` (from job.allow_reboot) which
+#     takes PRECEDENCE over ALLOW_REBOOT; summary.json records the winner as
+#     allow_reboot_source (governed | survey | default).
+#   EVIDENCE_BASE_DIR (default /var/tmp/samurai-shield/apt-update),
+#   SERIAL_BATCH (default 1), MIN_FREE_MB_BOOT (default 200),
+#   LOG_LEVEL (summary|package|full, default package). LOG_LEVEL controls how
+#   much of the package-manager output is echoed into the AAP/Execution Center
+#   job log (it never changes what is applied and never disables the structured
+#   evidence files):
+#     - summary: approximate affected-package count + evidence_dir + reboot flags.
+#     - package: relevant transaction lines (Inst/Conf/Setting up/Removing/...),
+#                capped at 300 lines.
+#     - full:    complete stdout + stderr, capped at 1000 lines each. WARNING:
+#                can produce very large job logs — use for deep troubleshooting.
+#
+# security mode: Ubuntu/Debian have no `apt --security` equivalent. The canonical
+# mechanism is the `unattended-upgrade` binary, which honours
+# Unattended-Upgrade::Allowed-Origins (default: the -security pocket). This
+# playbook therefore drives `unattended-upgrade` for UPDATE_MODE=security and,
+# exactly like the yum playbook with --security, deliberately does NOT fall back
+# to a full upgrade: if the binary is missing the run FAILS with a clear message.
+#
+# NOTE ON BLANK SURVEY FIELDS: when the Job Template has a survey, AAP sends a
+# blank optional answer as an empty STRING — the var IS defined, so a plain
+# `X | default(Y)` would keep '' instead of Y. Every optional var is therefore
+# resolved with `(X | default('') | string | trim) or Y`.
+#
+# NOTE ON VAR NAMING: optional extra-vars are copied into distinct internal
+# names (apt_*) instead of being redeclared as `X: "{{ X | default(...) }}"`.
+# When the extra-var is absent that self-referencing form makes Ansible recurse
+# ("recursive loop detected in template string").
+#
+# See README.md at the repository root for full documentation.
+# ============================================================================
+
+- name: "SamurAI :: apt-update :: build dynamic inventory from HOSTNAMES"
+  hosts: localhost
+  gather_facts: false
+  # This localhost play needs no privilege escalation. Pinning become:false
+  # keeps a globally-enabled --become (AAP "Privilege Escalation") from loading
+  # a become plugin here — that is what breaks the bootstrap play on mixed
+  # Windows/Linux inventories.
+  become: false
+  vars:
+    apt_hostnames: "{{ HOSTNAMES | default('') | string | trim }}"
+    apt_action: "{{ (ACTION | default('') | string | trim) or 'Check' }}"
+    apt_update_mode: "{{ (UPDATE_MODE | default('') | string | trim) or 'all' }}"
+    apt_upgrade_mode: "{{ (APT_UPGRADE_MODE | default('') | string | trim) or 'upgrade' }}"
+    apt_log_level: "{{ (LOG_LEVEL | default('') | string | trim) or 'package' }}"
+  tasks:
+    - name: "Validate HOSTNAMES is provided"
+      ansible.builtin.fail:
+        msg: "HOSTNAMES extra-var is required (single host, IP, or space/comma-separated list)."
+      when: apt_hostnames == ''
+
+    - name: "Validate ACTION is Check or Apply"
+      ansible.builtin.fail:
+        msg: "Invalid ACTION '{{ apt_action }}'. Allowed values: Check, Apply."
+      when: apt_action not in ['Check', 'Apply']
+
+    - name: "Validate UPDATE_MODE is all or security"
+      ansible.builtin.fail:
+        msg: "Invalid UPDATE_MODE '{{ apt_update_mode }}'. Allowed values: all, security."
+      when: apt_update_mode not in ['all', 'security']
+
+    - name: "Validate APT_UPGRADE_MODE is upgrade or dist-upgrade"
+      ansible.builtin.fail:
+        msg: "Invalid APT_UPGRADE_MODE '{{ apt_upgrade_mode }}'. Allowed values: upgrade, dist-upgrade."
+      when: apt_upgrade_mode not in ['upgrade', 'dist-upgrade']
+
+    - name: "Validate LOG_LEVEL is summary, package or full"
+      ansible.builtin.fail:
+        msg: "Invalid LOG_LEVEL '{{ apt_log_level }}'. Allowed values: summary, package, full."
+      when: apt_log_level not in ['summary', 'package', 'full']
+
+    - name: "Parse HOSTNAMES into a list (tolerant: space OR comma) — samurai-shield#1418"
+      ansible.builtin.set_fact:
+        # The engine sends HOSTNAMES space-separated (Oraex fleet convention);
+        # accept both delimiters so a space-joined wave never collapses to 1 host.
+        samurai_target_hosts: >-
+          {{ apt_hostnames.replace(',', ' ').split() | reject('equalto', '') | list }}
+
+    - name: "Add hosts to dynamic group samurai_apt_update_targets"
+      ansible.builtin.add_host:
+        name: "{{ item }}"
+        groups: samurai_apt_update_targets
+      loop: "{{ samurai_target_hosts }}"
+      changed_when: false
+
+    - name: "Show resolved target hosts"
+      ansible.builtin.debug:
+        msg: >-
+          Targets: {{ samurai_target_hosts | join(', ') }} | ACTION={{ apt_action }}
+          | UPDATE_MODE={{ apt_update_mode }} | APT_UPGRADE_MODE={{ apt_upgrade_mode }}
+          | LOG_LEVEL={{ apt_log_level }}
+
+
+- name: "SamurAI :: apt-update :: pre-check, update and post-check"
+  hosts: samurai_apt_update_targets
+  gather_facts: true
+  become: true
+  serial: "{{ (SERIAL_BATCH | default('') | string | trim) or 1 }}"
+
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+
+  vars:
+    apt_action: "{{ (ACTION | default('') | string | trim) or 'Check' }}"
+    apt_update_mode: "{{ (UPDATE_MODE | default('') | string | trim) or 'all' }}"
+    apt_upgrade_mode: "{{ (APT_UPGRADE_MODE | default('') | string | trim) or 'upgrade' }}"
+    apt_log_level: "{{ (LOG_LEVEL | default('') | string | trim) or 'package' }}"
+    apt_evidence_base: "{{ (EVIDENCE_BASE_DIR | default('') | string | trim) or '/var/tmp/samurai-shield/apt-update' }}"
+    apt_min_free_mb_boot: "{{ ((MIN_FREE_MB_BOOT | default('') | string | trim) or '200') | int }}"
+
+    # Reboot decision — two sources, distinct precedence:
+    #   * allow_reboot (lowercase) is injected by the SamurAI engine from
+    #     job.allow_reboot and ONLY exists on the governed path — its presence
+    #     means "the governed job decided this", so it WINS.
+    #   * ALLOW_REBOOT (uppercase) is the survey/manual operator knob (and the
+    #     survey default false that AAP also injects on the governed path).
+    # Coalesce on "defined and non-blank", NOT with `or`: a governed
+    # allow_reboot=false is a legitimate explicit "no" and is falsy, so an `or`
+    # chain would wrongly fall through to the uppercase survey default.
+    apt_reboot_governed: "{{ allow_reboot | default('') | string | trim }}"
+    apt_reboot_survey: "{{ ALLOW_REBOOT | default('') | string | trim }}"
+    apt_allow_reboot: >-
+      {{
+        (apt_reboot_governed if apt_reboot_governed != ''
+         else (apt_reboot_survey if apt_reboot_survey != '' else 'false')) | bool
+      }}
+    apt_reboot_source: >-
+      {{
+        'governed' if apt_reboot_governed != ''
+        else ('survey' if apt_reboot_survey != '' else 'default')
+      }}
+
+    log_package_max_lines: 300
+    log_full_max_lines: 1000
+    # apt transaction lines worth echoing into the job log.
+    pkg_tx_regex: '^[[:space:]]*(Inst|Conf|Setting up|Unpacking|Preparing to unpack|Removing|Get:)\b'
+
+    exclude_packages_list: >-
+      {{
+        ((EXCLUDE_PACKAGES | default('')) | string).split(',')
+        | map('trim') | reject('equalto', '') | list
+      }}
+
+    samurai_warnings: []
+    samurai_errors: []
+
+  tasks:
+
+    # ------------------------------------------------------------------------
+    # Phase 1: Input + OS compatibility validation
+    # ------------------------------------------------------------------------
+    - name: "Capture execution start timestamp (UTC, controller-side)"
+      ansible.builtin.set_fact:
+        execution_started_at: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+        execution_timestamp: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+
+    - name: "Fail when target OS family is not Debian"
+      ansible.builtin.fail:
+        msg: >-
+          Unsupported OS family '{{ ansible_os_family }}' on host {{ inventory_hostname }}.
+          This playbook only supports Debian-like systems (Ubuntu, Debian).
+          Use linux_yum_update_with_evidence.yml for Red Hat-like hosts.
+      when: ansible_os_family != 'Debian'
+
+    - name: "Detect apt-get binary"
+      ansible.builtin.stat:
+        path: /usr/bin/apt-get
+      register: apt_get_stat
+
+    - name: "Fail when apt-get is not available"
+      ansible.builtin.fail:
+        msg: "/usr/bin/apt-get not found on {{ inventory_hostname }}."
+      when: not apt_get_stat.stat.exists
+
+    - name: "Detect unattended-upgrade binary (required for UPDATE_MODE=security)"
+      ansible.builtin.stat:
+        path: /usr/bin/unattended-upgrade
+      register: unattended_stat
+
+    - name: "Fail when UPDATE_MODE=security but unattended-upgrade is missing"
+      ansible.builtin.fail:
+        msg: |
+          UPDATE_MODE=security requires the `unattended-upgrades` package on
+          {{ inventory_hostname }} — /usr/bin/unattended-upgrade was not found.
+          Debian/Ubuntu have no `apt --security` flag; the security pocket is
+          selected by unattended-upgrade via Unattended-Upgrade::Allowed-Origins.
+          This playbook deliberately does NOT fall back to a full upgrade.
+          Install it (apt-get install -y unattended-upgrades) or relaunch with
+          UPDATE_MODE=all if a full upgrade is acceptable.
+      when:
+        - apt_update_mode == 'security'
+        - not unattended_stat.stat.exists
+
+    - name: "Build evidence directory path"
+      ansible.builtin.set_fact:
+        evidence_dir: "{{ apt_evidence_base }}/{{ inventory_hostname }}/{{ execution_timestamp }}"
+
+    - name: "Create evidence directory"
+      ansible.builtin.file:
+        path: "{{ evidence_dir }}"
+        state: directory
+        mode: '0750'
+
+    # ------------------------------------------------------------------------
+    # Phase 2: Pre-check (always runs, even when ACTION=Check)
+    # ------------------------------------------------------------------------
+    - name: "Pre-check + optional update + post-check"
+      block:
+
+        # ---- system info --------------------------------------------------
+        - name: "Capture system info"
+          ansible.builtin.set_fact:
+            system_info:
+              hostname: "{{ ansible_hostname }}"
+              fqdn: "{{ ansible_fqdn }}"
+              primary_ip: "{{ ansible_default_ipv4.address | default('unknown') }}"
+              distribution: "{{ ansible_distribution }}"
+              distribution_version: "{{ ansible_distribution_version }}"
+              distribution_release: "{{ ansible_distribution_release | default('unknown') }}"
+              kernel: "{{ ansible_kernel }}"
+              architecture: "{{ ansible_architecture }}"
+              started_at: "{{ execution_started_at }}"
+              run_user: "{{ ansible_user_id | default('root') }}"
+
+        - name: "Write system_before.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/system_before.txt"
+            mode: '0640'
+            content: |
+              hostname: {{ system_info.hostname }}
+              fqdn: {{ system_info.fqdn }}
+              primary_ip: {{ system_info.primary_ip }}
+              distribution: {{ system_info.distribution }} {{ system_info.distribution_version }} ({{ system_info.distribution_release }})
+              kernel: {{ system_info.kernel }}
+              architecture: {{ system_info.architecture }}
+              update_mode: {{ apt_update_mode }}
+              apt_upgrade_mode: {{ apt_upgrade_mode }}
+              unattended_upgrade_available: {{ unattended_stat.stat.exists }}
+              started_at: {{ system_info.started_at }}
+              run_user: {{ system_info.run_user }}
+
+        # ---- disk space ---------------------------------------------------
+        - name: "Collect disk usage"
+          ansible.builtin.command: df -P -k
+          register: df_out
+          changed_when: false
+
+        - name: "Write disk_before.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/disk_before.txt"
+            mode: '0640'
+            content: "{{ df_out.stdout }}\n"
+
+        - name: "Compute filesystem usage percent (portable)"
+          ansible.builtin.shell: |
+            set -o pipefail
+            df -P {{ item }} 2>/dev/null | awk 'NR==2 {gsub("%","",$5); print $5}'
+          args:
+            executable: /bin/bash
+          register: fs_pct
+          changed_when: false
+          failed_when: false
+          loop:
+            - "/"
+            - "/var"
+            - "/boot"
+
+        - name: "Build filesystem usage dict"
+          ansible.builtin.set_fact:
+            fs_usage:
+              root: "{{ (fs_pct.results[0].stdout | default('0') | trim) | int }}"
+              var: "{{ (fs_pct.results[1].stdout | default('0') | trim) | int }}"
+              boot: "{{ (fs_pct.results[2].stdout | default('0') | trim) | int }}"
+
+        - name: "Fail when /var usage exceeds 90%"
+          ansible.builtin.fail:
+            msg: "/var is at {{ fs_usage.var }}% — refusing to update (threshold 90%)."
+          when: fs_usage.var | int > 90
+
+        # /boot on Ubuntu is small and kernel upgrades need real free MB, not
+        # just a percentage — a 512M /boot at 84% has ~80M free, not enough for
+        # a new kernel + initramfs. Check absolute free space too.
+        - name: "Measure free space on /boot in MB"
+          ansible.builtin.shell: |
+            set -o pipefail
+            df -P -m /boot 2>/dev/null | awk 'NR==2 {print $4}'
+          args:
+            executable: /bin/bash
+          register: boot_free_mb_raw
+          changed_when: false
+          failed_when: false
+
+        - name: "Register /boot free space"
+          ansible.builtin.set_fact:
+            boot_free_mb: "{{ (boot_free_mb_raw.stdout | default('0') | trim) | int }}"
+
+        - name: "Fail when /boot has less free space than MIN_FREE_MB_BOOT"
+          ansible.builtin.fail:
+            msg: >-
+              /boot has only {{ boot_free_mb }} MB free on {{ inventory_hostname }}
+              — refusing to update (threshold {{ apt_min_free_mb_boot }} MB). A kernel
+              upgrade would fail mid-transaction and can leave the host unbootable.
+          when: boot_free_mb | int < apt_min_free_mb_boot | int
+
+        - name: "Warn when / usage exceeds 85%"
+          ansible.builtin.set_fact:
+            samurai_warnings: "{{ samurai_warnings + ['/ is at ' + (fs_usage.root | string) + '%, above 85% warning threshold'] }}"
+          when: fs_usage.root | int > 85
+
+        # ---- package manager locks (BEFORE touching apt) -------------------
+        # Ubuntu runs apt-daily / unattended-upgrades on timers; hitting a live
+        # dpkg lock mid-transaction is the most common cause of a broken run.
+        - name: "Detect running package manager processes"
+          ansible.builtin.shell: |
+            set -o pipefail
+            ps -eo pid,comm,args | awk '/[a]pt-get|[a]ptitude|[d]pkg|[u]nattended-upgrade|[a]pt\.systemd\.daily/ {print}' || true
+          args:
+            executable: /bin/bash
+          register: pm_procs
+          changed_when: false
+
+        - name: "Write package_manager_locks_before.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/package_manager_locks_before.txt"
+            mode: '0640'
+            content: "{{ pm_procs.stdout if pm_procs.stdout else 'no_active_package_manager_processes' }}\n"
+
+        - name: "Detect held dpkg/apt locks via fuser"
+          ansible.builtin.shell: |
+            set -o pipefail
+            held=""
+            for f in /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock; do
+              if [ -e "$f" ] && command -v fuser >/dev/null 2>&1; then
+                if fuser "$f" >/dev/null 2>&1; then
+                  held="$held $f"
+                fi
+              fi
+            done
+            echo "$held" | sed 's/^ //'
+          args:
+            executable: /bin/bash
+          register: apt_locks
+          changed_when: false
+          failed_when: false
+
+        - name: "Fail when an apt/dpkg lock is actively held"
+          ansible.builtin.fail:
+            msg: >-
+              Active apt/dpkg lock detected on {{ inventory_hostname }}:
+              {{ apt_locks.stdout | trim }}. Another package operation
+              (apt-daily / unattended-upgrades / a human) is running — refusing
+              to update. Retry once it finishes.
+          when: (apt_locks.stdout | default('') | trim) != ''
+
+        # ---- refresh metadata ---------------------------------------------
+        - name: "Refresh apt cache (apt-get update)"
+          ansible.builtin.command: apt-get update
+          register: apt_update_out
+          changed_when: false
+          failed_when: false
+
+        - name: "Write apt_update_metadata.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/apt_update_metadata.txt"
+            mode: '0640'
+            content: |
+              exit_code: {{ apt_update_out.rc }}
+              ---
+              {{ apt_update_out.stdout }}
+              ----- stderr -----
+              {{ apt_update_out.stderr }}
+
+        - name: "Warn when apt-get update reported errors"
+          ansible.builtin.set_fact:
+            samurai_warnings: >-
+              {{ samurai_warnings + ['apt-get update returned rc=' + (apt_update_out.rc | string)
+                 + '; repository metadata may be stale or a repo is unreachable'] }}
+          when: apt_update_out.rc != 0
+
+        # ---- repos --------------------------------------------------------
+        - name: "List configured repositories"
+          ansible.builtin.shell: |
+            set -o pipefail
+            # classic sources.list(.d) plus deb822 .sources (Ubuntu 24.04+)
+            grep -rhE '^[[:space:]]*deb' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null || true
+            echo "----- deb822 (.sources) -----"
+            grep -rhE '^(URIs|Suites|Components):' /etc/apt/sources.list.d/ 2>/dev/null || true
+          args:
+            executable: /bin/bash
+          register: repos_out
+          changed_when: false
+          failed_when: false
+
+        - name: "Write repos_enabled_before.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/repos_enabled_before.txt"
+            mode: '0640'
+            content: "{{ repos_out.stdout }}\n"
+
+        # ---- installed packages before ------------------------------------
+        - name: "List installed packages (before)"
+          ansible.builtin.shell: |
+            set -o pipefail
+            dpkg-query -W -f='${Package}|${Version}|${Architecture}\n' 2>/dev/null | sort
+          args:
+            executable: /bin/bash
+          register: pkgs_before
+          changed_when: false
+
+        - name: "Write packages_before.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/packages_before.txt"
+            mode: '0640'
+            content: "{{ pkgs_before.stdout }}\n"
+
+        # ---- updates available before -------------------------------------
+        - name: "Simulate upgrade to list available updates (before)"
+          ansible.builtin.shell: |
+            set -o pipefail
+            apt-get -s {{ apt_upgrade_subcmd }} {{ apt_with_new_pkgs }} 2>/dev/null || true
+          args:
+            executable: /bin/bash
+          vars:
+            apt_upgrade_subcmd: "{{ 'dist-upgrade' if apt_upgrade_mode == 'dist-upgrade' else 'upgrade' }}"
+            apt_with_new_pkgs: "{{ '--with-new-pkgs' if apt_upgrade_mode != 'dist-upgrade' else '' }}"
+          register: apt_simulate
+          changed_when: false
+
+        - name: "Determine total upgradable package count"
+          ansible.builtin.set_fact:
+            updates_available_count: >-
+              {{ apt_simulate.stdout_lines | default([]) | select('match', '^Inst ') | list | length }}
+
+        - name: "Write updates_available_before.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/updates_available_before.txt"
+            mode: '0640'
+            content: |
+              update_mode: {{ apt_update_mode }}
+              apt_upgrade_mode: {{ apt_upgrade_mode }}
+              total_upgradable_count: {{ updates_available_count }}
+              note: total_upgradable_count is the FULL upgradable set as apt sees it.
+                    When update_mode=security only the security subset is applied
+                    (see security_dry_run.txt).
+              ---
+              {{ apt_simulate.stdout }}
+
+        - name: "Dry-run unattended-upgrade to scope the security subset"
+          ansible.builtin.command: unattended-upgrade --dry-run -v
+          register: security_dry_run
+          changed_when: false
+          failed_when: false
+          when:
+            - apt_update_mode == 'security'
+            - unattended_stat.stat.exists
+
+        - name: "Determine security-update count"
+          # regex_findall returns a LIST of captured groups; appending [''] makes
+          # `first` safe when unattended-upgrade printed no such line (nothing to
+          # do, or a version that words it differently) — no undefined/empty-list
+          # explosion, just a count of 0.
+          ansible.builtin.set_fact:
+            security_updates_count: >-
+              {{
+                ((
+                  (security_dry_run.stdout | default('')
+                   | regex_findall('Packages that will be upgraded:([^\n]*)')) + ['']
+                ) | first).split() | length
+                if apt_update_mode == 'security' else 0
+              }}
+
+        - name: "Write security_dry_run.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/security_dry_run.txt"
+            mode: '0640'
+            content: |
+              {% if apt_update_mode == 'security' %}
+              security_updates_count: {{ security_updates_count }}
+              ---
+              {{ security_dry_run.stdout | default('no output') }}
+              ----- stderr -----
+              {{ security_dry_run.stderr | default('') }}
+              {% else %}
+              not_applicable_update_mode_all
+              {% endif %}
+
+        # ---- reboot required before ---------------------------------------
+        - name: "Check reboot required (before)"
+          ansible.builtin.stat:
+            path: /var/run/reboot-required
+          register: reboot_before_stat
+
+        - name: "Read reboot-required package list (before)"
+          ansible.builtin.slurp:
+            src: /var/run/reboot-required.pkgs
+          register: reboot_before_pkgs
+          failed_when: false
+          when: reboot_before_stat.stat.exists
+
+        - name: "Compute reboot_required_before status"
+          ansible.builtin.set_fact:
+            reboot_required_before: "{{ 'yes' if reboot_before_stat.stat.exists else 'no' }}"
+
+        - name: "Write reboot_required_before.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/reboot_required_before.txt"
+            mode: '0640'
+            content: |
+              status: {{ reboot_required_before }}
+              ---
+              {{ (reboot_before_pkgs.content | default('') | b64decode) if reboot_before_stat.stat.exists else 'no /var/run/reboot-required' }}
+
+        - name: "Warn when the host already had a pending reboot before the run"
+          ansible.builtin.set_fact:
+            samurai_warnings: >-
+              {{ samurai_warnings + ['host had a pending reboot BEFORE this run'] }}
+          when: reboot_required_before == 'yes'
+
+        # ------------------------------------------------------------------
+        # Phase 3: Apply update (skipped in Check mode)
+        # ------------------------------------------------------------------
+        # apt has no --exclude: hold the excluded packages, remembering which
+        # were ALREADY held so the operator's own holds survive the run.
+        - name: "Capture current apt-mark hold list"
+          ansible.builtin.command: apt-mark showhold
+          register: holds_before
+          changed_when: false
+          failed_when: false
+          when: apt_action == 'Apply'
+
+        - name: "Hold excluded packages"
+          ansible.builtin.command: "apt-mark hold {{ item }}"
+          loop: "{{ exclude_packages_list }}"
+          register: hold_result
+          changed_when: true
+          failed_when: false
+          when:
+            - apt_action == 'Apply'
+            - (exclude_packages_list | length) > 0
+
+        - name: "Build update command argv"
+          ansible.builtin.set_fact:
+            update_argv: >-
+              {{
+                ['unattended-upgrade', '-v']
+                if apt_update_mode == 'security'
+                else (
+                  ['apt-get', '-y',
+                   '-o', 'Dpkg::Options::=--force-confdef',
+                   '-o', 'Dpkg::Options::=--force-confold',
+                   ('dist-upgrade' if apt_upgrade_mode == 'dist-upgrade' else 'upgrade')]
+                  + ([] if apt_upgrade_mode == 'dist-upgrade' else ['--with-new-pkgs'])
+                )
+              }}
+          when: apt_action == 'Apply'
+
+        - name: "Execute package update with explicit stdout/stderr evidence capture"
+          ansible.builtin.shell: |
+            set -o pipefail
+            {{ update_argv | map('quote') | join(' ') }} > "{{ evidence_dir }}/update_stdout.txt" 2> "{{ evidence_dir }}/update_stderr.txt"
+          args:
+            executable: /bin/bash
+          register: update_result
+          changed_when: apt_action == 'Apply' and update_result.rc == 0
+          failed_when: false
+          when: apt_action == 'Apply'
+
+        - name: "Restore previous apt-mark hold state"
+          ansible.builtin.command: "apt-mark unhold {{ item }}"
+          loop: "{{ exclude_packages_list }}"
+          changed_when: true
+          failed_when: false
+          when:
+            - apt_action == 'Apply'
+            - (exclude_packages_list | length) > 0
+            # only unhold what we put on hold — a package the operator had
+            # already held stays held.
+            - item not in (holds_before.stdout_lines | default([]))
+
+        - name: "Ensure update_stdout.txt exists in Check mode"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/update_stdout.txt"
+            mode: '0640'
+            content: "not_applicable_check_mode\n"
+            force: false
+          when: apt_action != 'Apply'
+
+        - name: "Ensure update_stderr.txt exists in Check mode"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/update_stderr.txt"
+            mode: '0640'
+            content: "not_applicable_check_mode\n"
+            force: false
+          when: apt_action != 'Apply'
+
+        - name: "Read update stdout/stderr tail on failure"
+          ansible.builtin.shell: |
+            echo "----- stdout tail -----"
+            tail -120 "{{ evidence_dir }}/update_stdout.txt" 2>/dev/null || true
+            echo "----- stderr tail -----"
+            tail -120 "{{ evidence_dir }}/update_stderr.txt" 2>/dev/null || true
+          args:
+            executable: /bin/bash
+          register: update_error_tail
+          changed_when: false
+          failed_when: false
+          when:
+            - apt_action == 'Apply'
+            - update_result.rc | default(0) != 0
+
+        # ------------------------------------------------------------------
+        # AAP / Execution Center observability (controlled by LOG_LEVEL).
+        # Renders the package-manager output into the job log WITHOUT touching
+        # the host and WITHOUT replacing the structured evidence files. Runs
+        # before the fail-on-error task so the operator still sees package and
+        # full detail even when the update returns non-zero.
+        # ------------------------------------------------------------------
+        - name: "Count package-transaction lines in update output (for AAP log)"
+          ansible.builtin.shell: |
+            set -o pipefail
+            f="{{ evidence_dir }}/update_stdout.txt"
+            if [ -f "$f" ]; then
+              grep -Ec '{{ pkg_tx_regex }}' "$f" || true
+            else
+              echo 0
+            fi
+          args:
+            executable: /bin/bash
+          register: pkg_tx_count
+          changed_when: false
+          failed_when: false
+
+        - name: "Compute approximate affected-package count"
+          ansible.builtin.set_fact:
+            approx_affected_packages: "{{ pkg_tx_count.stdout | default('0') | trim | int }}"
+
+        - name: "AAP log :: summary level"
+          ansible.builtin.debug:
+            msg:
+              - "SamurAI Shield :: apt-update :: SUMMARY"
+              - "host={{ inventory_hostname }} action={{ apt_action }} update_mode={{ apt_update_mode }} apt_upgrade_mode={{ apt_upgrade_mode }}"
+              - "approx_affected_packages={{ approx_affected_packages }}"
+              - "total_upgradable_before={{ updates_available_count | default('unknown') }}"
+              - "security_updates_before={{ security_updates_count | default('not_applicable') }}"
+              - "evidence_dir={{ evidence_dir }}"
+              - "reboot_required_before={{ reboot_required_before | default('unknown') }}"
+              - "reboot_required_after={{ reboot_required_after | default('not_yet_computed') }}"
+          when: apt_log_level == 'summary'
+
+        - name: "Extract package-transaction lines (capped) for AAP log"
+          ansible.builtin.shell: |
+            set -o pipefail
+            f="{{ evidence_dir }}/update_stdout.txt"
+            if [ -f "$f" ]; then
+              grep -E '{{ pkg_tx_regex }}' "$f" | head -n {{ log_package_max_lines | int }} || true
+            fi
+          args:
+            executable: /bin/bash
+          register: pkg_transaction_lines
+          changed_when: false
+          failed_when: false
+          when: apt_log_level == 'package'
+
+        - name: "AAP log :: package level (max {{ log_package_max_lines }} lines)"
+          ansible.builtin.debug:
+            msg: >-
+              {{
+                pkg_transaction_lines.stdout_lines
+                if (pkg_transaction_lines.stdout_lines | default([]) | length) > 0
+                else ['no package-transaction lines found (Check mode, nothing to do, or update failed before any transaction)']
+              }}
+          when: apt_log_level == 'package'
+
+        - name: "Read full update stdout/stderr (capped) for AAP log"
+          ansible.builtin.shell: |
+            echo "===== update_stdout.txt (max {{ log_full_max_lines }} lines) ====="
+            head -n {{ log_full_max_lines | int }} "{{ evidence_dir }}/update_stdout.txt" 2>/dev/null || echo "(update_stdout.txt not available)"
+            echo ""
+            echo "===== update_stderr.txt (max {{ log_full_max_lines }} lines) ====="
+            head -n {{ log_full_max_lines | int }} "{{ evidence_dir }}/update_stderr.txt" 2>/dev/null || echo "(update_stderr.txt not available)"
+          args:
+            executable: /bin/bash
+          register: full_update_log
+          changed_when: false
+          failed_when: false
+          when: apt_log_level == 'full'
+
+        - name: "AAP log :: full level"
+          ansible.builtin.debug:
+            msg: "{{ full_update_log.stdout_lines | default(['(no update output captured)']) }}"
+          when: apt_log_level == 'full'
+
+        - name: "Fail playbook when update returned non-zero"
+          ansible.builtin.fail:
+            msg: |
+              {% if apt_update_mode == 'security' %}
+              Security update failed (rc={{ update_result.rc }}) on {{ inventory_hostname }}.
+              UPDATE_MODE=security drives `unattended-upgrade`, which applies only the
+              origins allowed by Unattended-Upgrade::Allowed-Origins (the -security
+              pocket by default). A non-zero exit usually means a broken/held package,
+              a dpkg state that needs `dpkg --configure -a`, or a restrictive
+              unattended-upgrades configuration. The playbook deliberately does NOT
+              fall back to a full upgrade — fix the condition or relaunch with
+              UPDATE_MODE=all if a full upgrade is acceptable.
+              Evidence files:
+              - {{ evidence_dir }}/update_stdout.txt
+              - {{ evidence_dir }}/update_stderr.txt
+              - {{ evidence_dir }}/security_dry_run.txt
+              Diagnostic tail:
+              {{ update_error_tail.stdout | default('no diagnostic output captured') }}
+              {% else %}
+              Package update failed (rc={{ update_result.rc }}) on {{ inventory_hostname }}.
+              Evidence files:
+              - {{ evidence_dir }}/update_stdout.txt
+              - {{ evidence_dir }}/update_stderr.txt
+              Diagnostic tail:
+              {{ update_error_tail.stdout | default('no diagnostic output captured') }}
+              {% endif %}
+          when:
+            - apt_action == 'Apply'
+            - update_result.rc | default(0) != 0
+
+        # ------------------------------------------------------------------
+        # Phase 5: Post-check (only runs after Apply)
+        # ------------------------------------------------------------------
+        - name: "List installed packages (after)"
+          ansible.builtin.shell: |
+            set -o pipefail
+            dpkg-query -W -f='${Package}|${Version}|${Architecture}\n' 2>/dev/null | sort
+          args:
+            executable: /bin/bash
+          register: pkgs_after
+          changed_when: false
+          when: apt_action == 'Apply'
+
+        - name: "Write packages_after.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/packages_after.txt"
+            mode: '0640'
+            content: "{{ (pkgs_after.stdout | default('')) if apt_action == 'Apply' else 'not_applicable_check_mode' }}\n"
+
+        - name: "Compute packages diff before/after"
+          ansible.builtin.set_fact:
+            pkgs_before_set: "{{ pkgs_before.stdout_lines | default([]) | list }}"
+            pkgs_after_set: "{{ pkgs_after.stdout_lines | default([]) | list }}"
+          when: apt_action == 'Apply'
+
+        - name: "Identify updated packages (changed version)"
+          ansible.builtin.set_fact:
+            packages_updated: >-
+              {{
+                (pkgs_after_set | difference(pkgs_before_set))
+                | map('regex_replace', '^([^|]+)\\|.*$', '\\1') | unique | list
+              }}
+          when: apt_action == 'Apply'
+
+        - name: "Write packages_diff.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/packages_diff.txt"
+            mode: '0640'
+            content: |
+              {% if apt_action == 'Apply' %}
+              # Lines only in BEFORE (removed/replaced):
+              {% for line in pkgs_before_set | difference(pkgs_after_set) %}
+              - {{ line }}
+              {% endfor %}
+              # Lines only in AFTER (installed/upgraded):
+              {% for line in pkgs_after_set | difference(pkgs_before_set) %}
+              + {{ line }}
+              {% endfor %}
+              # Updated package names ({{ packages_updated | length }}):
+              {% for name in packages_updated %}
+              {{ name }}
+              {% endfor %}
+              {% else %}
+              not_applicable_check_mode
+              {% endif %}
+
+        # ---- dpkg health --------------------------------------------------
+        # A half-configured dpkg state is the apt-specific failure mode that a
+        # zero exit code can still hide.
+        - name: "Detect packages in a broken/half-configured dpkg state"
+          ansible.builtin.shell: |
+            set -o pipefail
+            dpkg -l 2>/dev/null | awk '/^[a-z][A-Z]|^i[^i]/ {print}' || true
+          args:
+            executable: /bin/bash
+          register: dpkg_broken
+          changed_when: false
+          failed_when: false
+          when: apt_action == 'Apply'
+
+        - name: "Write dpkg_state_after.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/dpkg_state_after.txt"
+            mode: '0640'
+            content: |
+              {% if apt_action == 'Apply' %}
+              {{ dpkg_broken.stdout | default('') if (dpkg_broken.stdout | default('') | trim) != '' else 'no_packages_in_broken_state' }}
+              {% else %}
+              not_applicable_check_mode
+              {% endif %}
+
+        - name: "Warn when dpkg reports packages in a broken state"
+          ansible.builtin.set_fact:
+            samurai_warnings: >-
+              {{ samurai_warnings + ['dpkg reports packages in a broken/half-configured state; run `dpkg --configure -a`'] }}
+          when:
+            - apt_action == 'Apply'
+            - (dpkg_broken.stdout | default('') | trim) != ''
+
+        # ---- failed services ----------------------------------------------
+        - name: "Detect systemctl"
+          ansible.builtin.stat:
+            path: /usr/bin/systemctl
+          register: systemctl_stat
+          when: apt_action == 'Apply'
+
+        - name: "List failed systemd units"
+          ansible.builtin.command: systemctl --failed --no-pager --no-legend
+          register: failed_units
+          changed_when: false
+          failed_when: false
+          when:
+            - apt_action == 'Apply'
+            - systemctl_stat.stat.exists | default(false)
+
+        - name: "Build failed services list"
+          ansible.builtin.set_fact:
+            failed_services_list: >-
+              {{
+                (failed_units.stdout_lines | default([]))
+                | map('regex_replace', '^\\s*(\\S+).*$', '\\1') | list
+              }}
+          when: apt_action == 'Apply'
+
+        - name: "Write failed_services_after.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/failed_services_after.txt"
+            mode: '0640'
+            content: |
+              {% if apt_action != 'Apply' %}
+              not_applicable_check_mode
+              {% elif not (systemctl_stat.stat.exists | default(false)) %}
+              not_applicable
+              {% else %}
+              {{ failed_units.stdout | default('') }}
+              {% endif %}
+
+        # ---- reboot required after ----------------------------------------
+        - name: "Check reboot required (after)"
+          ansible.builtin.stat:
+            path: /var/run/reboot-required
+          register: reboot_after_stat
+          when: apt_action == 'Apply'
+
+        - name: "Read reboot-required package list (after)"
+          ansible.builtin.slurp:
+            src: /var/run/reboot-required.pkgs
+          register: reboot_after_pkgs
+          failed_when: false
+          when:
+            - apt_action == 'Apply'
+            - reboot_after_stat.stat.exists | default(false)
+
+        - name: "Compute reboot_required_after status"
+          ansible.builtin.set_fact:
+            reboot_required_after: >-
+              {{
+                'not_applicable_check_mode' if apt_action != 'Apply'
+                else ('yes' if (reboot_after_stat.stat.exists | default(false)) else 'no')
+              }}
+
+        - name: "Write reboot_required_after.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/reboot_required_after.txt"
+            mode: '0640'
+            content: |
+              status: {{ reboot_required_after }}
+              ---
+              {{ (reboot_after_pkgs.content | default('') | b64decode) if (reboot_after_stat.stat.exists | default(false)) else 'not_applicable' }}
+
+        # ---- kernel info ---------------------------------------------------
+        - name: "Capture kernel info (after)"
+          ansible.builtin.shell: |
+            set -o pipefail
+            echo "running_kernel=$(uname -r)"
+            echo "installed_kernels="
+            dpkg-query -W -f='${Package} ${Version}\n' 'linux-image-*' 2>/dev/null || true
+          args:
+            executable: /bin/bash
+          register: kernel_info
+          changed_when: false
+          failed_when: false
+          when: apt_action == 'Apply'
+
+        - name: "Write kernel_after.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/kernel_after.txt"
+            mode: '0640'
+            content: "{{ (kernel_info.stdout | default('')) if apt_action == 'Apply' else 'not_applicable_check_mode' }}\n"
+
+        - name: "Capture kernel_after running version"
+          ansible.builtin.command: uname -r
+          register: kernel_after_uname
+          changed_when: false
+          when: apt_action == 'Apply'
+
+        # ---- optional reboot -----------------------------------------------
+        - name: "Reboot host when reboot is allowed and required"
+          ansible.builtin.reboot:
+            msg: "SamurAI Shield :: post-update reboot"
+            reboot_timeout: 600
+          when:
+            - apt_action == 'Apply'
+            - apt_allow_reboot | bool
+            - reboot_required_after == 'yes'
+          register: reboot_action
+
+      rescue:
+        - name: "Capture rescue error"
+          ansible.builtin.set_fact:
+            samurai_errors: "{{ samurai_errors + [ansible_failed_result.msg | default('unknown failure')] }}"
+
+        - name: "Mark execution status as failed"
+          ansible.builtin.set_fact:
+            execution_status: "failed"
+
+      always:
+        # ------------------------------------------------------------------
+        # summary.json — runs even on failure
+        # ------------------------------------------------------------------
+        - name: "Compute final execution status"
+          ansible.builtin.set_fact:
+            execution_status: >-
+              {{
+                execution_status | default(
+                  'check_completed' if apt_action != 'Apply'
+                  else ('updated' if (packages_updated | default([]) | length) > 0
+                        else 'no_updates')
+                )
+              }}
+
+        - name: "Capture finished_at timestamp (UTC, controller-side)"
+          ansible.builtin.set_fact:
+            execution_finished_at: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+
+        - name: "Build per-host summary"
+          ansible.builtin.set_fact:
+            host_summary:
+              tool: "SamurAI Shield"
+              playbook: "linux_apt_update_with_evidence"
+              host: "{{ inventory_hostname }}"
+              fqdn: "{{ ansible_fqdn | default(inventory_hostname) }}"
+              primary_ip: "{{ ansible_default_ipv4.address | default('unknown') }}"
+              os_family: "{{ ansible_os_family | default('unknown') }}"
+              distribution: "{{ ansible_distribution | default('unknown') }}"
+              distribution_version: "{{ ansible_distribution_version | default('unknown') }}"
+              distribution_release: "{{ ansible_distribution_release | default('unknown') }}"
+              kernel_before: "{{ ansible_kernel | default('unknown') }}"
+              kernel_after: "{{ kernel_after_uname.stdout | default(ansible_kernel | default('unknown')) | trim }}"
+              package_manager: "apt"
+              action: "{{ apt_action }}"
+              update_mode: "{{ apt_update_mode }}"
+              apt_upgrade_mode: "{{ apt_upgrade_mode }}"
+              log_level: "{{ apt_log_level }}"
+              exclude_packages: "{{ exclude_packages_list }}"
+              updates_available_before_count: "{{ updates_available_count | default(0) | int }}"
+              security_updates_before_count: "{{ security_updates_count | default(0) | int }}"
+              packages_updated_count: "{{ (packages_updated | default([])) | length }}"
+              packages_updated: "{{ packages_updated | default([]) }}"
+              dpkg_broken_after: "{{ (dpkg_broken.stdout | default('') | trim) != '' }}"
+              reboot_required_before: "{{ reboot_required_before | default('unknown') }}"
+              reboot_required_after: "{{ reboot_required_after | default('not_applicable_check_mode') }}"
+              allow_reboot: "{{ apt_allow_reboot | bool }}"
+              allow_reboot_source: "{{ apt_reboot_source }}"
+              rebooted: "{{ (reboot_action.rebooted | default(false)) | bool }}"
+              failed_services_after: "{{ failed_services_list | default([]) }}"
+              evidence_dir: "{{ evidence_dir | default('not_created') }}"
+              started_at: "{{ execution_started_at }}"
+              finished_at: "{{ execution_finished_at }}"
+              status: "{{ execution_status }}"
+              warnings: "{{ samurai_warnings }}"
+              errors: "{{ samurai_errors }}"
+
+        - name: "Write summary.json"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/summary.json"
+            mode: '0640'
+            content: "{{ host_summary | to_nice_json }}\n"
+          when: evidence_dir is defined
+
+        - name: "Publish per-host summary as run stat"
+          ansible.builtin.set_stats:
+            data:
+              samurai_apt_update_summary: "{{ host_summary }}"
+            per_host: true
+            aggregate: false
+
+
+- name: "SamurAI :: apt-update :: emit consolidated stdout JSON"
+  hosts: localhost
+  gather_facts: false
+  become: false  # localhost aggregation — no privilege escalation (see play 1)
+  tasks:
+    - name: "Collect per-host summaries"
+      ansible.builtin.set_fact:
+        all_host_summaries: >-
+          {{
+            groups['samurai_apt_update_targets'] | default([])
+            | map('extract', hostvars, 'host_summary')
+            | select('defined') | list
+          }}
+
+    - name: "Detect targets that produced no summary (unreachable or failed a pre-flight gate)"
+      # A host that dies before the rescue/always block — unreachable, non-Debian,
+      # apt missing — never publishes host_summary. Without this it would silently
+      # disappear from the JSON and the run would still read 'completed'.
+      ansible.builtin.set_fact:
+        missing_hosts: >-
+          {{
+            groups['samurai_apt_update_targets'] | default([])
+            | difference(all_host_summaries | map(attribute='host') | list)
+          }}
+
+    - name: "Compute consolidated status"
+      ansible.builtin.set_fact:
+        consolidated_status: >-
+          {{
+            'failed' if ((all_host_summaries | selectattr('status', 'equalto', 'failed') | list | length) > 0
+                         or (missing_hosts | length) > 0)
+            else 'completed'
+          }}
+
+    - name: "Build consolidated samurai_shield_result block"
+      ansible.builtin.set_fact:
+        samurai_shield_result:
+          playbook: "linux_apt_update_with_evidence"
+          action: "{{ (ACTION | default('') | string | trim) or 'Check' }}"
+          update_mode: "{{ (UPDATE_MODE | default('') | string | trim) or 'all' }}"
+          apt_upgrade_mode: "{{ (APT_UPGRADE_MODE | default('') | string | trim) or 'upgrade' }}"
+          log_level: "{{ (LOG_LEVEL | default('') | string | trim) or 'package' }}"
+          status: "{{ consolidated_status }}"
+          host_count: "{{ all_host_summaries | length }}"
+          hosts: "{{ all_host_summaries }}"
+          hosts_without_summary: "{{ missing_hosts }}"
+
+    - name: "Print consolidated SamurAI Shield JSON to stdout"
+      ansible.builtin.debug:
+        msg: "{{ {'samurai_shield_result': samurai_shield_result} | to_nice_json }}"
+
+    - name: "Publish consolidated result as workflow stat"
+      ansible.builtin.set_stats:
+        data:
+          samurai_shield_result: "{{ samurai_shield_result }}"
+        aggregate: false
+        per_host: false
+
+    - name: "Fail job when one or more hosts failed"
+      ansible.builtin.fail:
+        msg: >-
+          One or more hosts failed during apt update
+          {{ ('(no summary from: ' + (missing_hosts | join(', ')) + ')') if (missing_hosts | length) > 0 else '' }}.
+          See samurai_shield_result in stdout.
+      when: consolidated_status == 'failed'
