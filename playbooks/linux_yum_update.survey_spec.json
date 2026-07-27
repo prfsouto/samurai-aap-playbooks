@@ -1,0 +1,84 @@
+{
+  "name": "SamurAI Shield :: Linux yum/dnf update (RHEL-like)",
+  "description": "Input contract for playbooks/linux_yum_update_with_evidence.yml (repo: prfsouto/samurai-aap-playbooks). HOSTNAMES is auto-filled by SamurAI Shield from the governed asset and hidden from the operator form. IMPORTANT: enable 'Prompt on launch -> Extra variables' (ask_variables_on_launch) on the Job Template so the engine's governed HOSTNAMES (space-separated multi-host wave) overrides the survey's blank default instead of being discarded.",
+  "spec": [
+    {
+      "question_name": "Target host(s)",
+      "question_description": "Single host, IP, or space/comma-separated list. Filled automatically by SamurAI Shield from the selected asset — do not type it by hand.",
+      "variable": "HOSTNAMES",
+      "type": "text",
+      "required": true,
+      "default": "",
+      "new_question": true
+    },
+    {
+      "question_name": "Action",
+      "question_description": "Check lists available updates without changing packages. Apply installs them on the target.",
+      "variable": "ACTION",
+      "type": "multiplechoice",
+      "choices": "Check\nApply",
+      "required": true,
+      "default": "Check",
+      "new_question": true
+    },
+    {
+      "question_name": "Update mode",
+      "question_description": "all upgrades every package. security applies only security advisories (requires the repos to expose updateinfo.xml / the security plugin).",
+      "variable": "UPDATE_MODE",
+      "type": "multiplechoice",
+      "choices": "all\nsecurity",
+      "required": false,
+      "default": "all",
+      "new_question": true
+    },
+    {
+      "question_name": "Exclude packages",
+      "question_description": "Comma-separated package names to exclude from the update (mapped to --exclude=).",
+      "variable": "EXCLUDE_PACKAGES",
+      "type": "text",
+      "required": false,
+      "default": "",
+      "new_question": true
+    },
+    {
+      "question_name": "Allow reboot",
+      "question_description": "true lets the playbook reboot the target after Apply, and only when a reboot is required (needs-restarting -r).",
+      "variable": "ALLOW_REBOOT",
+      "type": "multiplechoice",
+      "choices": "false\ntrue",
+      "required": false,
+      "default": "false",
+      "new_question": true
+    },
+    {
+      "question_name": "Job log detail",
+      "question_description": "summary = counts only; package = one line per transaction (max 300); full = complete stdout/stderr.",
+      "variable": "LOG_LEVEL",
+      "type": "multiplechoice",
+      "choices": "summary\npackage\nfull",
+      "required": false,
+      "default": "package",
+      "new_question": true
+    },
+    {
+      "question_name": "Hosts at a time",
+      "question_description": "Rolling batch size. 1 updates the wave strictly one host at a time.",
+      "variable": "SERIAL_BATCH",
+      "type": "integer",
+      "min": 1,
+      "max": 100,
+      "required": false,
+      "default": 1,
+      "new_question": true
+    },
+    {
+      "question_name": "Evidence base directory",
+      "question_description": "Base directory on the target where the structured evidence files are written.",
+      "variable": "EVIDENCE_BASE_DIR",
+      "type": "text",
+      "required": false,
+      "default": "/var/tmp/samurai-shield/yum-update",
+      "new_question": true
+    }
+  ]
+}
