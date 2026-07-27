@@ -573,11 +573,15 @@
 
         - name: "Compute hotfix diff before/after"
           ansible.builtin.set_fact:
+            # Strip from the first '|' to end to leave just the HotFixID. No
+            # capture-group backreference ('\1'): inside a YAML block scalar
+            # Ansible hands re.sub a LITERAL '\1' (not group 1), collapsing every
+            # line to '\1'. Match-and-remove is robust.
             hotfixes_added: >-
               {{
                 (hotfixes_after.stdout_lines | default([]))
                 | difference(hotfixes_before.stdout_lines | default([]))
-                | map('regex_replace', '^([^|]+)\\|.*$', '\\1') | unique | list
+                | map('regex_replace', '\\|.*$', '') | unique | list
               }}
           when: wu_action == 'Apply'
 
