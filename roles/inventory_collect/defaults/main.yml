@@ -1,0 +1,50 @@
+---
+# ============================================================================
+# Defaults for the inventory_collect role (Fase 1 Onda 2 — Server Mapping,
+# RFC-004 §16.4/§16.5). Each value is overridable via the SamurAI payload
+# (extra_vars from the control plane) or via global samurai_* group_vars —
+# same convention as the other roles in this stack (image_build, provision,
+# validation...).
+#
+# The action is 100% READ-ONLY on the collected host: it runs the setup
+# (gather_facts) and package_facts modules and NOTHING that writes to the
+# target. To publish, the playbook PUTs the facts document straight to a
+# presigned S3 URL the engine mints for this run (model decided 2026-07-10,
+# RFC-004 §16.4/§16.5 — superseding the earlier "AAP holds an S3 IAM
+# credential" design): a plain HTTPS PUT (ansible.builtin.uri), no AWS SDK, no
+# S3 module and no AWS credential on the AAP side at all. The engine generates
+# the signature and consumes the object from the inbox once it lands. The PUT
+# leaves the AAP execution node, so it is delegated to localhost.
+#
+# I10: the AAP carries NO AWS credential whatsoever. The presigned URL already
+#     embeds the (time-boxed, single-object) write authorization — the engine
+#     is what signed it; the executor just does a plain HTTPS PUT with the
+#     headers it was told to send.
+# I8: samurai_execution_id is stamped on the document and on every set_stats
+#     output.
+# ============================================================================
+
+# ── Payload fields (control plane → job template) ──────────────────────────
+inventory_collect_target_host: "{{ target_host | default('') }}"
+inventory_collect_organization_id: "{{ organization_id | default('') }}"
+
+# ``cloud-init status --wait`` is read-only, but a broken boot must not hold
+# the inventory job forever. The timeout is explicit and can be governed by
+# the caller when a different image boot profile requires it.
+inventory_collect_cloud_init_timeout_seconds: 60
+
+# The presigned PUT URL for this run's inbox object, and the exact HTTP
+# headers the engine signed the URL for (the SSE-KMS directives — S3 rejects
+# the PUT if the headers sent do not match what was signed). Both are
+# injected by the control plane at launch; the role passes
+# facts_s3_put_headers through byte-for-byte — never invented, altered or
+# reordered here. The URL is not a long-lived credential, but it does grant
+# write access to that one object until it expires, so it is handled with the
+# same care a bearer secret would get: never echoed in full (tasks/main.yml
+# only reports whether it is set, and the PUT task itself is no_log).
+inventory_collect_facts_s3_presigned_put_url: "{{ facts_s3_presigned_put_url | default('') }}"
+inventory_collect_facts_s3_put_headers: "{{ facts_s3_put_headers | default({}) }}"
+
+# ── Document schema id — versioned so the Layer-2 transformers (RFC-004
+# §16.5) can evolve the mapping without re-collecting the raw. ──────────────
+inventory_collect_schema: "samurai.inventory_collect/v1"

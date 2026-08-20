@@ -1,0 +1,86 @@
+---
+# ============================================================================
+# Single-stage playbook used by the AAP job template "samurai_inventory_collect"
+# (Fase 1 Onda 2 — Server Mapping, RFC-004 §16.4/§16.5). It captures the raw
+# inventory (Layer-1) of an EXISTING host: gather_facts (setup) + package_facts,
+# assembled into one facts document, hashed and PUT to a presigned S3 URL for
+# the engine's Layer-2 transformers to derive OBOM/blueprint/baseline from.
+#
+# The action is READ-ONLY on the collected host — it never mutates it, so the
+# change gate (I2) does not apply (RFC-004 §16.7 read-only class). The upload
+# is a plain HTTPS PUT (ansible.builtin.uri) to a presigned URL the engine
+# minted for this run (model decided 2026-07-10, RFC-004 §16.4/§16.5 —
+# presigned-URL model). I10 stays intact and goes further than before: the AAP
+# carries NO AWS credential at all — the signed URL already embeds the
+# (time-boxed, single-object) write authorization.
+#
+# Inputs (extra_vars from the control plane):
+#   target_host                IP/hostname of the existing host to collect (required)
+#   target_port                SSH port of that host (optional, defaults to 22 —
+#                              the engine always sends it; the default only covers
+#                              a manual/legacy launch)
+#   samurai_execution_id       correlation id, stamped everywhere (required, I8)
+#   organization_id            tenant scope, carried in the document (required)
+#   facts_s3_presigned_put_url presigned S3 PUT URL for this run's inbox object (required)
+#   facts_s3_put_headers       the exact HTTP headers (SSE-KMS directives) the
+#                              URL was signed for — passed through as-is (required)
+# ============================================================================
+
+- name: "SamurAI :: inventory_collect :: validate inputs + register target host"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: "[inventory_collect] Validate required collection inputs are present"
+      ansible.builtin.assert:
+        that:
+          - samurai_execution_id | default('') | length > 0
+          - target_host | default('') | length > 0
+          # organization_id is an int on the wire (the engine's launch_collection
+          # passes org_id, the FastAPI/SQLAlchemy PK, unconverted) — | length on
+          # a bare int raises "object of type 'int' has no len()" and fails this
+          # task before the host is ever touched (confirmed against a real failed
+          # AAP job). | string coerces both the int case and the absent case
+          # (default('') already yields a str) so | length is always applied to
+          # a string.
+          - organization_id | default('') | string | length > 0
+          - facts_s3_presigned_put_url | default('') | length > 0
+          - facts_s3_put_headers | default({}) | length > 0
+        # The presigned URL's querystring carries the signature — echoed only
+        # as set/MISSING here, the same care the ephemeral ingest token had
+        # under the earlier POST design. facts_s3_put_headers carries no
+        # secret (just the SSE-KMS directives) and is echoed in full.
+        fail_msg: >-
+          inventory_collect requires samurai_execution_id, target_host,
+          organization_id, facts_s3_presigned_put_url and facts_s3_put_headers
+          (got execution_id='{{ samurai_execution_id | default('') }}',
+          target_host='{{ target_host | default('') }}',
+          organization_id='{{ organization_id | default('') }}',
+          facts_s3_presigned_put_url={{ 'set' if (facts_s3_presigned_put_url | default('') | length > 0) else 'MISSING' }},
+          facts_s3_put_headers={{ facts_s3_put_headers | default({}) }}).
+      tags: [inventory_collect]
+
+    - name: "[inventory_collect] Register the operator-supplied target host (in-memory inventory)"
+      ansible.builtin.add_host:
+        name: "{{ target_host }}"
+        groups: samurai_collect_target
+        # The host's SSH port, from the linked host credential (#1671). It CANNOT
+        # ride on the Machine credential — `port` is not a Machine credential
+        # input — so the in-memory host is the only place it can be set. Without
+        # it the play dials 22: a NAT'd lab host published on 8513 reached a
+        # different sshd on the shared public IP and failed as "Permission
+        # denied" (real STG job 210), which reads as a wrong password.
+        # default(22) keeps older callers that omit target_port working.
+        ansible_port: "{{ target_port | default(22) }}"
+      changed_when: false
+      tags: [inventory_collect]
+
+- name: "SamurAI :: inventory_collect :: collect facts (read-only) → presigned S3 PUT"
+  hosts: samurai_collect_target
+  # gather_facts IS half the collection — the setup module captures OS, kernel,
+  # hardware, mounts and interfaces; package_facts (in the role) adds packages.
+  gather_facts: true
+  tasks:
+    - name: "Run the inventory_collect role"
+      ansible.builtin.import_role:
+        name: inventory_collect
+      tags: [inventory_collect]

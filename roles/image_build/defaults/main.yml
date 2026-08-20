@@ -1,0 +1,95 @@
+---
+# ============================================================================
+# Defaults for the image_build role (Fase 1 — Image Factory, RFC-004 §17.1;
+# evidence contract samurai.image_build_evidence/v1 — plano L2I §10).
+# Each value is overridable via the SamurAI payload (extra_vars, nested under
+# `image_build`) or via global samurai_* group_vars — same convention as the
+# other roles in this stack (provision, validation, bootstrap...).
+# ============================================================================
+
+# ── Payload fields (control plane → workflow) ──────────────────────────────
+image_build_template_path: "{{ image_build.template_path | default('') }}"
+image_build_family: "{{ image_build.family | default('') }}"
+image_build_base_image: "{{ image_build.base_image | default('') }}"
+image_build_packer_vars: "{{ image_build.packer_vars | default({}) }}"
+# syft needs a locally-scannable source (dir:, file:, registry image, ...).
+# A cloud image_ref alone (e.g. a remote AMI id) is NOT one — the packer
+# template must surface a local path itself (e.g. via a provisioner that
+# writes the built rootfs/manifest somewhere reachable). REQUIRED for a real
+# (provider=packer) build since the v1 evidence contract: no scan target
+# means no SBOM/CVE evidence, and the build is refused up front.
+image_build_sbom_scan_target: "{{ image_build.sbom_scan_target | default('') }}"
+image_build_organization_id: "{{ organization_id | default('') }}"
+
+# ── Approved-proposal transport (plano L2I §9 → consumed here in §10) ───────
+# When the plan was materialised from an APPROVED ImageRecipeProposal, the
+# control plane sends short-lived presigned READ URLs for the three approved
+# artifacts plus the frozen content hash. The role downloads exactly those
+# bytes, re-computes the combined sha256 and refuses to build on any mismatch
+# ("execução não relê um artefato mutável sem conferir o hash aprovado").
+image_build_artifact_read_urls: "{{ image_build.artifact_read_urls | default({}) }}"
+image_build_proposal_artifact_sha256: "{{ image_build.proposal_artifact_sha256 | default('') }}"
+
+# ── Evidence destination (samurai.image_build_evidence/v1) ─────────────────
+# Org-scoped S3 prefix where the run's evidence artifacts (build log, SBOM,
+# CVE scan, DescribeImages proof) are uploaded with EXPLICIT SSE-KMS headers
+# (the server-facts bucket policy denies any unencrypted PutObject — issue
+# #1711). Non-secret destination config: the upload itself authenticates via
+# the AAP job template's own cloud credential (the same one Packer uses) —
+# no credential ever travels through extra_vars (I10).
+image_build_evidence_s3_bucket: "{{ image_build.evidence_s3_bucket | default('') }}"
+image_build_evidence_s3_prefix: "{{ image_build.evidence_s3_prefix | default('') }}"
+image_build_evidence_kms_key_id: "{{ image_build.evidence_kms_key_id | default('') }}"
+
+# ── Execution mode ───────────────────────────────────────────────────────────
+# packer (default) invokes the real binary; stub short-circuits with a
+# synthetic image_ref for local/CI testing without cloud credentials —
+# mirrors provision_cloud_provider: stub in the provision role. A stub run
+# publishes `status: stub` evidence, which the control plane REPROVES —
+# a stub can exercise the pipeline but can never become an ImageVersion draft.
+image_build_provider: "{{ samurai_image_build_provider | default('packer') }}"
+image_build_packer_binary: "{{ samurai_packer_binary | default('packer') }}"
+image_build_aws_cli_binary: "{{ samurai_aws_cli_binary | default('aws') }}"
+
+# ── Artifacts (log, SBOM, scan, DescribeImages proof) ───────────────────────
+# Ephemeral SCRATCH inside the AAP execution environment — NOT a persistent
+# install path. The playbook runs on the execution node (`hosts: localhost`),
+# which under AAP is a container running as a NON-ROOT (often arbitrary) UID:
+# `/opt` is root-owned (FHS 3.0 §3.13, "add-on application software packages")
+# and the role's own `file: state=directory` cannot create it there. The old
+# `/opt/samurai/image-build` default only ever worked on a box where somebody
+# had pre-created the tree by hand, and it killed the first real AAP run 9s in
+# (job 212, 27/07: "[Errno 13] Permission denied: b'/opt/samurai'").
+# `/tmp` is the one location an unprivileged UID can always write (FHS §3.18,
+# mode 1777) and it is what ansible-core itself falls back to for module tmp
+# dirs. On a build that COMPLETES the lifetime is enough by construction: the
+# artifacts are written and re-read by the S3 upload tasks of the SAME play,
+# and the durable copy is the SSE-KMS object in the evidence bucket. On Packer
+# init/validate/build/parsing failure, the role now uploads build.log before
+# failing loud; the remaining generated evidence artifacts still require a
+# completed build.
+# The per-run subdirectory `<artifact_dir>/<samurai_execution_id>/` is created
+# 0700 because a 1777 base protects against removal but NOT against reading.
+# Ansible applies that mode to the parents it creates too, so `/tmp/samurai`
+# and `/tmp/samurai/image-build` are born drwx------: on a shared, NON
+# containerized execution node another UID can neither read this run's
+# log/SBOM/scan/recipe NOR create its own run dir under the same base — the
+# second job fails. Under AAP every job gets its own container, so that only
+# bites a bare shared node; the layout trade-off is issue #2028.
+# An operator who DOES have a writable persistent path (bare execution node,
+# mounted volume) keeps full control via `samurai_image_build_artifact_dir`.
+image_build_artifact_dir: "{{ samurai_image_build_artifact_dir | default('/tmp/samurai/image-build') }}"
+image_build_log_tail_lines: "{{ samurai_image_build_log_tail_lines | default(200) }}"
+
+# ── SBOM / CVE scan — MANDATORY evidence for a real build (v1 contract) ────
+# A tool exiting non-zero (or missing from PATH) FAILS the job — the old
+# best-effort `unavailable` outcome no longer exists for provider=packer.
+image_build_sbom_binary: "{{ samurai_sbom_binary | default('syft') }}"
+image_build_cve_scan_binary: "{{ samurai_cve_scan_binary | default('grype') }}"
+
+# ── DescribeImages confirmation (post-build AWS proof) ──────────────────────
+# The AMI must reach state `available` within retries × delay seconds; the
+# packer amazon-ebs builder normally waits for that itself, so this is a
+# confirmation loop, not the primary wait.
+image_build_describe_retries: "{{ samurai_image_build_describe_retries | default(12) }}"
+image_build_describe_delay: "{{ samurai_image_build_describe_delay | default(10) }}"

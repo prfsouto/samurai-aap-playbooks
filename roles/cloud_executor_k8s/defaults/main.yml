@@ -1,0 +1,49 @@
+---
+# cloud_executor_k8s role defaults
+cek_namespace: ""
+cek_executor_image: "{{ lookup('env', 'CLOUD_EXECUTOR_IMAGE') | default('', true) }}"
+cek_packer_template: ""
+cek_job_ttl_seconds: 3600
+cek_job_active_deadline_seconds: 1800
+cek_wait_timeout_seconds: 2100
+cek_wait_sleep_seconds: 10
+cek_state_backend: "s3"
+cek_tf_repo: ""           # uma fonte do workspace; usar repo OU archive inline
+# Base64 de um tar.gz com o workspace Terraform/Packer. O entrypoint extrai
+# este valor no volume /workspace antes de iniciar o build.
+cek_tf_files_inline: ""
+cek_terraform_dir: "."
+base_image_filter: ""
+image_family_name: ""
+sbom_scan_target: "/var/lib/dpkg"
+samurai_execution_id: ""
+correlation_id: ""
+evidence_kms_key_id: ""
+aws_region: ""
+aws_credential_ref: ""    # nome de Secret pré-existente; valores de acesso nunca entram no contrato
+cek_service_account: "samurai-terraform-runner"
+state_bucket: ""          # bucket S3 para outputs (RFC-004 §17.2)
+
+# Modo do executor. `build` é o caminho histórico (Packer constrói a imagem e o
+# Terraform registra a evidência) e continua sendo o default absoluto: nada muda
+# para quem não informa este valor. `provision` sobe UMA instância a partir de uma
+# AMI já congelada, sem Packer — é o Live Demo da RFC-004 §17.1.
+cek_mode: "build"
+
+# Entradas exclusivas do modo provision.
+cek_ami_id: ""            # AMI concreta (ami-...), nunca nome nem filtro
+cek_image_version_id: ""  # ImageVersion demonstrada, para linhagem na instância
+cek_tf_state_bucket: ""
+cek_tf_state_key: ""      # chave exclusiva por org+execução
+cek_tf_state_region: ""   # região do BUCKET do state, não a da AMI
+cek_tf_state_kms_key_id: ""
+# Rede/tipo governados. Vazios deixam valer o default do módulo Terraform.
+cek_subnet_id: ""
+cek_security_group_id: ""
+cek_instance_type: ""
+cek_name_prefix: ""
+
+# Probe de runtime dentro do modo provision: o Job nasce, prova o toolchain e sai 0
+# antes de terraform init/plan/apply. Nao e' um `cek_mode` novo — o contrato de modos
+# continua sendo build|provision.
+cek_probe_only: false

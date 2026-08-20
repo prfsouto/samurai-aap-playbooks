@@ -1,0 +1,209 @@
+---
+- name: "[cek] Verificar entradas obrigatórias do Cloud Executor"
+  ansible.builtin.assert:
+    that:
+      - >-
+        (cek_tf_repo | default('') | trim | length > 0)
+        or (cek_tf_files_inline | default('') | string | trim | length > 0)
+      - >-
+        not (
+          (cek_tf_repo | default('') | trim | length > 0)
+          and (cek_tf_files_inline | default('') | string | trim | length > 0)
+        )
+      - cek_namespace | default('') | trim | length > 0
+      - aws_credential_ref | default('') | trim | length > 0
+      - samurai_execution_id | default('') | trim | length > 0
+      - >-
+        (samurai_execution_id | default('') | string) is match(
+          '^[A-Za-z0-9]([A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$'
+        )
+      - evidence_kms_key_id | default('') | trim | length > 0
+      - cek_mode | default('build') in ['build', 'provision']
+    fail_msg: >-
+      Cloud Executor requer exatamente uma fonte de workspace (cek_tf_repo ou
+      cek_tf_files_inline), namespace, referência da credencial AWS,
+      samurai_execution_id, evidence_kms_key_id e cek_mode válido
+      (build ou provision).
+  tags: [cloud_executor_k8s, validate]
+
+# As entradas de BUILD continuam obrigatórias no modo build — o modo provision não
+# pode afrouxar o caminho que constrói imagem. Exigi-las no provision seria o
+# oposto: pedir template Packer para subir uma AMI que já existe.
+- name: "[cek] Verificar entradas obrigatórias do modo build"
+  ansible.builtin.assert:
+    that:
+      - cek_packer_template | default('') | trim | length > 0
+      - base_image_filter | default('') | trim | length > 0
+    fail_msg: >-
+      O modo build do Cloud Executor requer template Packer e base_image_filter.
+  when: (cek_mode | default('build')) == 'build'
+  tags: [cloud_executor_k8s, validate]
+
+- name: "[cek] Verificar entradas obrigatórias do modo provision"
+  ansible.builtin.assert:
+    that:
+      - cek_ami_id | default('') | trim | is match('^ami-[0-9a-f]{8,17}$')
+      - cek_image_version_id | default('') | string | trim | length > 0
+      - cek_tf_state_bucket | default('') | trim | length > 0
+      - cek_tf_state_key | default('') | trim | length > 0
+      - cek_tf_state_region | default('') | trim | length > 0
+      - cek_tf_state_kms_key_id | default('') | trim | length > 0
+    fail_msg: >-
+      O modo provision requer AMI concreta (ami-...), image_version_id e o backend
+      de state completo (bucket, key, region e KMS). A região do state é a do
+      bucket — nunca se presume a região da AMI.
+  when:
+    - (cek_mode | default('build')) == 'provision'
+    - not (cek_probe_only | default(false) | bool)
+  tags: [cloud_executor_k8s, validate]
+
+- name: "[cek] Exigir imagem do executor fixada por digest ou SHA"
+  ansible.builtin.assert:
+    that:
+      - cek_executor_image | default('') | trim | length > 0
+      - >-
+        (cek_executor_image is match('^.+@sha256:[0-9a-fA-F]{64}$'))
+        or (cek_executor_image is match('^.+:[0-9a-fA-F]{40}$'))
+    fail_msg: >-
+      cek_executor_image deve usar digest sha256 ou tag com SHA de 40
+      caracteres; latest e tags mutáveis não são aceitos.
+  tags: [cloud_executor_k8s, validate]
+
+- name: "[cloud_executor_k8s] Criar k8s Job do executor ({{ cek_mode | default('build') }})"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        # Nome por modo: build e provision do MESMO plano coexistem, e um nome
+        # compartilhado faria o segundo Job colidir com o primeiro em vez de rodar.
+        name: >-
+          {{
+            'samurai-provision-' ~ plan_id
+            if (cek_mode | default('build')) == 'provision'
+            else 'samurai-tf-' ~ plan_id
+          }}
+        namespace: "{{ cek_namespace }}"
+        labels:
+          samurai-plan-id: "{{ plan_id }}"
+          samurai-org-id: "{{ organization_id }}"
+          samurai-execution-id: "{{ samurai_execution_id }}"
+          app.kubernetes.io/managed-by: samurai-shield
+      spec:
+        backoffLimit: 0
+        activeDeadlineSeconds: "{{ cek_job_active_deadline_seconds }}"
+        ttlSecondsAfterFinished: "{{ cek_job_ttl_seconds }}"
+        template:
+          metadata:
+            labels:
+              samurai-plan-id: "{{ plan_id }}"
+              samurai-org-id: "{{ organization_id }}"
+              samurai-execution-id: "{{ samurai_execution_id }}"
+              app.kubernetes.io/managed-by: samurai-shield
+          spec:
+            serviceAccountName: "{{ cek_service_account }}"
+            restartPolicy: Never
+            securityContext:
+              runAsNonRoot: true
+              runAsUser: 999
+              runAsGroup: 999
+              fsGroup: 999
+              fsGroupChangePolicy: OnRootMismatch
+            containers:
+              - name: cloud-executor
+                image: "{{ cek_executor_image }}"
+                command:
+                  - >-
+                    {{
+                      '/opt/samurai/provision-entrypoint.sh'
+                      if (cek_mode | default('build')) == 'provision'
+                      else '/opt/samurai/entrypoint.sh'
+                    }}
+                workingDir: /workspace
+                resources:
+                  requests:
+                    cpu: "500m"
+                    memory: "1Gi"
+                env:
+                  - name: PLAN_ID
+                    value: "{{ plan_id }}"
+                  - name: STATE_BUCKET
+                    value: "{{ state_bucket }}"
+                  - name: ORGANIZATION_ID
+                    value: "{{ organization_id }}"
+                  - name: PACKER_TEMPLATE
+                    value: "{{ cek_packer_template }}"
+                  - name: BASE_IMAGE_FILTER
+                    value: "{{ base_image_filter }}"
+                  - name: IMAGE_FAMILY_NAME
+                    value: "{{ image_family_name | default('') }}"
+                  - name: SBOM_SCAN_TARGET
+                    value: "{{ sbom_scan_target | default('') }}"
+                  - name: SAMURAI_EXECUTION_ID
+                    value: "{{ samurai_execution_id }}"
+                  - name: CORRELATION_ID
+                    value: "{{ correlation_id | default(samurai_execution_id) }}"
+                  - name: EVIDENCE_KMS_KEY_ID
+                    value: "{{ evidence_kms_key_id }}"
+                  - name: AWS_REGION
+                    value: "{{ aws_region | default('') }}"
+                  - name: SOURCE_ARTIFACTS_JSON
+                    value: "{{ source_artifacts | default([]) | to_json }}"
+                  - name: CEK_TF_REPO
+                    value: "{{ cek_tf_repo | default('') }}"
+                  - name: TF_FILES_INLINE_B64
+                    value: "{{ cek_tf_files_inline | default('') }}"
+                  - name: TERRAFORM_DIR
+                    value: "{{ cek_terraform_dir | default('.') }}"
+                  - name: CEK_IMAGE_TAG
+                    value: "{{ lookup('env', 'CEK_IMAGE_TAG') | default(cek_executor_image, true) }}"
+                  # Entradas do modo provision. Vazias no build, onde o
+                  # provision-entrypoint.sh nem chega a ser executado.
+                  - name: CEK_AMI_ID
+                    value: "{{ cek_ami_id | default('') }}"
+                  - name: CEK_IMAGE_VERSION_ID
+                    value: "{{ cek_image_version_id | default('') | string }}"
+                  - name: TF_STATE_BUCKET
+                    value: "{{ cek_tf_state_bucket | default('') }}"
+                  - name: TF_STATE_KEY
+                    value: "{{ cek_tf_state_key | default('') }}"
+                  - name: TF_STATE_REGION
+                    value: "{{ cek_tf_state_region | default('') }}"
+                  - name: TF_STATE_KMS_KEY_ID
+                    value: "{{ cek_tf_state_kms_key_id | default('') }}"
+                  # Rede e tipo são decisão do wiring governado; vazios deixam valer
+                  # o default declarado no próprio módulo Terraform.
+                  - name: CEK_SUBNET_ID
+                    value: "{{ cek_subnet_id | default('') }}"
+                  - name: CEK_SECURITY_GROUP_ID
+                    value: "{{ cek_security_group_id | default('') }}"
+                  - name: CEK_INSTANCE_TYPE
+                    value: "{{ cek_instance_type | default('') }}"
+                  - name: CEK_NAME_PREFIX
+                    value: "{{ cek_name_prefix | default('') }}"
+                  # Probe de runtime: o entrypoint de provision sai apos provar o
+                  # toolchain, antes de qualquer mutacao. Desligado por padrao.
+                  - name: CEK_PROBE_ONLY
+                    value: "{{ cek_probe_only | default(false) | string | lower }}"
+                  # Namespace e service account vem da downward API para que a
+                  # evidencia seja o que o Job OBSERVA de si, nao o que quem
+                  # despachou afirmou sobre ele.
+                  - name: POD_NAMESPACE
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: metadata.namespace
+                  - name: POD_SERVICE_ACCOUNT
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: spec.serviceAccountName
+                envFrom:
+                  - secretRef:
+                      name: "{{ aws_credential_ref }}"
+                volumeMounts:
+                  - name: workspace
+                    mountPath: /workspace
+            volumes:
+              - name: workspace
+                emptyDir: {}
+  register: cloud_executor_k8s_job_result

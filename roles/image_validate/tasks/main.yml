@@ -1,0 +1,903 @@
+---
+# ============================================================================
+# Role: image_validate (RFC-004 §17.1, PR-B)
+#
+# ``provision`` is intentionally a single-purpose operation: it creates the
+# candidate bench, waits until AWS reports it usable, and publishes the
+# ``samurai.image_validation_bench/v1`` identity.  Collection and ETL run while
+# that instance remains alive.
+#
+# ``teardown`` is a separate, tag-scoped and idempotent operation.  It may be
+# retried by the reaper and only publishes confirmation after the AWS waiter
+# observes ``instance-terminated``.  No AWS credential is accepted in
+# extra_vars; every aws-cli call uses the AAP JT's injected credential.
+# ============================================================================
+
+- name: "[image_validate] Display incoming payload"
+  ansible.builtin.debug:
+    msg:
+      mode: "{{ image_validate_mode }}"
+      provider: "{{ image_validate_provider }}"
+      execution_id: "{{ samurai_execution_id | default('unknown') }}"
+      organization_id: "{{ image_validate_organization_id }}"
+      build_id: "{{ image_validate_build_id }}"
+      validation_id: "{{ image_validate_validation_id }}"
+      correlation_id: "{{ image_validate_correlation_id }}"
+      image_ref: "{{ image_validate_image_ref | default('') }}"
+      region: "{{ image_validate_region | default('') }}"
+      teardown_instance_id: "{{ image_validate_teardown_instance_id | default('') }}"
+  tags: [image_validate, debug]
+
+- name: "[image_validate] Validate identity and operation mode"
+  ansible.builtin.assert:
+    that:
+      - samurai_execution_id | default('') | string | length > 0
+      - image_validate_organization_id | default('') | string | length > 0
+      - image_validate_mode in ['provision', 'teardown']
+      - image_validate_provider in ['aws', 'stub']
+    fail_msg: >-
+      image_validate requires samurai_execution_id, organization_id and mode
+      provision|teardown (got execution_id='{{ samurai_execution_id | default('') }}',
+      organization_id='{{ image_validate_organization_id }}',
+      mode='{{ image_validate_mode }}').
+  tags: [image_validate]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TEARDOWN mode — separate reaper operation, protected by identity tags.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: "[image_validate] Validate teardown region"
+  when:
+    - image_validate_mode == 'teardown'
+    - image_validate_provider == 'aws'
+  ansible.builtin.assert:
+    that:
+      - image_validate_region | default('') | string | length > 0
+    fail_msg: "AWS image_validate teardown requires the bench region."
+
+- name: "[image_validate] Teardown the bench (tag-scoped and idempotent)"
+  when: image_validate_mode == 'teardown'
+  tags: [image_validate, teardown]
+  block:
+    - name: "[image_validate] Initialize teardown facts"
+      ansible.builtin.set_fact:
+        image_validate_teardown_found_ids: []
+        image_validate_teardown_target_ids: []
+        image_validate_teardown_remaining_ids: []
+        image_validate_teardown_terminated_ids: []
+        image_validate_teardown_waited_for_terminal: false
+        # `observed` começa FALSO de propósito: ele é a prova de que a varredura
+        # por etiqueta rodou. Sem ele, a lista vazia de `remaining_ids` seria
+        # indistinguível de "ninguém olhou".
+        image_validate_teardown_observed: false
+        image_validate_teardown_effective_ids: []
+        image_validate_teardown_state_instance_id: ""
+
+    - name: "[image_validate] Stub teardown (no cloud call)"
+      when: image_validate_provider == 'stub'
+      ansible.builtin.set_fact:
+        image_validate_teardown_found_ids: >-
+          {{ [image_validate_teardown_instance_id]
+             if (image_validate_teardown_instance_id | string | length > 0)
+             else [] }}
+        image_validate_teardown_terminated_ids: >-
+          {{ [image_validate_teardown_instance_id]
+             if (image_validate_teardown_instance_id | string | length > 0)
+             else [] }}
+
+    - name: "[image_validate] Find recorded bench instance"
+      when:
+        - image_validate_provider == 'aws'
+        - image_validate_teardown_instance_id | string | length > 0
+      amazon.aws.ec2_instance_info:
+        region: "{{ image_validate_region }}"
+        instance_ids:
+          - "{{ image_validate_teardown_instance_id }}"
+      register: image_validate_teardown_describe
+      changed_when: false
+
+    - name: "[image_validate] Refuse recorded identity incompatibility"
+      when:
+        - image_validate_provider == 'aws'
+        - image_validate_teardown_instance_id | string | length > 0
+        - image_validate_teardown_describe.instances | default([]) | length > 0
+      ansible.builtin.assert:
+        that:
+          - image_validate_teardown_describe.instances | length == 1
+          - (image_validate_teardown_describe.instances | first).instance_id | string
+            == image_validate_teardown_instance_id | string
+          - (image_validate_teardown_describe.instances | first).tags.SamuraiOrganizationId
+            | default('') | string == image_validate_organization_id | string
+          - (image_validate_teardown_describe.instances | first).tags.SamuraiExecutionId
+            | default('') | string == samurai_execution_id | string
+          - (image_validate_teardown_describe.instances | first).tags.SamuraiImageVersionId
+            | default('') | string == image_validate_image_version_id | string
+          - (image_validate_teardown_describe.instances | first).tags.managed_by
+            | default('') | string == 'samurai-shield'
+        fail_msg: >-
+          Triple-identity incompatibility: recorded instance
+          '{{ image_validate_teardown_instance_id }}' does not carry the
+          organization, execution, image-version and managed-by tags of this
+          validation. Refusing to terminate.
+
+    - name: "[image_validate] Record recorded bench instance"
+      when:
+        - image_validate_provider == 'aws'
+        - image_validate_teardown_instance_id | string | length > 0
+      ansible.builtin.set_fact:
+        image_validate_teardown_found_ids: >-
+          {{ image_validate_teardown_describe.instances | default([])
+             | map(attribute='instance_id') | list }}
+
+    - name: "[image_validate] Find active tagged bench instances"
+      when:
+        - image_validate_provider == 'aws'
+        - image_validate_teardown_instance_id | string | length > 0
+      amazon.aws.ec2_instance_info:
+        region: "{{ image_validate_region }}"
+        instance_ids:
+          - "{{ image_validate_teardown_instance_id }}"
+      register: image_validate_teardown_active_describe
+      changed_when: false
+
+    - name: "[image_validate] Record active tagged instances"
+      when:
+        - image_validate_provider == 'aws'
+        - image_validate_teardown_instance_id | string | length > 0
+      ansible.builtin.set_fact:
+        image_validate_teardown_target_ids: >-
+          {{ image_validate_teardown_active_describe.instances | default([])
+             | selectattr('state.name', 'in',
+                 ['pending', 'running', 'stopping', 'stopped', 'shutting-down'])
+             | map(attribute='instance_id')
+             | list }}
+
+    - name: "[image_validate] Discover candidate by identity tags"
+      when:
+        - image_validate_provider == 'aws'
+        - not (image_validate_use_terraform | bool)
+        - image_validate_teardown_instance_id | string | length == 0
+      amazon.aws.ec2_instance_info:
+        region: "{{ image_validate_region }}"
+        filters:
+          "tag:SamuraiOrganizationId": "{{ image_validate_organization_id | string }}"
+          "tag:SamuraiExecutionId": "{{ samurai_execution_id }}"
+          "tag:SamuraiImageVersionId": "{{ image_validate_image_version_id | string }}"
+          "tag:managed_by": "samurai-shield"
+          instance-state-name: "pending,running,stopping,stopped,shutting-down"
+      register: image_validate_teardown_recovery_describe
+      changed_when: false
+
+    - name: "[image_validate] Require one or no recovered candidate"
+      when:
+        - image_validate_provider == 'aws'
+        - not (image_validate_use_terraform | bool)
+        - image_validate_teardown_instance_id | string | length == 0
+      ansible.builtin.assert:
+        that:
+          - image_validate_teardown_recovery_describe.instances | default([]) | length <= 1
+        fail_msg: >-
+          Identity-tag recovery found more than one active candidate for
+          organization={{ image_validate_organization_id }},
+          execution={{ samurai_execution_id }},
+          image_version={{ image_validate_image_version_id }}. Refusing to
+          select a teardown target.
+
+    - name: "[image_validate] Record recovered candidate"
+      when:
+        - image_validate_provider == 'aws'
+        - not (image_validate_use_terraform | bool)
+        - image_validate_teardown_instance_id | string | length == 0
+      ansible.builtin.set_fact:
+        image_validate_teardown_found_ids: >-
+          {{ image_validate_teardown_recovery_describe.instances | default([])
+             | map(attribute='instance_id') | list }}
+        image_validate_teardown_target_ids: >-
+          {{ image_validate_teardown_recovery_describe.instances | default([])
+             | map(attribute='instance_id') | list }}
+
+    # ── Destroy path A — Terraform (governed IaC lifecycle, N5A) ────────────
+    # Terraform destroys what Terraform created, from the state key of THIS
+    # execution. The identity assertions above already ran, so a state that
+    # somehow pointed elsewhere would have been refused before reaching here.
+    - name: "[image_validate] Terraform destroy of the candidate bench"
+      # NÃO condicionado a `image_validate_teardown_target_ids`. O estado remoto
+      # É o caminho de recuperação: quando o apply criou a instância mas o job
+      # morreu antes de publicar o envelope, o control plane nunca registrou o
+      # instance_id — e exigi-lo aqui deixaria viva exatamente a máquina que
+      # ninguém consegue mais nomear. O estado sabe o que foi criado mesmo
+      # quando o envelope não chegou.
+      when:
+        - image_validate_provider == 'aws'
+        - image_validate_use_terraform | bool
+      tags: [terraform]
+      block:
+        - name: "[image_validate] Require the durable state backend for destroy"
+          # Sem estas três coisas o `init` monta um backend inválido e o destroy
+          # falha ANTES de tocar na instância — com uma mensagem sobre backend,
+          # que o operador leria como "não havia nada para destruir".
+          ansible.builtin.assert:
+            that:
+              - image_validate_terraform_state_bucket | string | length > 0
+              - image_validate_terraform_state_region | string | length > 0
+              - image_validate_terraform_state_kms_key_id | string | length > 0
+            fail_msg: >-
+              O destroy governado exige bucket, região e chave KMS do estado
+              remoto (recebido bucket='{{ image_validate_terraform_state_bucket }}',
+              region='{{ image_validate_terraform_state_region }}',
+              kms_key_id='{{ image_validate_terraform_state_kms_key_id }}').
+              Sem eles o backend não resolve e a máquina fica viva.
+
+        - name: "[image_validate] Ensure the Terraform working directory exists"
+          ansible.builtin.file:
+            path: "{{ image_validate_terraform_workdir }}"
+            state: directory
+            mode: "0700"
+
+        - name: "[image_validate] Stage the versioned Candidate B module"
+          # The teardown usually runs in a FRESH container, long after the apply.
+          # The module is re-staged and the state is re-read from S3; nothing is
+          # assumed to have survived on local disk.
+          ansible.builtin.copy:
+            src: "{{ image_validate_terraform_module_dir }}/"
+            dest: "{{ image_validate_terraform_workdir }}/"
+            mode: "0600"
+
+        - name: "[image_validate] Render the module inputs for destroy"
+          ansible.builtin.copy:
+            dest: "{{ image_validate_terraform_workdir }}/samurai.auto.tfvars.json"
+            mode: "0600"
+            # `ami_id` sintético de propósito: o destroy NÃO consulta a AMI nem
+            # recria coisa alguma — ele lê o que existe no estado. O valor só
+            # existe para satisfazer a validação de formato da variável, que o
+            # Terraform aplica mesmo num destroy.
+            content: "{{ {'ami_id': image_validate_image_ref | default('ami-00000000', true),
+              'region': image_validate_region,
+              'instance_type': image_validate_instance_type,
+              'subnet_id': image_validate_subnet_id,
+              'security_group_id': image_validate_security_group_id,
+              'organization_id': image_validate_organization_id | string,
+              'execution_id': samurai_execution_id | string,
+              'image_version_id': image_validate_image_version_id | string,
+              'ssh_username': image_validate_ssh_username,
+              'ssh_public_key': image_validate_ssh_public_key} | to_nice_json }}"
+
+        - name: "[image_validate] Terraform init against the run's own state key"
+          ansible.builtin.command:
+            argv:
+              - "{{ image_validate_terraform_binary }}"
+              - init
+              - -input=false
+              - -no-color
+              - "-backend-config=bucket={{ image_validate_terraform_state_bucket }}"
+              - "-backend-config=key={{ image_validate_terraform_state_key }}"
+              - "-backend-config=region={{ image_validate_terraform_state_region }}"
+              - "-backend-config=encrypt=true"
+              - "-backend-config=kms_key_id={{ image_validate_terraform_state_kms_key_id }}"
+              - "-backend-config=use_lockfile=true"
+            chdir: "{{ image_validate_terraform_workdir }}"
+          changed_when: false
+
+        # ── A identidade do ESTADO, provada antes de destruir ────────────────
+        # As checagens por etiqueta acima olham a instância que o control plane
+        # REGISTROU. Elas não dizem nada sobre o que este arquivo de estado
+        # contém. Uma chave de backend errada — digitada, herdada de outra
+        # execução, montada com um execution_id trocado — passa por todas elas e
+        # destrói a instância da OUTRA execução, possivelmente de outro tenant.
+        # O waiter depois falha (a instância pretendida continua viva) e o
+        # estrago já aconteceu. Por isso o estado é lido e confrontado ANTES.
+        - name: "[image_validate] Read what the remote state actually holds"
+          ansible.builtin.command:
+            argv:
+              - "{{ image_validate_terraform_binary }}"
+              - show
+              - -json
+            chdir: "{{ image_validate_terraform_workdir }}"
+          register: image_validate_tf_state_show
+          changed_when: false
+
+        - name: "[image_validate] Extract the candidate recorded in the state"
+          ansible.builtin.set_fact:
+            image_validate_tf_state_instances: >-
+              {{ ((image_validate_tf_state_show.stdout | default('{}') | from_json).get('values', {})
+                  .get('root_module', {}).get('resources', []))
+                 | selectattr('type', 'equalto', 'aws_instance') | list }}
+
+        - name: "[image_validate] Refuse a state that belongs to another execution"
+          # A identidade tripla vive nas etiquetas que o próprio módulo grava.
+          # Se o estado tem recurso e as etiquetas não batem com ESTA execução,
+          # o destroy para aqui — recusar é sempre mais barato que destruir
+          # recurso alheio.
+          when: image_validate_tf_state_instances | length > 0
+          ansible.builtin.assert:
+            that:
+              - (image_validate_tf_state_instances | first).values.tags.SamuraiOrganizationId
+                | default('') | string == (image_validate_organization_id | string)
+              - (image_validate_tf_state_instances | first).values.tags.SamuraiExecutionId
+                | default('') | string == (samurai_execution_id | string)
+              - (image_validate_tf_state_instances | first).values.tags.SamuraiImageVersionId
+                | default('') | string == (image_validate_image_version_id | string)
+            fail_msg: >-
+              Incompatibilidade de identidade no estado remoto: a chave
+              '{{ image_validate_terraform_state_key }}' contém recurso de outra
+              organização/execução, e esta execução é
+              org='{{ image_validate_organization_id }}'
+              exec='{{ samurai_execution_id }}'. Recusando destruir.
+
+        - name: "[image_validate] Refuse a state whose instance is not the recorded one"
+          # Quando o control plane REGISTROU um instance_id, ele e o estado
+          # precisam concordar. Divergência aqui significa que uma das duas
+          # fontes aponta para outra máquina — e não há como saber qual sem
+          # parar.
+          when:
+            - image_validate_tf_state_instances | length > 0
+            - image_validate_teardown_instance_id | string | length > 0
+          ansible.builtin.assert:
+            that:
+              - (image_validate_tf_state_instances | first).values.id
+                | default('') | string == (image_validate_teardown_instance_id | string)
+            fail_msg: >-
+              O estado remoto e a instância registrada
+              ('{{ image_validate_teardown_instance_id }}') discordam sobre qual
+              máquina pertence a esta execução. Recusando destruir.
+
+        - name: "[image_validate] Terraform destroy"
+          ansible.builtin.command:
+            argv:
+              - "{{ image_validate_terraform_binary }}"
+              - destroy
+              - -auto-approve
+              - -input=false
+              - -no-color
+            chdir: "{{ image_validate_terraform_workdir }}"
+          register: image_validate_tf_destroy
+          changed_when: "'Destroy complete' in (image_validate_tf_destroy.stdout | default(''))"
+
+        - name: "[image_validate] Record what the state destroyed"
+          # Alimenta a confirmação terminal adiante: quando o envelope morreu e
+          # não há instance_id registrado, este é o único id conhecido da
+          # máquina que existiu.
+          when: image_validate_tf_state_instances | length > 0
+          ansible.builtin.set_fact:
+            image_validate_teardown_state_instance_id: >-
+              {{ (image_validate_tf_state_instances | first).values.id | default('') }}
+
+    # ── Destroy path B — native AWS module (credential supplied by AAP) ─────
+    - name: "[image_validate] Terminate active tagged bench instances"
+      when:
+        - image_validate_provider == 'aws'
+        - not (image_validate_use_terraform | bool)
+        - image_validate_teardown_target_ids | length > 0
+      amazon.aws.ec2_instance:
+        region: "{{ image_validate_region }}"
+        instance_ids: "{{ image_validate_teardown_target_ids }}"
+        state: terminated
+        wait: true
+      register: image_validate_teardown_run
+      changed_when: true
+
+    # ── A identidade EFETIVA do teardown ────────────────────────────────────
+    # O id registrado pelo control plane é o caminho normal, mas ele NÃO existe
+    # quando o apply criou a máquina e o job morreu antes de publicar o
+    # envelope. Nesse caso o estado remoto é quem sabe o que foi criado. Sem
+    # unir as duas fontes numa identidade só, o waiter abaixo simplesmente não
+    # roda — e a ausência de observação seria lida como ausência de máquina.
+    - name: "[image_validate] Resolve the effective teardown identity"
+      ansible.builtin.set_fact:
+        image_validate_teardown_effective_ids: >-
+          {{ ([image_validate_teardown_instance_id]
+              if (image_validate_teardown_instance_id | string | length > 0)
+              else ([image_validate_teardown_state_instance_id]
+                    if (image_validate_teardown_state_instance_id | default('') | string | length > 0)
+                    else (image_validate_teardown_target_ids | default([])))) }}
+
+    # Esperar o estado terminal é uma LEITURA, e é a única frase que merece a
+    # palavra "confirmado": a ferramenta que agiu relatando sucesso é uma
+    # afirmação sobre a ferramenta; isto é uma observação da conta.
+    - name: "[image_validate] Wait for instance-terminated"
+      when:
+        - image_validate_provider == 'aws'
+        - image_validate_teardown_effective_ids | length > 0
+      amazon.aws.ec2_instance_info:
+        region: "{{ image_validate_region }}"
+        instance_ids: "{{ image_validate_teardown_effective_ids }}"
+      register: image_validate_teardown_wait
+      changed_when: false
+      retries: "{{ image_validate_teardown_retries | int }}"
+      delay: "{{ image_validate_teardown_delay | int }}"
+      until: >-
+        (image_validate_teardown_wait.instances | default([])
+         | map(attribute='state') | map(attribute='name')
+         | difference(['terminated']) | list | length == 0)
+
+    - name: "[image_validate] Record terminal wait confirmation"
+      when:
+        - image_validate_provider == 'aws'
+        - image_validate_teardown_effective_ids | length > 0
+      ansible.builtin.set_fact:
+        image_validate_teardown_waited_for_terminal: true
+        image_validate_teardown_terminated_ids: "{{ image_validate_teardown_effective_ids }}"
+
+    # ── A varredura por ETIQUETA, independente de qualquer id ───────────────
+    # Roda SEMPRE (não condicionada a id registrado nem a id do estado). É ela
+    # que responde a pergunta que interessa — "sobrou alguma máquina desta
+    # execução?" — inclusive no caso em que nenhuma das duas fontes conhece um
+    # id. Filtrar por instance-id aqui reintroduziria a cegueira que este bloco
+    # existe para eliminar.
+    - name: "[image_validate] Confirm no active instance of this execution remains"
+      when: image_validate_provider == 'aws'
+      amazon.aws.ec2_instance_info:
+        region: "{{ image_validate_region }}"
+        filters:
+          "tag:SamuraiOrganizationId": "{{ image_validate_organization_id | string }}"
+          "tag:SamuraiExecutionId": "{{ samurai_execution_id }}"
+          "tag:SamuraiImageVersionId": "{{ image_validate_image_version_id | string }}"
+          "tag:managed_by": "samurai-shield"
+          instance-state-name: "pending,running,stopping,stopped,shutting-down"
+      register: image_validate_teardown_remaining_describe
+      changed_when: false
+
+    - name: "[image_validate] Record what the account actually still has"
+      when: image_validate_provider == 'aws'
+      ansible.builtin.set_fact:
+        image_validate_teardown_remaining_ids: >-
+          {{ image_validate_teardown_remaining_describe.instances | default([])
+             | map(attribute='instance_id') | list }}
+        image_validate_teardown_observed: true
+
+    - name: "[image_validate] Record all tagged instances as terminal"
+      when:
+        - image_validate_provider == 'aws'
+        - image_validate_teardown_remaining_ids | length == 0
+      ansible.builtin.set_fact:
+        image_validate_teardown_terminated_ids: >-
+          {{ (image_validate_teardown_found_ids | default([]))
+             | union(image_validate_teardown_effective_ids | default([])) }}
+
+    # ── A confirmação exige OBSERVAÇÃO, nunca a lista vazia da inicialização ─
+    # `image_validate_teardown_remaining_ids` nasce `[]`. Sem a guarda abaixo,
+    # um caminho que pulasse a varredura chegaria aqui com a lista intocada e
+    # publicaria `confirmed=true` sem nada ter sido olhado — "despachado" virando
+    # "confirmado" pelo silêncio. A confirmação passa a exigir que a varredura
+    # tenha REALMENTE acontecido.
+    - name: "[image_validate] Assert the teardown was observed, not assumed"
+      when: image_validate_provider == 'aws'
+      ansible.builtin.assert:
+        that:
+          - image_validate_teardown_observed | default(false) | bool
+        fail_msg: >-
+          O teardown não pode ser confirmado: a varredura por etiqueta desta
+          execução não foi executada. Lista vazia por inicialização não é prova
+          de ausência de máquina.
+
+    - name: "[image_validate] Assert teardown is terminal"
+      ansible.builtin.assert:
+        that:
+          - image_validate_teardown_remaining_ids | length == 0
+        fail_msg: >-
+          Teardown did not reach instance-terminated for the scoped bench:
+          {{ image_validate_teardown_remaining_ids }}.
+
+    - name: "[image_validate] Publish terminal teardown envelope"
+      ansible.builtin.set_stats:
+        data:
+          validation:
+            schema_version: "samurai.image_validation_bench/v1"
+            mode: teardown
+            samurai_execution_id: "{{ samurai_execution_id }}"
+            organization_id: "{{ image_validate_organization_id }}"
+            build_id: "{{ image_validate_build_id }}"
+            samurai_build_id: "{{ image_validate_build_id }}"
+            validation_id: "{{ image_validate_validation_id }}"
+            samurai_validation_id: "{{ image_validate_validation_id }}"
+            correlation_id: "{{ image_validate_correlation_id }}"
+            samurai_correlation_id: "{{ image_validate_correlation_id }}"
+            instance_id: "{{ image_validate_teardown_instance_id | default((image_validate_teardown_found_ids | first) | default(''), true) }}"
+            ip_address: ""
+            region: "{{ image_validate_region }}"
+            tags:
+              SamuraiExecutionId: "{{ samurai_execution_id }}"
+              SamuraiOrganizationId: "{{ image_validate_organization_id | string }}"
+              Name: "samurai-image-validate-{{ samurai_execution_id }}"
+              managed_by: "samurai-shield"
+            bench_ready: false
+            teardown:
+              requested: true
+              confirmed: true
+              instance_terminated: true
+              state: instance-terminated
+              waited_for_instance_terminated: "{{ image_validate_teardown_waited_for_terminal | bool }}"
+              terminated: "{{ image_validate_teardown_terminated_ids }}"
+              terminated_at: "{{ now(utc=True).isoformat() }}"
+        aggregate: false
+        per_host: false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PROVISION mode — create B and leave it alive for collection/ETL.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: "[image_validate] Validate provision inputs"
+  when: image_validate_mode == 'provision'
+  ansible.builtin.assert:
+    that:
+      - image_validate_image_ref | string | length > 0
+      - image_validate_region | string | length > 0
+      - image_validate_provider in ['aws', 'stub']
+    fail_msg: >-
+      provision-mode image_validate requires image_validate.image_ref and a
+      region, and image_validate_provider must be aws or stub (got
+      image_ref='{{ image_validate_image_ref }}', region='{{ image_validate_region }}',
+      provider='{{ image_validate_provider }}').
+  tags: [image_validate]
+
+- name: "[image_validate] Validate Candidate B SSH bootstrap inputs"
+  when:
+    - image_validate_mode == 'provision'
+    - image_validate_provider == 'aws'
+  ansible.builtin.assert:
+    that:
+      - image_validate_ssh_username | string | length > 0
+      - image_validate_ssh_public_key | string | length > 0
+    fail_msg: >-
+      AWS Candidate B requires the source host SSH username and public key
+      before the instance is created.
+  tags: [image_validate, provision]
+
+- name: "[image_validate] Record provision start timestamp (UTC)"
+  when: image_validate_mode == 'provision'
+  ansible.builtin.set_fact:
+    image_validate_started_at: "{{ now(utc=True).isoformat() }}"
+  tags: [image_validate]
+
+- name: "[image_validate] Stub provision (offline harness — no cloud)"
+  when:
+    - image_validate_mode == 'provision'
+    - image_validate_provider == 'stub'
+  ansible.builtin.set_fact:
+    image_validate_instance_id: "i-stub-{{ samurai_execution_id }}"
+    image_validate_private_ip: "192.0.2.10"
+    image_validate_instance_state: running
+    image_validate_bench_ready: true
+  tags: [image_validate, stub]
+
+- name: "[image_validate] Provision the candidate bench with Terraform"
+  when:
+    - image_validate_mode == 'provision'
+    - image_validate_provider == 'aws'
+    - image_validate_use_terraform | bool
+  tags: [image_validate, provision, terraform]
+  block:
+    - name: "[image_validate] Require a durable, encrypted Terraform state backend"
+      ansible.builtin.assert:
+        that:
+          - image_validate_terraform_state_bucket | string | length > 0
+          - image_validate_terraform_state_region | string | length > 0
+          - image_validate_terraform_state_kms_key_id | string | length > 0
+        fail_msg: >-
+          O provisionamento por Terraform exige estado remoto com bucket, região
+          e chave KMS. O apply e o destroy são jobs separados: sem estado
+          durável o destroy não tem de onde trabalhar, e a máquina sobrevive sem
+          registro de que não deveria. A região é a do BUCKET, que não é
+          necessariamente a da AMI.
+
+    - name: "[image_validate] Ensure the Terraform working directory exists"
+      ansible.builtin.file:
+        path: "{{ image_validate_terraform_workdir }}"
+        state: directory
+        mode: "0700"
+
+    - name: "[image_validate] Stage the versioned Candidate B module"
+      ansible.builtin.copy:
+        src: "{{ image_validate_terraform_module_dir }}/"
+        dest: "{{ image_validate_terraform_workdir }}/"
+        mode: "0600"
+
+    - name: "[image_validate] Render the module inputs"
+      # Written to a file, never passed on the command line: process arguments
+      # are world-readable on the host, and a job log that echoes the command
+      # would publish them too.
+      ansible.builtin.copy:
+        dest: "{{ image_validate_terraform_workdir }}/samurai.auto.tfvars.json"
+        mode: "0600"
+        content: "{{ {'ami_id': image_validate_image_ref,
+          'region': image_validate_region,
+          'instance_type': image_validate_instance_type,
+          'subnet_id': image_validate_subnet_id,
+          'security_group_id': image_validate_security_group_id,
+          'organization_id': image_validate_organization_id | string,
+          'execution_id': samurai_execution_id | string,
+          'image_version_id': image_validate_image_version_id | string,
+          'ssh_username': image_validate_ssh_username,
+          'ssh_public_key': image_validate_ssh_public_key} | to_nice_json }}"
+
+    - name: "[image_validate] Terraform init against the run's own state key"
+      ansible.builtin.command:
+        argv:
+          - "{{ image_validate_terraform_binary }}"
+          - init
+          - -input=false
+          - -no-color
+          - "-backend-config=bucket={{ image_validate_terraform_state_bucket }}"
+          - "-backend-config=key={{ image_validate_terraform_state_key }}"
+          - "-backend-config=region={{ image_validate_terraform_state_region }}"
+          - "-backend-config=encrypt=true"
+          - "-backend-config=kms_key_id={{ image_validate_terraform_state_kms_key_id }}"
+          - "-backend-config=use_lockfile=true"
+        chdir: "{{ image_validate_terraform_workdir }}"
+      changed_when: false
+
+    - name: "[image_validate] Terraform apply (creates Candidate B)"
+      # Idempotent by state, not by luck: a retry of the same execution finds the
+      # instance already in its own state file and creates nothing new. That is
+      # what keeps a retried job from leaving a second machine behind.
+      ansible.builtin.command:
+        argv:
+          - "{{ image_validate_terraform_binary }}"
+          - apply
+          - -auto-approve
+          - -input=false
+          - -no-color
+        chdir: "{{ image_validate_terraform_workdir }}"
+      register: image_validate_tf_apply
+      changed_when: "'Apply complete' in (image_validate_tf_apply.stdout | default(''))"
+
+    - name: "[image_validate] Read the Terraform outputs"
+      ansible.builtin.command:
+        argv:
+          - "{{ image_validate_terraform_binary }}"
+          - output
+          - -json
+        chdir: "{{ image_validate_terraform_workdir }}"
+      register: image_validate_tf_output
+      changed_when: false
+
+    - name: "[image_validate] Record the bench identity from Terraform"
+      ansible.builtin.set_fact:
+        image_validate_tf_parsed: "{{ image_validate_tf_output.stdout | from_json }}"
+
+    - name: "[image_validate] Publish the bench network identity"
+      ansible.builtin.set_fact:
+        image_validate_instance_id: "{{ image_validate_tf_parsed.instance_id.value | default('') }}"
+        image_validate_private_ip: "{{ image_validate_tf_parsed.ip_address.value | default('') }}"
+        image_validate_instance_state: "{{ image_validate_tf_parsed.state.value | default('running') }}"
+        image_validate_bench_ready: true
+
+    - name: "[image_validate] Wait for the bench to report status ok"
+      # Terraform returns when the instance EXISTS; the collection needs one that
+      # has finished booting. This read is the same status check the aws-cli path
+      # makes, and reading is not a cloud mutation.
+      ansible.builtin.command:
+        argv:
+          - "{{ image_validate_aws_cli_binary }}"
+          - ec2
+          - describe-instance-status
+          - --instance-ids
+          - "{{ image_validate_instance_id }}"
+          - --region
+          - "{{ image_validate_region }}"
+          - --output
+          - json
+      register: image_validate_tf_status
+      changed_when: false
+      retries: "{{ image_validate_boot_retries | int }}"
+      delay: "{{ image_validate_boot_delay | int }}"
+      until: >-
+        image_validate_tf_status.rc == 0
+        and ((image_validate_tf_status.stdout | from_json).InstanceStatuses | default([]) | length > 0)
+        and ((image_validate_tf_status.stdout | from_json).InstanceStatuses | first).InstanceStatus.Status == 'ok'
+
+  # ── A falha depois do apply não pode virar máquina órfã ──────────────────
+  # Sem isto, uma falha AQUI — o wait esgotando as tentativas, por exemplo —
+  # aborta o play DEPOIS de o apply já ter criado a instância. O envelope no
+  # fim do arquivo nunca é publicado, o control plane nunca recebe instance_id,
+  # e o teardown que o exige falha no assert. A máquina fica viva, com estado
+  # remoto íntegro, e sem ninguém autorizado a destruí-la.
+  #
+  # O rescue publica a identidade PARCIAL que já é conhecida (o estado sabe o
+  # que criou) e marca a execução como falha. A falha continua sendo falha — o
+  # que muda é que ela passa a ser uma falha COM endereço.
+  rescue:
+    - name: "[image_validate] Recover the candidate identity from the state"
+      ansible.builtin.command:
+        argv:
+          - "{{ image_validate_terraform_binary }}"
+          - show
+          - -json
+        chdir: "{{ image_validate_terraform_workdir }}"
+      register: image_validate_tf_rescue_show
+      changed_when: false
+      failed_when: false
+
+    - name: "[image_validate] Extract whatever the apply managed to create"
+      ansible.builtin.set_fact:
+        image_validate_rescue_instances: >-
+          {{ ((image_validate_tf_rescue_show.stdout | default('{}') | from_json).get('values', {})
+              .get('root_module', {}).get('resources', []))
+             | selectattr('type', 'equalto', 'aws_instance') | list }}
+      failed_when: false
+
+    - name: "[image_validate] Publish the partial identity so the reaper can act"
+      # SÓ quando o estado prova que existe recurso. Uma falha ANTES do apply
+      # (input inválido, backend inacessível, init recusado) não criou máquina
+      # nenhuma — publicar `teardown.pending=true` ali inventaria um alvo de
+      # destruição para algo que nunca existiu, e mandaria o reaper caçar um
+      # fantasma. Falha pré-apply continua sendo falha comum, sem envelope.
+      when: image_validate_rescue_instances | default([]) | length > 0
+      # `bench_ready: false` — esta máquina NÃO serve para coletar. Mas o
+      # instance_id e a região vão junto, que é o que o teardown precisa para
+      # alcançá-la. Falha não vira sucesso: o envelope declara o erro.
+      ansible.builtin.set_stats:
+        data:
+          validation:
+            schema_version: "samurai.image_validation_bench/v1"
+            mode: provision
+            samurai_execution_id: "{{ samurai_execution_id }}"
+            organization_id: "{{ image_validate_organization_id }}"
+            build_id: "{{ image_validate_build_id }}"
+            validation_id: "{{ image_validate_validation_id }}"
+            correlation_id: "{{ image_validate_correlation_id }}"
+            instance_id: >-
+              {{ (image_validate_rescue_instances | first).values.id
+                 if (image_validate_rescue_instances | length > 0) else '' }}
+            ip_address: >-
+              {{ (image_validate_rescue_instances | first).values.private_ip
+                 if (image_validate_rescue_instances | length > 0) else '' }}
+            region: "{{ image_validate_region }}"
+            state: unknown
+            bench_ready: false
+            provision_failed: true
+            terraform_state_key: "{{ image_validate_terraform_state_key }}"
+            tags:
+              SamuraiExecutionId: "{{ samurai_execution_id }}"
+              SamuraiOrganizationId: "{{ image_validate_organization_id | string }}"
+              managed_by: "samurai-shield"
+            teardown:
+              confirmed: false
+              pending: true
+              reason: "provision failed after apply; identity recovered from state"
+        aggregate: false
+        per_host: false
+
+    - name: "[image_validate] Fail the play, saying whether a machine exists"
+      # A mensagem distingue os dois casos porque eles pedem ações diferentes:
+      # com recurso no estado, alguém precisa garantir o teardown; sem recurso,
+      # não há nada na nuvem para limpar.
+      ansible.builtin.fail:
+        msg: >-
+          {{
+            ("O provisionamento da candidata falhou APÓS o terraform apply. A "
+             ~ "identidade foi recuperada do estado remoto e publicada para o "
+             ~ "teardown e o reaper (chave de estado '"
+             ~ image_validate_terraform_state_key ~ "'). A execução permanece falha.")
+            if (image_validate_rescue_instances | default([]) | length > 0)
+            else ("O provisionamento da candidata falhou ANTES de qualquer "
+                  ~ "recurso ser criado: o estado remoto não contém instância. "
+                  ~ "Nada a destruir na nuvem. A execução permanece falha.")
+          }}
+
+- name: "[image_validate] Provision the candidate bench"
+  when:
+    - image_validate_mode == 'provision'
+    - image_validate_provider == 'aws'
+    - not (image_validate_use_terraform | bool)
+  tags: [image_validate, provision]
+  block:
+    - name: "[image_validate] Launch the throwaway bench (tagged with run identity)"
+      ansible.builtin.command:
+        argv: >-
+          {{ [image_validate_aws_cli_binary, 'ec2', 'run-instances',
+              '--image-id', image_validate_image_ref,
+              '--instance-type', image_validate_instance_type,
+              '--count', '1', '--region', image_validate_region]
+             + (['--subnet-id', image_validate_subnet_id] if (image_validate_subnet_id | length > 0) else [])
+             + (['--security-group-ids', image_validate_security_group_id] if (image_validate_security_group_id | length > 0) else [])
+              + ['--tag-specifications',
+                'ResourceType=instance,Tags=[{Key=SamuraiExecutionId,Value=' ~ samurai_execution_id
+                ~ '},{Key=SamuraiOrganizationId,Value=' ~ (image_validate_organization_id | string)
+                ~ '},{Key=SamuraiImageVersionId,Value=' ~ image_validate_image_version_id
+                ~ '},{Key=Name,Value=samurai-image-validate-' ~ samurai_execution_id
+                ~ '},{Key=managed_by,Value=samurai-shield}]',
+                '--output', 'json'] }}
+      register: image_validate_run_instances
+      changed_when: true
+
+    - name: "[image_validate] Record the bench instance id"
+      ansible.builtin.set_fact:
+        image_validate_instance_id: "{{ ((image_validate_run_instances.stdout | from_json).Instances | first).InstanceId }}"
+
+    - name: "[image_validate] Wait for the bench to reach running and status ok"
+      ansible.builtin.command:
+        argv:
+          - "{{ image_validate_aws_cli_binary }}"
+          - ec2
+          - describe-instance-status
+          - --instance-ids
+          - "{{ image_validate_instance_id }}"
+          - --region
+          - "{{ image_validate_region }}"
+          - --output
+          - json
+      register: image_validate_status_run
+      changed_when: false
+      retries: "{{ image_validate_boot_retries | int }}"
+      delay: "{{ image_validate_boot_delay | int }}"
+      until: >-
+        image_validate_status_run.rc == 0
+        and ((image_validate_status_run.stdout | from_json).InstanceStatuses | default([]) | length > 0)
+        and ((image_validate_status_run.stdout | from_json).InstanceStatuses | first).InstanceStatus.Status == 'ok'
+
+    - name: "[image_validate] Read the bench private IP and state"
+      ansible.builtin.command:
+        argv:
+          - "{{ image_validate_aws_cli_binary }}"
+          - ec2
+          - describe-instances
+          - --instance-ids
+          - "{{ image_validate_instance_id }}"
+          - --region
+          - "{{ image_validate_region }}"
+          - --query
+          - "Reservations[].Instances[].{InstanceId:InstanceId,PrivateIpAddress:PrivateIpAddress,State:State.Name}"
+          - --output
+          - json
+      register: image_validate_instance_describe
+      changed_when: false
+
+    - name: "[image_validate] Record the bench network identity"
+      ansible.builtin.set_fact:
+        image_validate_instance_details: "{{ (image_validate_instance_describe.stdout | from_json) | first | default({}) }}"
+        image_validate_private_ip: "{{ ((image_validate_instance_describe.stdout | from_json) | first | default({})).PrivateIpAddress | default('') }}"
+        image_validate_instance_state: "{{ ((image_validate_instance_describe.stdout | from_json) | first | default({})).State | default('running') }}"
+        image_validate_bench_ready: true
+
+- name: "[image_validate] Assert the provisioned bench has a private IP"
+  when: image_validate_mode == 'provision'
+  ansible.builtin.assert:
+    that:
+      - image_validate_instance_id | default('') | string | length > 0
+      - image_validate_private_ip | default('') | string | length > 0
+      - image_validate_bench_ready | default(false) | bool
+    fail_msg: >-
+      image_validate provision did not return a ready bench identity
+      (instance_id={{ image_validate_instance_id | default('') }},
+      private_ip={{ image_validate_private_ip | default('') }}).
+
+- name: "[image_validate] Record provision finish timestamp (UTC)"
+  when: image_validate_mode == 'provision'
+  ansible.builtin.set_fact:
+    image_validate_finished_at: "{{ now(utc=True).isoformat() }}"
+  tags: [image_validate]
+
+- name: "[image_validate] Publish the provisioned bench envelope"
+  when: image_validate_mode == 'provision'
+  ansible.builtin.set_stats:
+    data:
+      validation:
+        schema_version: "samurai.image_validation_bench/v1"
+        mode: provision
+        samurai_execution_id: "{{ samurai_execution_id }}"
+        organization_id: "{{ image_validate_organization_id }}"
+        build_id: "{{ image_validate_build_id }}"
+        samurai_build_id: "{{ image_validate_build_id }}"
+        validation_id: "{{ image_validate_validation_id }}"
+        samurai_validation_id: "{{ image_validate_validation_id }}"
+        correlation_id: "{{ image_validate_correlation_id }}"
+        samurai_correlation_id: "{{ image_validate_correlation_id }}"
+        source_server_id: "{{ image_validate_source_server_id }}"
+        asset_id: "{{ image_validate_asset_id }}"
+        instance_id: "{{ image_validate_instance_id }}"
+        ip_address: "{{ image_validate_private_ip }}"
+        region: "{{ image_validate_region }}"
+        state: "{{ image_validate_instance_state | default('running') }}"
+        bench_ready: true
+        tags:
+          SamuraiExecutionId: "{{ samurai_execution_id }}"
+          SamuraiOrganizationId: "{{ image_validate_organization_id | string }}"
+          Name: "samurai-image-validate-{{ samurai_execution_id }}"
+          managed_by: "samurai-shield"
+        teardown:
+          confirmed: false
+          pending: true
+        started_at: "{{ image_validate_started_at | default('') }}"
+        finished_at: "{{ image_validate_finished_at | default('') }}"
+    aggregate: false
+    per_host: false
+  tags: [image_validate, provision]

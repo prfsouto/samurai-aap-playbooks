@@ -1,0 +1,16 @@
+---
+# cloud_executor_k8s — orquestra as sub-tasks em ordem
+- name: "[cloud_executor_k8s] Criar Secret de credenciais"
+  ansible.builtin.include_tasks: create_k8s_secret.yml
+  tags: [cloud_executor_k8s, setup]
+
+- name: "[cloud_executor_k8s] Criar k8s Job Terraform"
+  ansible.builtin.include_tasks: create_k8s_job.yml
+  tags: [cloud_executor_k8s, execute]
+
+- name: "[cloud_executor_k8s] Aguardar e coletar resultado"
+  block:
+    - ansible.builtin.include_tasks: wait_and_collect.yml
+  always:
+    - ansible.builtin.include_tasks: cleanup.yml
+  tags: [cloud_executor_k8s, wait]

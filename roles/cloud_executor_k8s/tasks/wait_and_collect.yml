@@ -1,0 +1,142 @@
+---
+- name: "[cloud_executor_k8s] Definir caminho isolado para outputs"
+  ansible.builtin.set_fact:
+    cloud_executor_k8s_outputs_path: >-
+      /tmp/cek_outputs-{{ organization_id }}-{{ plan_id }}-{{ samurai_execution_id }}.json
+
+- name: "[cloud_executor_k8s] Aguardar k8s Job terminar"
+  kubernetes.core.k8s_info:
+    api_version: batch/v1
+    kind: Job
+    name: "samurai-tf-{{ plan_id }}"
+    namespace: "{{ cek_namespace }}"
+  register: cloud_executor_k8s_job_info
+  until: >-
+    (cloud_executor_k8s_job_info.resources | length > 0) and
+    ((cloud_executor_k8s_job_info.resources[0].status.succeeded | default(0)) > 0 or
+     (cloud_executor_k8s_job_info.resources[0].status.failed | default(0)) > 0)
+  retries: "{{ [(cek_wait_timeout_seconds | int // cek_wait_sleep_seconds | int), 1] | max }}"
+  delay: "{{ cek_wait_sleep_seconds }}"
+
+- name: "[cloud_executor_k8s] Determinar resultado do Job"
+  ansible.builtin.set_fact:
+    cloud_executor_k8s_job_succeeded: >-
+      {{ (cloud_executor_k8s_job_info.resources[0].status.succeeded | default(0)) > 0 }}
+    cloud_executor_k8s_job_failed: >-
+      {{ (cloud_executor_k8s_job_info.resources[0].status.failed | default(0)) > 0 }}
+
+- name: "[cloud_executor_k8s] Falhar se Job falhou"
+  ansible.builtin.fail:
+    msg: >-
+      k8s Job samurai-tf-{{ plan_id }} falhou — verificar logs:
+      kubectl logs -n {{ cek_namespace }} -l samurai-plan-id={{ plan_id }}
+  when: cloud_executor_k8s_job_failed | bool
+
+# ignore_nonexistent_bucket: o modulo chama validate_bucket() -> bucket_check()
+# -> s3_bucket_exists() -> HeadBucket ANTES de qualquer operacao de objeto
+# (s3_object.py:1403, 1267-1268, 548-551), em TODO mode, inclusive get. HeadBucket
+# e autorizado por s3:ListBucket no ARN DO BUCKET, e a credencial do Cloud Executor
+# tem de proposito apenas permissao de objeto (PutObject em evidence/, outputs/ e
+# image-build/; GetObject em outputs/). Com o default false o 403 do HeadBucket
+# propaga e a task falha mesmo com o GetObject permitido — a propria doc do modulo
+# descreve este caso: "useful when a user may have the GetObject permission but no
+# other permissions. In which case using mode=get will fail unless
+# ignore_nonexistent_bucket=true is specified".
+#
+# Alternativa descartada: conceder s3:ListBucket na policy. Nao daria pra escopar
+# por prefixo — HeadBucket nao envia s3:prefix, e condition sobre chave ausente nao
+# casa, entao so um ListBucket SEM condition autorizaria (padrao documentado pela
+# AWS em config/latest/developerguide/s3-bucket-policy.html). Isso daria a UMA
+# credencial compartilhada entre organizacoes a capacidade de enumerar TODAS as
+# chaves do bucket, incluindo server-facts/org=*/host=* de todo tenant. Zero
+# permissao nova custa menos.
+#
+# Nao afrouxa validacao: bucket inexistente/inacessivel faz o proprio GetObject
+# falhar, e os asserts abaixo recusam output ausente, vazio ou fora do contrato.
+- name: "[cloud_executor_k8s] Ler outputs do S3"
+  amazon.aws.s3_object:
+    bucket: "{{ state_bucket }}"
+    object: "outputs/{{ organization_id }}/{{ plan_id }}/outputs.json"
+    mode: get
+    dest: "{{ cloud_executor_k8s_outputs_path }}"
+    ignore_nonexistent_bucket: true
+  register: cloud_executor_k8s_s3_result
+  when: cloud_executor_k8s_job_succeeded | bool
+
+- name: "[cloud_executor_k8s] Confirmar arquivo de outputs presente"
+  ansible.builtin.stat:
+    path: "{{ cloud_executor_k8s_outputs_path }}"
+  register: cloud_executor_k8s_outputs_file
+  when: cloud_executor_k8s_job_succeeded | bool
+
+- name: "[cloud_executor_k8s] Recusar output ausente ou vazio"
+  ansible.builtin.assert:
+    that:
+      - cloud_executor_k8s_s3_result is succeeded
+      - cloud_executor_k8s_outputs_file.stat.exists | bool
+      - cloud_executor_k8s_outputs_file.stat.size | int > 0
+    fail_msg: "Cloud Executor não publicou outputs.json válido no S3"
+  when: cloud_executor_k8s_job_succeeded | bool
+
+- name: "[cloud_executor_k8s] Parse outputs do S3"
+  ansible.builtin.set_fact:
+    cloud_executor_k8s_outputs: "{{ lookup('ansible.builtin.file', cloud_executor_k8s_outputs_path) | from_json }}"
+  when: cloud_executor_k8s_job_succeeded | bool
+
+- name: "[cloud_executor_k8s] Validar envelope de evidência"
+  ansible.builtin.assert:
+    that:
+      - cloud_executor_k8s_outputs is mapping
+      - cloud_executor_k8s_outputs.schema_version | default('') == 'samurai.image_build_evidence/v1'
+      - cloud_executor_k8s_outputs.image_ref | default('') is match('^ami-[0-9a-f]{8,17}$')
+      - cloud_executor_k8s_outputs.cloud_provider | default('') == 'aws'
+      - cloud_executor_k8s_outputs.region | default('') | length > 0
+      - cloud_executor_k8s_outputs.template_hash | default('') is match('^[0-9a-fA-F]{64}$')
+      - cloud_executor_k8s_outputs.base_image | default('') | length > 0
+      - cloud_executor_k8s_outputs.packer_log.uri | default('') is match('^s3://')
+      - cloud_executor_k8s_outputs.packer_log.sha256 | default('') is match('^[0-9a-fA-F]{64}$')
+      - cloud_executor_k8s_outputs.sbom.uri | default('') is match('^s3://')
+      - cloud_executor_k8s_outputs.sbom.sha256 | default('') is match('^[0-9a-fA-F]{64}$')
+      - cloud_executor_k8s_outputs.sbom.status | default('') == 'generated'
+      - cloud_executor_k8s_outputs.cve_scan.uri | default('') is match('^s3://')
+      - cloud_executor_k8s_outputs.cve_scan.sha256 | default('') is match('^[0-9a-fA-F]{64}$')
+      - cloud_executor_k8s_outputs.cve_scan.status | default('') == 'generated'
+      - cloud_executor_k8s_outputs.describe_images.uri | default('') is match('^s3://')
+      - cloud_executor_k8s_outputs.describe_images.sha256 | default('') is match('^[0-9a-fA-F]{64}$')
+      - cloud_executor_k8s_outputs.describe_images.state | default('') == 'available'
+      - cloud_executor_k8s_outputs.describe_images.image_id | default('') == cloud_executor_k8s_outputs.image_ref
+      - cloud_executor_k8s_outputs.describe_images.region | default('') == cloud_executor_k8s_outputs.region
+      - cloud_executor_k8s_outputs.describe_images.owner_id | default('') | length > 0
+      - cloud_executor_k8s_outputs.describe_images.execution_tag_verified | default(false) | bool
+      - >-
+        cloud_executor_k8s_outputs.organization_id | default('') | string
+        == organization_id | string
+      - >-
+        cloud_executor_k8s_outputs.samurai_execution_id | default('') | string
+        == samurai_execution_id | string
+      - cloud_executor_k8s_outputs.build_started_at | default('') | length > 0
+      - cloud_executor_k8s_outputs.build_finished_at | default('') | length > 0
+    fail_msg: >-
+      outputs.json não satisfaz samurai.image_build_evidence/v1; nenhum
+      resultado parcial será publicado ao AAP.
+  when: cloud_executor_k8s_job_succeeded | bool
+
+- name: "[cloud_executor_k8s] set_stats para o AAP coletar"
+  ansible.builtin.set_stats:
+    data:
+      cek_job_name: "samurai-tf-{{ plan_id }}"
+      cek_namespace: "{{ cek_namespace }}"
+      cek_plan_id: "{{ plan_id }}"
+      cek_status: "successful"
+      result_outputs: "{{ cloud_executor_k8s_outputs }}"
+      schema_version: "{{ cloud_executor_k8s_outputs.schema_version }}"
+      image_ref: "{{ cloud_executor_k8s_outputs.image_ref }}"
+      region: "{{ cloud_executor_k8s_outputs.region }}"
+      build_log_url: "{{ cloud_executor_k8s_outputs.packer_log.uri }}"
+      samurai_plan_id: "{{ plan_id }}"
+      packer_artifact_id: "{{ cloud_executor_k8s_outputs.image_ref }}"
+      terraform_plan_hash: "{{ cloud_executor_k8s_outputs.terraform_plan_hash | default('') }}"
+      organization_id: "{{ organization_id }}"
+    aggregate: false
+    per_host: false
+  when: cloud_executor_k8s_job_succeeded | bool

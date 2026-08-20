@@ -1,0 +1,158 @@
+---
+# ============================================================================
+# Defaults for the image_validate role (Fase 1 — Image Factory, RFC-004 §17.1,
+# PR-B). The role has two explicit modes, keyed by `image_validate_mode`:
+#   * provision (default) — create the THROWAWAY bench from the draft AMI, wait
+#                until it is usable, and publish only its cloud identity via
+#                `samurai.image_validation_bench/v1`. The bench stays alive for
+#                the standard collection and ETL path.
+#   * teardown           — the separate, idempotent safety net: terminate ONLY
+#                the bench EC2 carrying this run's identity tags and wait for
+#                the AWS terminal state `instance-terminated`.
+# NO AWS credential ever travels in extra_vars: every aws-cli call inherits the
+# AAP job template's own credential injection (same posture as image_build).
+# ============================================================================
+
+# ── Mode ──────────────────────────────────────────────────────────────────
+image_validate_mode: "{{ image_validate_run_mode | default('provision', true) }}"
+
+# ── Execution mode (real cloud vs offline stub) ─────────────────────────────
+# stub short-circuits with a synthetic ready instance so the offline/CI harness
+# runs without cloud credentials — mirrors image_build's `stub` provider. A
+# stub run publishes the same bench identity envelope, but never touches cloud.
+image_validate_provider: "{{ samurai_image_validate_provider | default('aws') }}"
+image_validate_aws_cli_binary: "{{ samurai_aws_cli_binary | default('aws') }}"
+
+# ── Terraform lifecycle for Candidate B (RFC-004 §17.1, N5A) ────────────────
+# When true, Terraform CREATES and DESTROYS the machine; the aws-cli is then
+# used for READING only — describing state to prove what happened. That split
+# matters: "terraform destroy returned 0" is a report from the tool that acted,
+# while "no active instance carries these tags" is an observation of the world.
+# A teardown may only be called confirmed on the second kind of statement.
+#
+# The path stays switchable because the native AWS-module branch below is what
+# the teardown uses today; turning this on is how the Live Demo opts into the
+# governed IaC path without rewriting the one already in production.
+image_validate_use_terraform: >-
+  {{ image_validate.use_terraform | default(samurai_image_validate_use_terraform | default(false)) }}
+image_validate_terraform_binary: "{{ samurai_terraform_binary | default('terraform') }}"
+# O módulo vive DENTRO da role, em files/, e não em ansible/terraform/.
+#
+# Não é preferência de organização: o AAP executa de um espelho, e o manifesto
+# (.github/aap-mirror-paths.json) trata `ansible/terraform/*` como
+# `unmirrored_ok` — o gate fica calado sobre ele. Um módulo ali produziria CI
+# verde com o artefato de runtime AUSENTE no repositório que o AAP faz checkout:
+# a role publicada tentaria ler um caminho que não existe do outro lado.
+#
+# `ansible/roles/image_validate` já é espelhado como diretório inteiro, então
+# tudo sob `files/` viaja junto com a role que o usa. A role fica autocontida —
+# um artefato só para publicar, nenhuma entrada nova no manifesto.
+image_validate_terraform_module_dir: >-
+  {{ samurai_image_validate_terraform_module_dir
+     | default(role_path ~ '/files/terraform/live-demo', true) }}
+# Same `/tmp` reasoning as image_validate_artifact_dir: the EE container runs as
+# a non-root, often arbitrary UID and cannot create a root-owned /opt path.
+#
+# `samurai_execution_id` entra SEM fallback. Ele é obrigatório e o role já o
+# valida logo no início; um `default('none')` aqui transformaria a ausência de
+# identidade num diretório literal `.../none` — e duas execuções sem identidade
+# compartilhariam o mesmo workdir, uma sobrescrevendo o estado da outra. Falhar
+# alto é o comportamento correto: a variável indefinida quebra a expansão.
+image_validate_terraform_workdir: >-
+  {{ samurai_image_validate_terraform_workdir
+     | default('/tmp/samurai/image-validate-tf/' ~ samurai_execution_id, true) }}
+
+# Remote state is NOT optional for this module. The apply and the destroy are
+# two different jobs, minutes or hours apart: without durable state the destroy
+# has nothing to destroy from, and an instance survives with no record that it
+# should not have. Bucket/key arrive from the control plane at launch.
+image_validate_terraform_state_bucket: "{{ image_validate.terraform_state_bucket | default('', true) }}"
+# Sem fallback no execution_id, pela mesma razão do workdir: uma chave
+# `.../exec=none/terraform.tfstate` seria COMPARTILHADA por toda execução sem
+# identidade, e a segunda destruiria o que a primeira registrou. A chave de
+# estado é a identidade da execução; sem identidade não há chave.
+image_validate_terraform_state_key: >-
+  {{ image_validate.terraform_state_key
+     | default('image-validate/org=' ~ (image_validate_organization_id | string)
+               ~ '/exec=' ~ samurai_execution_id ~ '/terraform.tfstate', true) }}
+# A região do BUCKET de estado NÃO é a região da AMI: o backend do projeto vive
+# em `sa-east-1` enquanto a candidata nasce onde a imagem foi assada. Por isso o
+# fallback é `image_validate_region` (que já aceita a forma aninhada E a
+# top-level usada no teardown) e nunca `image_validate.region` sozinho — no
+# teardown a forma aninhada não existe, e um `-backend-config=region=` vazio faz
+# o `init` falhar antes de o destroy governado tocar na instância.
+image_validate_terraform_state_region: >-
+  {{ image_validate.terraform_state_region
+     | default(samurai_image_validate_terraform_state_region
+               | default(image_validate_region, true), true) }}
+# Chave KMS explícita do estado remoto. `encrypt=true` sozinho entrega SSE-S3, e
+# o estado carrega identidade de tenant, de execução e linhagem de imagem — a
+# mesma postura que o bucket server-facts exige para escrita de dado de execução.
+image_validate_terraform_state_kms_key_id: >-
+  {{ image_validate.terraform_state_kms_key_id
+     | default(samurai_image_validate_terraform_state_kms_key_id | default(''), true) }}
+# Lineage tag on the instance — which image this machine is demonstrating.
+image_validate_image_version_id: "{{ image_validate.image_version_id | default('', true) }}"
+
+# ── Provision inputs (control plane → JT, nested under image_validate) ───────
+image_validate_image_ref: "{{ image_validate.image_ref | default('', true) }}"
+image_validate_region: "{{ image_validate.region | default(region | default(''), true) }}"
+image_validate_instance_type: "{{ image_validate.instance_type | default('t3.small') }}"
+image_validate_subnet_id: "{{ image_validate.subnet_id | default(samurai_image_validate_subnet_id | default('', true), true) }}"
+image_validate_security_group_id: "{{ image_validate.security_group_id | default(samurai_image_validate_security_group_id | default('', true), true) }}"
+image_validate_expected_services: "{{ image_validate.expected_services | default([]) }}"
+image_validate_expected_ports: "{{ image_validate.expected_ports | default([]) }}"
+image_validate_build_id: >-
+  {{ image_validate.build_id | default(build_id | default(samurai_build_id |
+  default(image_validate.image_version_id | default('', true), true), true), true) }}
+image_validate_validation_id: >-
+  {{ image_validate.validation_id | default(validation_id |
+  default(samurai_validation_id | default(samurai_execution_id |
+  default('', true), true), true), true) }}
+image_validate_correlation_id: "{{ correlation_id | default(samurai_correlation_id | default(''), true) }}"
+image_validate_source_server_id: "{{ image_validate.source_server_id | default('', true) }}"
+image_validate_asset_id: "{{ image_validate.asset_id | default('', true) }}"
+image_validate_ssh_username: "{{ image_validate.ssh_username | default('ubuntu', true) }}"
+image_validate_ssh_public_key: "{{ image_validate.ssh_public_key | default('', true) }}"
+
+# ── Identity + tenant scope ─────────────────────────────────────────────────
+image_validate_organization_id: "{{ organization_id | default('', true) }}"
+
+# ── Teardown-mode input (top-level, from the reaper/finalize) ───────────────
+# ``default('', true)`` (boolean 2nd arg) replaces a DEFINED-None too, not only an
+# undefined var — an abandoned bench (AMI that never booted) has no instance id,
+# and a bare None would survive plain ``default('')`` and blow up ``| length``
+# below. Empty means "no recorded instance — the teardown has no termination target".
+image_validate_teardown_instance_id: "{{ instance_id | default('', true) }}"
+
+# ── Evidence destination (org-scoped S3 prefix, SSE-KMS) ────────────────────
+# Non-secret destination config, injected at launch by the control plane
+# (`AAPProvider._image_validate_evidence_destination`) but RESERVED: no task in
+# this role uploads anything today — the observations travel inline in
+# `set_stats` and the engine writes the report. Kept for the future large-facts
+# upload, which will have to carry the explicit SSE-KMS header pair (the bucket
+# policy denies any unencrypted PutObject — issue #1711) and will authenticate
+# via the JT's own cloud credential, never via extra_vars.
+image_validate_evidence_s3_bucket: "{{ image_validate.evidence_s3_bucket | default('') }}"
+image_validate_evidence_s3_prefix: "{{ image_validate.evidence_s3_prefix | default('') }}"
+image_validate_evidence_kms_key_id: "{{ image_validate.evidence_kms_key_id | default('') }}"
+
+# ── Artifacts + boot wait ───────────────────────────────────────────────────
+# `image_validate_artifact_dir` is RESERVED scratch: no task in this role reads
+# or writes it today (the full mode measures the bench and publishes everything
+# inline via `set_stats`). It is declared so a future local-artifact need lands
+# on a path the AAP execution environment can actually write — the EE container
+# runs as a NON-ROOT (often arbitrary) UID, so a root-owned `/opt` default
+# cannot be created by a role and fails the job on the first write, the defect
+# that killed image_build's first real AAP run (job 212, 27/07, EACCES on
+# `/opt/samurai`). Hence the same `/tmp` base as `image_build_artifact_dir`
+# (FHS 3.0 §3.18, mode 1777 — writable for any UID), overridable via
+# `samurai_image_validate_artifact_dir` on a node with a persistent path.
+image_validate_artifact_dir: "{{ samurai_image_validate_artifact_dir | default('/tmp/samurai/image-validate') }}"
+image_validate_boot_retries: "{{ samurai_image_validate_boot_retries | default(30) }}"
+image_validate_boot_delay: "{{ samurai_image_validate_boot_delay | default(10) }}"
+image_validate_teardown_retries: "{{ samurai_image_validate_teardown_retries | default(30) }}"
+image_validate_teardown_delay: "{{ samurai_image_validate_teardown_delay | default(10) }}"
+
+# ── Security scan (candidate CVEs on the booted bench) ──────────────────────
+image_validate_cve_scan_binary: "{{ samurai_cve_scan_binary | default('grype') }}"

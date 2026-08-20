@@ -1,0 +1,42 @@
+---
+# ============================================================================
+# Defaults for the aws_replacement role (Fase 1 — Image Factory, RFC-004
+# §17.1, PR 8 L2I). The role has ONE job: create/consult/tag the SUBSTITUTE
+# EC2 from the approved image. It contains ZERO stop/terminate/cutover/
+# decommission tasks — the origin server is read-only (two DescribeInstances
+# reads for the preservation proof) and is never in the role's inventory.
+# NO AWS credential ever travels in extra_vars: every aws-cli call inherits
+# the AAP job template's own credential injection.
+# ============================================================================
+
+# ── Execution mode (real cloud vs offline stub) ─────────────────────────────
+# stub short-circuits with a synthetic instance so the offline/CI harness runs
+# without cloud credentials — mirrors image_validate's stub provider. A stub
+# run publishes a self-consistent envelope; it never touches a real cloud.
+aws_replacement_provider: "{{ samurai_aws_replacement_provider | default('aws') }}"
+aws_replacement_aws_cli_binary: "{{ samurai_aws_cli_binary | default('aws') }}"
+
+# ── Flow constant ───────────────────────────────────────────────────────────
+# preserve_source is a CONSTANT of the flow (plano L2I §13) — asserted true
+# before anything runs; the role has no code path that could violate it.
+aws_replacement_preserve_source: "{{ aws_replacement.preserve_source | default(false) }}"
+
+# ── Inputs (control plane → workflow, nested under aws_replacement) ────────
+aws_replacement_image_ref: "{{ aws_replacement.image_ref | default('') }}"
+aws_replacement_region: "{{ aws_replacement.region | default(region | default('')) }}"
+aws_replacement_hostname: "{{ aws_replacement.hostname | default('') }}"
+aws_replacement_instance_type: "{{ aws_replacement.instance_type | default('t3.small') }}"
+aws_replacement_subnet_id: "{{ aws_replacement.subnet_id | default(samurai_aws_replacement_subnet_id | default('')) }}"
+aws_replacement_security_group_id: "{{ aws_replacement.security_group_id | default(samurai_aws_replacement_security_group_id | default('')) }}"
+aws_replacement_extra_tags: "{{ aws_replacement.tags | default({}) }}"
+
+# Read-only reference to the ORIGIN instance — used exclusively for the two
+# DescribeInstances preservation reads. Never passed to any mutating call.
+aws_replacement_source_instance_id: "{{ aws_replacement.source_instance_id | default('', true) }}"
+
+# ── Identity + tenant scope ─────────────────────────────────────────────────
+aws_replacement_organization_id: "{{ organization_id | default('') }}"
+
+# ── Boot wait ───────────────────────────────────────────────────────────────
+aws_replacement_boot_retries: "{{ samurai_aws_replacement_boot_retries | default(30) }}"
+aws_replacement_boot_delay: "{{ samurai_aws_replacement_boot_delay | default(10) }}"

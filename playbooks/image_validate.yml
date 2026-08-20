@@ -1,0 +1,37 @@
+---
+# ============================================================================
+# Playbook driven by the AAP job templates "samurai_image_validate" and
+# "samurai_image_validate_teardown" (RFC-004 §17.1, PR-B). It is the
+# mechanical arm of the candidate-image validation: the provision JT creates
+# the THROWAWAY bench and publishes its identity, while the separate teardown
+# JT waits for the AWS terminal state — the origin server is NEVER touched.
+#
+# Two modes (image_validate_mode), both handled by the image_validate role:
+#   * provision (default) — provision → boot → publish the bench envelope
+#   * teardown           — terminate ONLY the tagged bench EC2 and confirm its
+#                          instance-terminated state
+#
+# The AAP carries NO AWS credential in extra_vars — every aws-cli call inherits
+# the job template's own credential injection (I10). The bench is tagged with the
+# run identity (SamuraiOrganizationId + SamuraiExecutionId) so the teardown can
+# only ever act on THIS run's instance (triple-identity protection).
+#
+# Inputs (extra_vars from the control plane):
+#   samurai_execution_id   correlation id, stamped everywhere (required)
+#   organization_id        tenant scope (required)
+#   image_validate_mode    'provision' (default) | 'teardown'
+#   image_validate         provision dict: image_ref, region, build/validation
+#                          identifiers and optional source asset reference
+#   instance_id            teardown-mode: the recorded bench instance id (optional)
+#   region                 teardown-mode: the bench region
+# ============================================================================
+
+- name: "SamurAI :: image_validate :: provision or teardown the candidate bench"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: "Run the image_validate role"
+      ansible.builtin.import_role:
+        name: image_validate
+      tags: [image_validate]
