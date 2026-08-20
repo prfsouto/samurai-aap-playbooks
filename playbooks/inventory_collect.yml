@@ -71,6 +71,20 @@
         # denied" (real STG job 210), which reads as a wrong password.
         # default(22) keeps older callers that omit target_port working.
         ansible_port: "{{ target_port | default(22) }}"
+        # O shell que o alvo fala (OSA #2809, fundação Windows): o Windows
+        # conecta pelo MESMO OpenSSH, mas o Ansible precisa saber que o shell
+        # padrão é PowerShell para usar os wrappers certos. default('sh')
+        # preserva todo chamador anterior byte a byte.
+        ansible_shell_type: "{{ target_shell_type | default('sh') }}"
+        # A CONTA que existe no alvo. Numa máquina do cliente é a da credencial
+        # governada, e o omitido aqui deixa a Machine credential mandar — é o
+        # comportamento de sempre. Numa CANDIDATA a conta é outra: ela nasce da
+        # imagem-base da plataforma e herda a conta DELA (`ubuntu`, `ec2-user`,
+        # `Administrator`), que é o que o provisionamento autorizou a chave a
+        # usar. Sem poder dizer isso aqui, a coleta discorda do provisionamento e
+        # o alvo responde "Permission denied" com o SSH funcionando — medido no
+        # STG, validação 102 (`samurai@…: Permission denied`).
+        ansible_user: "{{ target_login_user | default(omit) }}"
       changed_when: false
       tags: [inventory_collect]
 
@@ -78,8 +92,42 @@
   hosts: samurai_collect_target
   # gather_facts IS half the collection — the setup module captures OS, kernel,
   # hardware, mounts and interfaces; package_facts (in the role) adds packages.
-  gather_facts: true
+  #
+  # Ele roda EXPLICITAMENTE, e não pelo automático do play, porque o gather
+  # automático acontece antes de qualquer task — inclusive antes de uma espera —
+  # e não há onde provar que o alvo já aceita conexão. Uma candidata recém
+  # provisionada ainda está subindo: no Linux o sshd atende em segundos, no
+  # Windows o EC2Launch leva minutos, e a coleta batia em UNREACHABLE tratando
+  # "instância criada" como "máquina alcançável" (medido no STG, validação 110:
+  # instância às 12:49:55, coleta às 12:50:54, timeout em 16s).
+  gather_facts: false
   tasks:
+    - name: "[inventory_collect] Wait until the target actually serves SSH"
+      # Espera do lado do CONTROLADOR, olhando a porta e o banner — de propósito.
+      # `wait_for_connection` executa `ansible.legacy.ping`, que precisa de Python
+      # no alvo e portanto nunca responde numa candidata Windows; esperar o banner
+      # OpenSSH prova que o serviço atende sem exigir nada de dentro da máquina, e
+      # vale igual para as quatro famílias.
+      #
+      # O alvo vem de `target_host`/`target_port` — as MESMAS variáveis que o
+      # add_host usou — e não de `ansible_host`/`ansible_port`: sob `delegate_to`
+      # as variáveis de conexão passam a ser as do host DELEGADO, então a espera
+      # ficava olhando o SSH do próprio controlador e queimava o timeout inteiro
+      # sem nunca tocar na máquina (medido no STG, job AAP 227: "Timeout when
+      # waiting for search string OpenSSH in localhost:22", 600s perdidos).
+      ansible.builtin.wait_for:
+        host: "{{ target_host }}"
+        port: "{{ target_port | default(22) | int }}"
+        search_regex: "OpenSSH"
+        timeout: "{{ inventory_collect_connection_timeout | default(600) | int }}"
+        sleep: 10
+      delegate_to: localhost
+      tags: [inventory_collect]
+
+    - name: "[inventory_collect] Gather facts once the target is reachable"
+      ansible.builtin.setup:
+      tags: [inventory_collect]
+
     - name: "Run the inventory_collect role"
       ansible.builtin.import_role:
         name: inventory_collect

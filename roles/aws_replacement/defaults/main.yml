@@ -40,3 +40,17 @@ aws_replacement_organization_id: "{{ organization_id | default('') }}"
 # ── Boot wait ───────────────────────────────────────────────────────────────
 aws_replacement_boot_retries: "{{ samurai_aws_replacement_boot_retries | default(30) }}"
 aws_replacement_boot_delay: "{{ samurai_aws_replacement_boot_delay | default(10) }}"
+
+# ── Par governado da substituta (#2905) ─────────────────────────────────────
+# A substituta nasce da NOSSA dourada, que herda a conta da imagem-base da
+# plataforma e NENHUMA chave autorizada — o nosso Packer não cria conta. Sem
+# este par ela sobe de pé e inalcançável: registrada como ManagedServer, visível
+# na UI, e o produto não consegue coletar inventário nem provar o Replace.
+# A CONTA vem da PlatformPolicy da imagem; a CHAVE (metade pública) vem da
+# credencial governada do asset de ORIGEM. Nenhum segredo trafega aqui.
+# Dialeto: `posix_shell` ou `windows_powershell` — decisão da policy, não deste
+# role. Ausente/desconhecido é RECUSA, nunca queda para o default POSIX: uma
+# substituta Windows bootada com script sh nasceria muda.
+aws_replacement_bootstrap: "{{ aws_replacement.bootstrap | default('') }}"
+aws_replacement_ssh_username: "{{ aws_replacement.ssh_username | default('') }}"
+aws_replacement_ssh_public_key: "{{ aws_replacement.ssh_public_key | default('') }}"

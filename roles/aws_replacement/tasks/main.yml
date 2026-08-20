@@ -129,6 +129,33 @@
         aws_replacement_adopted: true
       when: (aws_replacement_adopt_describe.stdout | from_json) | length > 0
 
+    # ── Par governado da substituta (#2905) ───────────────────────────────
+    # Recusa ANTES de criar: uma substituta sem conta/chave nasce inalcançável e
+    # o produto reportaria sucesso. Dialeto desconhecido também é recusa — cair
+    # para o POSIX faria a substituta Windows subir muda.
+    - name: "[aws_replacement] Refuse to create a substitute with no reachable account"
+      when: aws_replacement_instance_id is not defined
+      ansible.builtin.assert:
+        that:
+          - aws_replacement_bootstrap in ['posix_shell', 'windows_powershell']
+          - (aws_replacement_ssh_username | default('', true) | trim | length) > 0
+          - (aws_replacement_ssh_public_key | default('', true) | trim | length) > 0
+        fail_msg: >-
+          the substitute would be created with no reachable account: bootstrap
+          dialect, login user and public key are all required (governed by the
+          image PlatformPolicy and the origin asset credential).
+        quiet: true
+
+    - name: "[aws_replacement] Render the platform bootstrap for the substitute"
+      when: aws_replacement_instance_id is not defined
+      ansible.builtin.set_fact:
+        aws_replacement_user_data: >-
+          {{ lookup('ansible.builtin.template',
+                    'candidate_bootstrap_windows.ps1.j2'
+                    if aws_replacement_bootstrap == 'windows_powershell'
+                    else 'candidate_bootstrap_posix.sh.j2') }}
+      no_log: true
+
     # ── Create the NEW instance (only when none exists for this run) ──────
     - name: "[aws_replacement] Run the substitute instance from the approved image"
       when: aws_replacement_instance_id is not defined
@@ -146,7 +173,8 @@
               '},{Key=SamuraiRole,Value=replacement},{Key=SamuraiManaged,Value=true}]',
               '--query', 'Instances[0].InstanceId', '--output', 'text']
              + (['--subnet-id', aws_replacement_subnet_id] if (aws_replacement_subnet_id | length > 0) else [])
-             + (['--security-group-ids', aws_replacement_security_group_id] if (aws_replacement_security_group_id | length > 0) else []) }}
+             + (['--security-group-ids', aws_replacement_security_group_id] if (aws_replacement_security_group_id | length > 0) else [])
+             + ['--user-data', aws_replacement_user_data] }}
       register: aws_replacement_run_instances
       changed_when: true
 

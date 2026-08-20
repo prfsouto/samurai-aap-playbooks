@@ -33,6 +33,17 @@ inventory_collect_organization_id: "{{ organization_id | default('') }}"
 # the caller when a different image boot profile requires it.
 inventory_collect_cloud_init_timeout_seconds: 60
 
+# ``systemctl is-system-running`` responde ``initializing``/``starting`` enquanto
+# a máquina ainda sobe, ``running`` quando assenta, e ``degraded``/``maintenance``
+# quando algo falhou de verdade. Medir assim que o SSH responde faz o veredito
+# depender de quem ganha a corrida: a MESMA imagem foi medida ``running`` num
+# boot e ``starting`` no seguinte (jobs AAP 76 e 80, 18/08/2026), reprovando a
+# validação funcional por tempo, não por defeito. Esta janela dá ao systemd o
+# tempo de assentar antes da leitura valer; esgotada, registra-se o estado
+# realmente observado em vez de um falso ``degraded``.
+inventory_collect_systemd_settle_timeout_seconds: 120
+inventory_collect_systemd_settle_interval_seconds: 5
+
 # The presigned PUT URL for this run's inbox object, and the exact HTTP
 # headers the engine signed the URL for (the SSE-KMS directives — S3 rejects
 # the PUT if the headers sent do not match what was signed). Both are

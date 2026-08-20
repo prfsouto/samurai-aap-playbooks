@@ -3,9 +3,14 @@
 cek_namespace: ""
 cek_executor_image: "{{ lookup('env', 'CLOUD_EXECUTOR_IMAGE') | default('', true) }}"
 cek_packer_template: ""
-cek_job_ttl_seconds: 3600
-cek_job_active_deadline_seconds: 1800
-cek_wait_timeout_seconds: 2100
+# O prazo do Job precisa caber o TRABALHO — medido no STG: o build RHEL 9.6 com
+# 511 pacotes fechou em ~28 min e o Ubuntu com kernel `linux-aws` passou dos 30
+# e morreu com DeadlineExceeded (plan 87). 1800s ficava ABAIXO do tempo típico.
+# O TTL e o wait acompanham, senão o Job some (ou a espera desiste) antes do
+# desfecho ser lido. Mesmos valores do lado Python (`cloud_executor_job_primitives`).
+cek_job_ttl_seconds: 14400
+cek_job_active_deadline_seconds: 10800
+cek_wait_timeout_seconds: 11100
 cek_wait_sleep_seconds: 10
 cek_state_backend: "s3"
 cek_tf_repo: ""           # uma fonte do workspace; usar repo OU archive inline

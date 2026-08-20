@@ -115,14 +115,34 @@ variable "image_version_id" {
   type        = string
 }
 
+variable "candidate_bootstrap" {
+  description = <<-EOT
+    Dialeto de bootstrap DECLARADO pela policy da plataforma: como a candidata
+    autoriza a chave do coletor no primeiro boot. Este módulo não infere a
+    família — nem pelo nome da conta, nem pela AMI. Quem sabe é o documento
+    governado, e o valor chega daqui de cima.
+  EOT
+  type        = string
+  default     = "posix_shell"
+
+  validation {
+    condition     = contains(["posix_shell", "windows_powershell"], var.candidate_bootstrap)
+    error_message = "candidate_bootstrap must be posix_shell or windows_powershell."
+  }
+}
+
 variable "ssh_username" {
-  description = "Linux account used by the governed inventory collector."
+  description = "Account used by the governed inventory collector."
   type        = string
   default     = "ubuntu"
 
   validation {
-    condition     = can(regex("^[a-z_][a-z0-9_-]*$", var.ssh_username))
-    error_message = "ssh_username must be a valid Linux account name."
+    # A forma da conta muda com a plataforma (``ec2-user`` × ``Administrator``);
+    # o formato POSIX estrito continua exigido, mas na precondition do recurso,
+    # onde o dialeto declarado pode ser lido junto. Aqui fica só o que vale para
+    # qualquer família: nome de conta, nunca caminho nem injeção de shell.
+    condition     = can(regex("^[A-Za-z_][A-Za-z0-9._-]*$", var.ssh_username))
+    error_message = "ssh_username must be a valid account name."
   }
 }
 
@@ -187,8 +207,13 @@ locals {
     ? var.assign_public_address
     : nonsensitive(data.aws_ssm_parameter.assign_public_address[0].value)
   )
-  ssh_public_key      = trimspace(var.ssh_public_key)
-  candidate_user_data = <<-EOT
+  ssh_public_key = trimspace(var.ssh_public_key)
+
+  # Os dois dialetos fazem a MESMA coisa — autorizar a chave do coletor para a
+  # conta declarada, sem criar conta nenhuma e sem tocar em senha. O que muda é
+  # a língua da plataforma. Qual deles vale é decisão da policy, não deste
+  # módulo.
+  candidate_user_data_posix = <<-EOT
 #cloud-boothook
 #!/bin/sh
 set -eu
@@ -206,6 +231,53 @@ if ! grep -Fqx -- "$candidate_key" "$candidate_home/.ssh/authorized_keys"; then
   printf '%s\n' "$candidate_key" >> "$candidate_home/.ssh/authorized_keys"
 fi
 EOT
+
+  # No Windows a conta administrativa NÃO lê o ``authorized_keys`` do home: o
+  # Win32-OpenSSH exige ``administrators_authorized_keys`` em ProgramData, com
+  # ACL restrita a Administrators e SYSTEM — chave no home de admin é
+  # silenciosamente ignorada, e o banco ficaria de pé e inalcançável. O sshd já
+  # vem habilitado da dourada (o compilador desta plataforma instala o
+  # OpenSSH.Server e o deixa Automatic), então aqui só se autoriza a chave.
+  candidate_user_data_windows = <<-EOT
+<powershell>
+$ErrorActionPreference = 'Stop'
+$candidateUser = '${var.ssh_username}'
+$candidateKey  = '${local.ssh_public_key}'
+if (-not (Get-LocalUser -Name $candidateUser -ErrorAction SilentlyContinue)) {
+  throw "candidate account $candidateUser does not exist in this image"
+}
+$isAdmin = $false
+foreach ($member in (Get-LocalGroupMember -Group 'Administrators' -ErrorAction SilentlyContinue)) {
+  if ($member.Name -eq "$env:COMPUTERNAME\$candidateUser") { $isAdmin = $true }
+}
+if ($isAdmin) {
+  $target = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
+} else {
+  $target = Join-Path 'C:\Users' $candidateUser
+  $target = Join-Path $target '.ssh\authorized_keys'
+}
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
+if (-not (Test-Path $target)) { New-Item -ItemType File -Force -Path $target | Out-Null }
+if (-not (Select-String -Path $target -SimpleMatch -Pattern $candidateKey -Quiet)) {
+  # UTF-8 SEM BOM, escrito pelo .NET de proposito. No Windows PowerShell 5.1 o
+  # Add-Content grava ANSI e o -Encoding utf8 grava COM BOM; o sshd rejeita o
+  # authorized_keys com BOM, e o sintoma seria a candidata de pe e muda, sem
+  # nada dizendo o porque.
+  $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+  [System.IO.File]::AppendAllText($target, ($candidateKey + "`n"), $utf8NoBom)
+}
+if ($isAdmin) {
+  icacls.exe $target /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null
+}
+</powershell>
+<persist>false</persist>
+EOT
+
+  candidate_user_data = (
+    var.candidate_bootstrap == "windows_powershell"
+    ? local.candidate_user_data_windows
+    : local.candidate_user_data_posix
+  )
 }
 
 # Both must exist and share a VPC. A security group from another VPC is not a
@@ -230,6 +302,18 @@ resource "aws_instance" "candidate" {
     precondition {
       condition     = data.aws_subnet.candidate.vpc_id == data.aws_security_group.candidate.vpc_id
       error_message = "Validation subnet and security group are in different VPCs."
+    }
+
+    # A garantia POSIX que a validação da variável tinha continua valendo — só
+    # que agora amarrada ao dialeto declarado, em vez de aplicada a toda
+    # plataforma. Conta fora da forma da própria família é erro de cadastro, e
+    # aparece nomeado antes de a instância nascer.
+    precondition {
+      condition = (
+        var.candidate_bootstrap != "posix_shell"
+        || can(regex("^[a-z_][a-z0-9_-]*$", var.ssh_username))
+      )
+      error_message = "ssh_username must be a valid Linux account name for a posix_shell candidate."
     }
   }
 
