@@ -1,0 +1,32 @@
+<powershell>
+$ErrorActionPreference = 'Stop'
+$candidateUser = '{{ aws_replacement_ssh_username }}'
+$candidateKey  = '{{ aws_replacement_ssh_public_key }}'
+if (-not (Get-LocalUser -Name $candidateUser -ErrorAction SilentlyContinue)) {
+  throw "candidate account $candidateUser does not exist in this image"
+}
+$isAdmin = $false
+foreach ($member in (Get-LocalGroupMember -Group 'Administrators' -ErrorAction SilentlyContinue)) {
+  if ($member.Name -eq "$env:COMPUTERNAME\$candidateUser") { $isAdmin = $true }
+}
+if ($isAdmin) {
+  $target = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
+} else {
+  $target = Join-Path 'C:\Users' $candidateUser
+  $target = Join-Path $target '.ssh\authorized_keys'
+}
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
+if (-not (Test-Path $target)) { New-Item -ItemType File -Force -Path $target | Out-Null }
+if (-not (Select-String -Path $target -SimpleMatch -Pattern $candidateKey -Quiet)) {
+  # UTF-8 SEM BOM, escrito pelo .NET de proposito. No Windows PowerShell 5.1 o
+  # Add-Content grava ANSI e o -Encoding utf8 grava COM BOM; o sshd rejeita o
+  # authorized_keys com BOM, e o sintoma seria a substituta de pe e muda, sem
+  # nada dizendo o porque.
+  $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+  [System.IO.File]::AppendAllText($target, ($candidateKey + "`n"), $utf8NoBom)
+}
+if ($isAdmin) {
+  icacls.exe $target /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null
+}
+</powershell>
+<persist>false</persist>

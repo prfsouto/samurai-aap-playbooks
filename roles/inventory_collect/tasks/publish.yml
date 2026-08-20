@@ -1,0 +1,118 @@
+---
+# Publicação COMUM da coleta: montagem do documento, PUT no presigned S3
+# (delegate_to: localhost — roda no controlador, neutro de plataforma) e
+# o contrato de set_stats. Todo braço de coleta desemboca aqui com as
+# MESMAS variáveis: ansible_facts.packages, inventory_collect_functional,
+# inventory_collect_manual_packages_*.
+
+- name: "[inventory_collect] Assemble the raw facts document"
+  ansible.builtin.set_fact:
+    inventory_collect_document:
+      schema: "{{ inventory_collect_schema }}"
+      samurai_execution_id: "{{ samurai_execution_id }}"
+      organization_id: "{{ inventory_collect_organization_id }}"
+      target_host: "{{ inventory_collect_target_host }}"
+      collected_at: "{{ now(utc=True, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+      ansible_facts: >-
+        {{
+          (ansible_facts
+            | dict2items
+            | rejectattr('key', 'equalto', 'packages')
+            | items2dict)
+          | combine({
+              'samurai_manual_packages_status': inventory_collect_manual_packages_status,
+              'samurai_manual_packages_reason': inventory_collect_manual_packages_reason,
+              'samurai_manual_packages_kind': inventory_collect_manual_packages_kind
+                | default('package-manager-explicit-install'),
+              'samurai_package_source': inventory_collect_package_source | default('package_facts'),
+              'samurai_package_status': inventory_collect_package_status | default('ready'),
+              'samurai_package_reason': inventory_collect_package_reason | default('')
+            })
+          | combine({'samurai_functional': inventory_collect_functional})
+          | combine(
+              {'samurai_manual_packages': inventory_collect_manual_packages}
+              if inventory_collect_manual_packages is defined
+              else {}
+            )
+        }}
+      packages: "{{ ansible_facts.packages | default({}) }}"
+  tags: [inventory_collect]
+
+- name: "[inventory_collect] Serialize the facts document once (the exact bytes that get uploaded)"
+  ansible.builtin.set_fact:
+    inventory_collect_document_json: "{{ inventory_collect_document | to_json }}"
+  tags: [inventory_collect]
+
+- name: "[inventory_collect] Record integrity (sha256), size and package count"
+  ansible.builtin.set_fact:
+    inventory_collect_facts_sha256: "{{ inventory_collect_document_json | hash('sha256') }}"
+    inventory_collect_facts_size_bytes: "{{ inventory_collect_document_json | length }}"
+    inventory_collect_packages_count: "{{ ansible_facts.packages | default({}) | length }}"
+  tags: [inventory_collect]
+
+- name: "[inventory_collect] Publish the facts document to the presigned S3 URL (fail loud, but record why first)"
+  tags: [inventory_collect, publish]
+  block:
+    - name: "[inventory_collect] PUT the facts document to the presigned URL (signed headers, no_log)"
+      ansible.builtin.uri:
+        url: "{{ inventory_collect_facts_s3_presigned_put_url }}"
+        method: PUT
+        body: "{{ inventory_collect_document_json }}"
+        headers: "{{ inventory_collect_facts_s3_put_headers }}"
+        status_code: [200]
+        timeout: 120
+      no_log: true
+      delegate_to: localhost
+      run_once: true
+
+    - name: "[inventory_collect] Mark the collection as collected"
+      ansible.builtin.set_fact:
+        inventory_collect_status: collected
+  rescue:
+    - name: "[inventory_collect] Record the upload failure reason (fallback contract)"
+      ansible.builtin.set_fact:
+        inventory_collect_status: upload_failed
+        inventory_collect_fail_reason: >-
+          PUT of the facts document to the presigned S3 URL failed (HTTP
+          error, expired/invalid signature, or a header mismatch against what
+          was signed) — see the AAP job detail.
+
+    - name: "[inventory_collect] Log the upload failure to set_stats before failing"
+      ansible.builtin.set_stats:
+        data:
+          collect_status: "{{ inventory_collect_status }}"
+          reason: "{{ inventory_collect_fail_reason }}"
+          samurai_execution_id: "{{ samurai_execution_id | default('') }}"
+          organization_id: "{{ inventory_collect_organization_id }}"
+          target_host: "{{ inventory_collect_target_host }}"
+          facts_sha256: "{{ inventory_collect_facts_sha256 | default('') }}"
+        aggregate: false
+        per_host: false
+
+    - name: "[inventory_collect] Fail loud — the facts document IS the objective of the run"
+      ansible.builtin.fail:
+        msg: >-
+          inventory_collect assembled the facts document
+          (sha256={{ inventory_collect_facts_sha256 | default('?') }},
+          {{ inventory_collect_facts_size_bytes | default('?') }} bytes) but could not
+          publish it: {{ inventory_collect_fail_reason }}
+
+- name: "[inventory_collect] Publish the collection contract to set_stats"
+  ansible.builtin.set_stats:
+    data:
+      collect_status: "{{ inventory_collect_status }}"
+      samurai_execution_id: "{{ samurai_execution_id | default('') }}"
+      organization_id: "{{ inventory_collect_organization_id }}"
+      target_host: "{{ inventory_collect_target_host }}"
+      facts_sha256: "{{ inventory_collect_facts_sha256 }}"
+      facts_size_bytes: "{{ inventory_collect_facts_size_bytes }}"
+      packages_count: "{{ inventory_collect_packages_count }}"
+      workload_root_signal: >-
+        {{ 'apt_manual' if inventory_collect_manual_packages is defined else 'unavailable' }}
+      workload_root_status: "{{ inventory_collect_manual_packages_status }}"
+      workload_root_reason: "{{ inventory_collect_manual_packages_reason }}"
+      workload_root_count: >-
+        {{ (inventory_collect_manual_packages | length) if inventory_collect_manual_packages is defined else 0 }}
+    aggregate: false
+    per_host: false
+  tags: [inventory_collect]

@@ -1,0 +1,16 @@
+#cloud-boothook
+#!/bin/sh
+set -eu
+candidate_user='{{ aws_replacement_ssh_username }}'
+candidate_key='{{ aws_replacement_ssh_public_key }}'
+candidate_home="$(getent passwd "$candidate_user" | cut -d: -f6)"
+test -n "$candidate_home"
+candidate_uid="$(id -u "$candidate_user")"
+candidate_gid="$(id -g "$candidate_user")"
+install -d -m 700 -o "$candidate_uid" -g "$candidate_gid" "$candidate_home/.ssh"
+touch "$candidate_home/.ssh/authorized_keys"
+chown "$candidate_uid:$candidate_gid" "$candidate_home/.ssh/authorized_keys"
+chmod 600 "$candidate_home/.ssh/authorized_keys"
+if ! grep -Fqx -- "$candidate_key" "$candidate_home/.ssh/authorized_keys"; then
+  printf '%s\n' "$candidate_key" >> "$candidate_home/.ssh/authorized_keys"
+fi

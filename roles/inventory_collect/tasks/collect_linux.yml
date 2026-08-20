@@ -1,0 +1,366 @@
+---
+# Braço LINUX da coleta (RFC-004 Camada 1) — o conteúdo que viveu no
+# main.yml até a fundação Windows (OSA #2809): módulos builtin (Python)
+# e os braços de workload por família de gerenciador. Windows tem braço
+# próprio (collect_windows.yml): módulo Python não executa via
+# SSH+PowerShell, e guard por task viraria ruído em vinte lugares — a
+# boundary é o arquivo, como no template do lab.
+
+- name: "[inventory_collect] Enumerate installed packages (read-only)"
+  ansible.builtin.package_facts:
+    manager: auto
+  register: inventory_collect_package_facts
+  failed_when: false
+  tags: [inventory_collect, collect]
+
+# ``package_facts`` reconhece o gerenciador pelo BINDING PYTHON dele, não pelo
+# binário. Medido no SLES 15.7 (AMI oficial da SUSE): o ``rpm`` está instalado
+# e responde, mas nenhum interpretador da imagem tem ``import rpm`` — e
+# instalar ``python3-rpm`` exige subscription. O módulo então recusa a máquina
+# inteira ("Could not detect a supported package manager") e a coleta morre
+# antes de produzir evidência nenhuma, numa plataforma que o produto declara
+# suportar.
+#
+# O módulo continua sendo o caminho primário; este bloco só roda quando ELE
+# falhou, e lê o MESMO banco de dados pelo binário (consulta pura, sem mutação),
+# publicando a mesma forma que ``package_facts`` publica. A origem fica marcada
+# em ``samurai_package_source`` para que ninguém precise adivinhar depois qual
+# caminho produziu o inventário.
+- name: "[inventory_collect] Enumerate installed packages via the rpm binary (fallback)"
+  # A condição olha o EFEITO, não o status da task: com ``failed_when: false`` o
+  # resultado do módulo nunca é "failed", e a primeira versão desta regra nunca
+  # disparou (medido no job 127 — a coleta terminou com zero pacotes, calada).
+  # Inventário vazio é a mesma lacuna, venha ela de erro ou de módulo que
+  # devolveu nada.
+  when: (ansible_facts.packages | default({})) | length == 0
+  tags: [inventory_collect, collect]
+  block:
+    - name: "[inventory_collect] Read the rpm database directly (read-only)"
+      ansible.builtin.command:
+        argv:
+          - rpm
+          - -qa
+          - --qf
+          # As chaves precisam de escape: no formato de consulta do rpm elas
+          # delimitam tag, e um ``{`` solto aborta cada linha com "incorrect
+          # format" (medido no job 129). Com escape, cada pacote sai como um
+          # JSON de uma linha e o parse fica trivial e sem ambiguidade.
+          - >-
+            \{"name":"%{NAME}","version":"%{VERSION}","release":"%{RELEASE}","epoch":"%{EPOCH}","arch":"%{ARCH}","source":"rpm"\}\n
+
+      register: inventory_collect_rpm_qa
+      changed_when: false
+
+    - name: "[inventory_collect] Publish the rpm fallback as package facts"
+      ansible.builtin.set_fact:
+        # ``package_facts`` publica ``{nome: [entrada, ...]}`` — o mesmo formato
+        # sai daqui, para que coleta, ETL e OBOM continuem lendo um contrato só.
+        ansible_facts: >-
+          {{ ansible_facts | combine({'packages': _iic_rpm_packages}) }}
+        inventory_collect_package_source: rpm_binary
+      vars:
+        _iic_rpm_entries: >-
+          {{ inventory_collect_rpm_qa.stdout_lines
+             | map('trim')
+             | select('search', '^{')
+             | map('from_json')
+             | list }}
+        # ``groupby`` devolve pares (nome, entradas) e ``dict`` os fecha no
+        # mapa que o resto do produto espera — mesmo pacote com duas versões
+        # instaladas (kernel, por exemplo) fica com as duas, como no módulo.
+        _iic_rpm_packages: "{{ dict(_iic_rpm_entries | groupby('name')) }}"
+
+- name: "[inventory_collect] Observe cloud-init completion (read-only)"
+  ansible.builtin.command:
+    argv:
+      - cloud-init
+      - status
+      - --wait
+  register: inventory_collect_cloud_init
+  changed_when: false
+  failed_when: false
+  async: "{{ inventory_collect_cloud_init_timeout_seconds | int }}"
+  poll: 1
+  when: "'cloud-init' in (ansible_facts.packages | default({}))"
+  tags: [inventory_collect, collect, functional]
+
+- name: "[inventory_collect] Observe systemd health (read-only, after it settles)"
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - is-system-running
+  register: inventory_collect_systemd
+  changed_when: false
+  failed_when: false
+  # Espera o systemd SAIR do boot antes de a leitura valer. ``initializing`` e
+  # ``starting`` não são veredito nenhum — são "ainda não terminei". Sem esta
+  # espera, quem mede primeiro decide o resultado, e a mesma imagem passa num
+  # boot e reprova no outro. ``degraded``/``maintenance`` encerram o retry na
+  # hora: são estados terminais e a resposta é definitiva.
+  retries: >-
+    {{ ((inventory_collect_systemd_settle_timeout_seconds | int)
+        // (inventory_collect_systemd_settle_interval_seconds | int)) | int }}
+  delay: "{{ inventory_collect_systemd_settle_interval_seconds | int }}"
+  until: >-
+    (inventory_collect_systemd.stdout | default('') | trim)
+    not in ['initializing', 'starting']
+  when: (ansible_facts.service_mgr | default('')) == 'systemd'
+  tags: [inventory_collect, collect, functional]
+
+- name: "[inventory_collect] Record functional observations"
+  ansible.builtin.set_fact:
+    inventory_collect_functional:
+      # Reaching this task through the machine connection proves the SSH
+      # conversation used by this collection, including its configured port.
+      ssh_ok: true
+      cloud_init_ok: >-
+        {{ (inventory_collect_cloud_init.rc | default(1) | int) == 0
+           if (inventory_collect_cloud_init is defined
+               and not (inventory_collect_cloud_init.skipped | default(false) | bool))
+           else false }}
+      # O estado LITERAL que o sistema reportou — a evidência, não o veredito.
+      # Quem julga é a regra de domínio, que não conhece ``systemctl``; aqui só
+      # se observa. Sem este campo o booleano abaixo vira veredito sem motivo:
+      # quem lê o relatório não distingue "serviço quebrado" de "ainda subindo",
+      # e o ambiente de validação onde daria pra olhar já foi destruído. Custou
+      # uma ida ao stdout do AAP para diagnosticar o falso negativo de
+      # 18/08/2026 (jobs 76 e 80, mesma imagem, ``running`` × ``starting``).
+      systemd_state: >-
+        {{ ((inventory_collect_systemd.stdout | default('') | trim) or 'unknown')
+           if (inventory_collect_systemd is defined
+               and not (inventory_collect_systemd.skipped | default(false) | bool))
+           else 'not_observed' }}
+      # A CLASSIFICAÇÃO, em vocabulário de domínio. Quem conhece ``systemctl`` é
+      # este adapter; a regra que decide o parecer recebe ``healthy`` /
+      # ``degraded`` / ``not_settled`` / ``not_observed`` e não precisa saber de
+      # onde veio. ``not_settled`` é o desfecho da espera acima ter estourado —
+      # ausência de medida, que a regra trata como evidência indisponível.
+      systemd_health: >-
+        {{ ('healthy'
+            if (inventory_collect_systemd.stdout | default('') | trim) == 'running'
+            else ('degraded'
+                  if (inventory_collect_systemd.stdout | default('') | trim)
+                     in ['degraded', 'maintenance']
+                  else 'not_settled'))
+           if (inventory_collect_systemd is defined
+               and not (inventory_collect_systemd.skipped | default(false) | bool))
+           else 'not_observed' }}
+      # Mantido pelo contrato existente (leitores antigos), agora sem afirmar
+      # degradação onde não houve: só ``degraded``/``maintenance`` a negam. Ele
+      # NÃO decide o parecer sozinho — ``systemd_health`` é quem manda.
+      systemd_no_degraded: >-
+        {{ (inventory_collect_systemd.stdout | default('') | trim)
+           not in ['degraded', 'maintenance']
+           if (inventory_collect_systemd is defined
+               and not (inventory_collect_systemd.skipped | default(false) | bool))
+           else false }}
+  tags: [inventory_collect, collect, functional]
+
+- name: "[inventory_collect] Initialize workload evidence as unavailable"
+  ansible.builtin.set_fact:
+    inventory_collect_manual_packages_status: unavailable
+    inventory_collect_manual_packages_reason: unsupported_platform
+  tags: [inventory_collect, collect]
+
+# Debian/Ubuntu workload-root evidence. ``apt-mark showmanual`` only reads the
+# dpkg selection state; it does not install, remove, mark or otherwise mutate a
+# package. Failure remains explicit and fail-closed; it is never converted into
+# an empty successful list.
+- name: "[inventory_collect] Observe manually installed APT packages (read-only)"
+  ansible.builtin.command:
+    argv:
+      - apt-mark
+      - showmanual
+  register: inventory_collect_apt_manual
+  changed_when: false
+  failed_when: false
+  when: (ansible_facts.os_family | default('')) == 'Debian'
+  tags: [inventory_collect, collect]
+
+- name: "[inventory_collect] Normalize successful APT workload evidence"
+  ansible.builtin.set_fact:
+    inventory_collect_manual_packages: >-
+      {{ inventory_collect_apt_manual.stdout_lines
+         | default([])
+         | map('trim')
+         | reject('equalto', '')
+         | list
+         | sort }}
+    inventory_collect_manual_packages_status: ready
+    inventory_collect_manual_packages_reason: ""
+  when:
+    - inventory_collect_apt_manual is defined
+    - not (inventory_collect_apt_manual.skipped | default(false))
+    - (inventory_collect_apt_manual.rc | default(1)) == 0
+  tags: [inventory_collect, collect]
+
+- name: "[inventory_collect] Record failed APT workload observation"
+  ansible.builtin.set_fact:
+    inventory_collect_manual_packages_status: unavailable
+    inventory_collect_manual_packages_reason: manual_package_observation_failed
+  when:
+    - (ansible_facts.os_family | default('')) == 'Debian'
+    - inventory_collect_apt_manual is defined
+    - not (inventory_collect_apt_manual.skipped | default(false))
+    - (inventory_collect_apt_manual.rc | default(1)) != 0
+  tags: [inventory_collect, collect]
+
+# RHEL-family workload-root evidence (OSA ciclo RHEL-AZ-C1, #2809). ``dnf
+# repoquery --userinstalled`` is the RPM analogue of ``apt-mark showmanual``:
+# it only reads the package reason recorded by the package manager — it never
+# installs, removes or marks anything. Measured on a real RHEL 8.10 lab VM
+# before this branch existed: 23 user-installed roots. Same contract as the
+# APT arm — a non-zero exit is reported as an explicit observation failure,
+# never converted into an empty successful list.
+# O ``persistdir`` sai de propósito para um diretório efêmero do próprio
+# coletor. O ``repoquery --userinstalled`` só LÊ a razão de instalação, mas o
+# dnf abre o ``history.sqlite`` em modo ESCRITA para registrar a própria
+# consulta — e a coleta roda sem privilégio. Medido no STG (job AAP 245,
+# candidata do plano 118): ``Error: SQLite error on
+# "/var/lib/dnf/history.sqlite": attempt to write a readonly database``, rc=1,
+# evidência ausente, e o perfil saiu com ZERO workload roots contra os 48 do
+# Ubuntu — que passa porque ``apt-mark showmanual`` é read-only de fato.
+#
+# Copiar o history para um diretório gravável e apontar o dnf para lá preserva
+# as duas coisas que importam: o DADO é o real da máquina (é o mesmo arquivo),
+# e o sistema continua intocado — sem sudo, sem escrita fora do temporário.
+# Falha em qualquer etapa continua sendo observação ausente explícita, nunca
+# uma lista vazia bem-sucedida.
+- name: "[inventory_collect] Create an ephemeral dnf persistdir for the read"
+  ansible.builtin.tempfile:
+    state: directory
+    suffix: samurai-dnf
+  register: inventory_collect_dnf_persistdir
+  changed_when: false
+  when: (ansible_facts.os_family | default('')) == 'RedHat'
+  tags: [inventory_collect, collect]
+
+- name: "[inventory_collect] Copy the dnf history for read-only inspection"
+  ansible.builtin.copy:
+    src: /var/lib/dnf/history.sqlite
+    dest: "{{ inventory_collect_dnf_persistdir.path }}/history.sqlite"
+    remote_src: true
+    mode: "0600"
+  register: inventory_collect_dnf_history_copy
+  changed_when: false
+  failed_when: false
+  when:
+    - (ansible_facts.os_family | default('')) == 'RedHat'
+    - inventory_collect_dnf_persistdir is defined
+    - not (inventory_collect_dnf_persistdir.skipped | default(false))
+  tags: [inventory_collect, collect]
+
+- name: "[inventory_collect] Observe user-installed RPM packages (read-only)"
+  ansible.builtin.command:
+    argv:
+      - dnf
+      - -q
+      - --setopt=persistdir={{ inventory_collect_dnf_persistdir.path }}
+      - repoquery
+      - --userinstalled
+      - --qf
+      - "%{name}\n"
+  register: inventory_collect_dnf_manual
+  changed_when: false
+  failed_when: false
+  when:
+    - (ansible_facts.os_family | default('')) == 'RedHat'
+    - inventory_collect_dnf_history_copy is defined
+    - not (inventory_collect_dnf_history_copy.skipped | default(false))
+    - (inventory_collect_dnf_history_copy.failed | default(true)) == false
+  tags: [inventory_collect, collect]
+
+- name: "[inventory_collect] Discard the ephemeral dnf persistdir"
+  ansible.builtin.file:
+    path: "{{ inventory_collect_dnf_persistdir.path }}"
+    state: absent
+  changed_when: false
+  failed_when: false
+  when:
+    - (ansible_facts.os_family | default('')) == 'RedHat'
+    - inventory_collect_dnf_persistdir is defined
+    - not (inventory_collect_dnf_persistdir.skipped | default(false))
+  tags: [inventory_collect, collect]
+
+- name: "[inventory_collect] Normalize successful RPM workload evidence"
+  ansible.builtin.set_fact:
+    inventory_collect_manual_packages: >-
+      {{ inventory_collect_dnf_manual.stdout_lines
+         | default([])
+         | map('trim')
+         | reject('equalto', '')
+         | unique
+         | list
+         | sort }}
+    inventory_collect_manual_packages_status: ready
+    inventory_collect_manual_packages_reason: ""
+  when:
+    - inventory_collect_dnf_manual is defined
+    - not (inventory_collect_dnf_manual.skipped | default(false))
+    - (inventory_collect_dnf_manual.rc | default(1)) == 0
+  tags: [inventory_collect, collect]
+
+# Duas maneiras de a observação não acontecer, e as duas contam como ausência
+# explícita: o dnf rodou e recusou, ou nem chegou a rodar porque a cópia do
+# history falhou. Sem o segundo caso o status ficaria em ``unsupported_platform``
+# numa máquina RedHat — dizendo "esta plataforma não sabe responder" quando o
+# certo é "esta máquina não respondeu desta vez".
+- name: "[inventory_collect] Record failed RPM workload observation"
+  ansible.builtin.set_fact:
+    inventory_collect_manual_packages_status: unavailable
+    inventory_collect_manual_packages_reason: manual_package_observation_failed
+  when:
+    - (ansible_facts.os_family | default('')) == 'RedHat'
+    - >-
+      (inventory_collect_dnf_manual is not defined)
+      or (inventory_collect_dnf_manual.skipped | default(false))
+      or ((inventory_collect_dnf_manual.rc | default(1)) != 0)
+  tags: [inventory_collect, collect]
+
+# Evidência de workload no SUSE. ``zypper packages --installed-only`` marca com
+# ``i+`` o que foi instalado EXPLICITAMENTE e com ``i`` o que entrou como
+# dependência — é o análogo do ``apt-mark showmanual`` e do ``dnf repoquery
+# --userinstalled``, e é consulta pura ao banco local. Medido na AMI oficial do
+# SLES 15.7: 94 explícitos de 429 instalados.
+#
+# Sem subscription o zypper ainda lê o que está instalado; o que ele não faz é
+# resolver repositório — por isso esta evidência não depende de registro.
+- name: "[inventory_collect] Observe explicitly installed zypper packages (read-only)"
+  ansible.builtin.shell:
+    cmd: >-
+      zypper --non-interactive --quiet packages --installed-only
+      | awk -F'|' '$1 ~ /i\+/ { gsub(/ /, "", $3); if ($3 != "") print $3 }'
+  args:
+    executable: /bin/bash
+  register: inventory_collect_zypper_manual
+  changed_when: false
+  failed_when: false
+  when: (ansible_facts.os_family | default('')) == 'Suse'
+  tags: [inventory_collect, collect]
+
+- name: "[inventory_collect] Normalize successful SUSE workload evidence"
+  ansible.builtin.set_fact:
+    inventory_collect_manual_packages: >-
+      {{ inventory_collect_zypper_manual.stdout_lines
+         | default([])
+         | map('trim')
+         | select('!=', '')
+         | list | unique | sort }}
+    inventory_collect_manual_packages_status: ready
+    inventory_collect_manual_packages_reason: ""
+  when:
+    - inventory_collect_zypper_manual is defined
+    - not (inventory_collect_zypper_manual.skipped | default(false))
+    - (inventory_collect_zypper_manual.rc | default(1)) == 0
+  tags: [inventory_collect, collect]
+
+- name: "[inventory_collect] Mark SUSE workload evidence as unavailable on failure"
+  ansible.builtin.set_fact:
+    inventory_collect_manual_packages_status: unavailable
+    inventory_collect_manual_packages_reason: manual_package_observation_failed
+  when:
+    - inventory_collect_zypper_manual is defined
+    - not (inventory_collect_zypper_manual.skipped | default(false))
+    - (inventory_collect_zypper_manual.rc | default(1)) != 0
+  tags: [inventory_collect, collect]
+

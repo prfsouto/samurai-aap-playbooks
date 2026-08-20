@@ -1,0 +1,154 @@
+---
+# Braço WINDOWS da coleta (RFC-004 Camada 1, OSA #2809 — fundação Windows).
+# Mesmo contrato de saída do braço Linux, produzido pelos meios da plataforma:
+# módulos Python não executam via SSH+PowerShell, então tudo aqui é
+# ``ansible.windows.win_shell`` em consulta pura — Machine A nunca é mutada.
+#
+# O que cada evidência significa aqui:
+# * pacotes: as entradas de Uninstall do registry (64 e 32 bit) — o banco de
+#   "programas instalados" da plataforma; ``source`` marca a origem.
+# * workload roots: os Windows Features INSTALADOS (Get-WindowsFeature) — o
+#   análogo do ``apt-mark showmanual``/``dnf repoquery --userinstalled``: o
+#   que um humano pediu por nome (Web-Server/IIS aparece aqui).
+# * funcional: o estado dos serviços automáticos — o análogo do
+#   ``systemctl is-system-running``; a evidência LITERAL viaja junto do
+#   veredito classificado, como no braço Linux.
+
+- name: "[inventory_collect] Enumerate installed packages via the registry (read-only)"
+  # O Windows Server 2022 entrega **PowerShell 5.1** (medido: powershell_version
+  # 5 na coleta 208). O `-AsArray` do ConvertTo-Json só existe do PowerShell 6
+  # em diante — com ele a task voltava rc=1 e a coleta publicava ZERO pacotes.
+  # A forma abaixo é a idiomática do 5.1: força a coleção com @(), e trata o
+  # caso de um único item (que o ConvertTo-Json desembrulharia em objeto).
+  ansible.windows.win_shell: |
+    $paths = @(
+      'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+      'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+    $items = @(
+      Get-ItemProperty -Path $paths -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayName } |
+        ForEach-Object {
+          [pscustomobject]@{
+            name    = $_.DisplayName
+            version = [string]$_.DisplayVersion
+            arch    = if ($_.PSPath -like '*WOW6432Node*') { 'x86' } else { 'amd64' }
+            source  = 'windows_registry'
+          }
+        }
+    )
+    if ($items.Count -eq 0) {
+      '[]'
+    } elseif ($items.Count -eq 1) {
+      '[' + ($items[0] | ConvertTo-Json -Compress) + ']'
+    } else {
+      $items | ConvertTo-Json -Compress
+    }
+  register: inventory_collect_win_packages
+  changed_when: false
+  failed_when: false
+  tags: [inventory_collect, collect]
+
+- name: "[inventory_collect] Publish the registry inventory as package facts"
+  ansible.builtin.set_fact:
+    # O MESMO formato que ``package_facts`` publica no Linux ({nome:
+    # [entradas...]}) — coleta, ETL e OBOM continuam lendo um contrato só.
+    ansible_facts: >-
+      {{ ansible_facts | combine({'packages': _iic_win_packages}) }}
+    inventory_collect_package_source: windows_registry
+    inventory_collect_package_status: ready
+    inventory_collect_package_reason: ""
+  vars:
+    _iic_win_entries: "{{ inventory_collect_win_packages.stdout | default('[]') | from_json }}"
+    _iic_win_packages: "{{ dict(_iic_win_entries | groupby('name')) }}"
+  when: (inventory_collect_win_packages.rc | default(1)) == 0
+  tags: [inventory_collect, collect]
+
+- name: "[inventory_collect] Record failed Windows package observation"
+  # Observação que falhou é ESTADO DECLARADO, nunca inventário vazio: um mapa
+  # de pacotes {} publicado como se fosse leitura boa faz "não consegui ver"
+  # parecer "não tem nada instalado" — e o ciclo seguinte compara contra o
+  # nada. Mesma postura dos braços apt/dnf/zypper para workload evidence.
+  ansible.builtin.set_fact:
+    inventory_collect_package_source: windows_registry
+    inventory_collect_package_status: unavailable
+    inventory_collect_package_reason: package_observation_failed
+  when: (inventory_collect_win_packages.rc | default(1)) != 0
+  tags: [inventory_collect, collect]
+
+- name: "[inventory_collect] Observe installed Windows Features (workload roots, read-only)"
+  ansible.windows.win_shell: |
+    Get-WindowsFeature | Where-Object Installed |
+      Select-Object -ExpandProperty Name | Sort-Object
+  register: inventory_collect_win_features
+  changed_when: false
+  failed_when: false
+  tags: [inventory_collect, collect]
+
+- name: "[inventory_collect] Normalize successful Windows workload evidence"
+  ansible.builtin.set_fact:
+    inventory_collect_manual_packages: >-
+      {{ inventory_collect_win_features.stdout_lines
+         | default([])
+         | map('trim')
+         | reject('equalto', '')
+         | list | unique | sort }}
+    inventory_collect_manual_packages_status: ready
+    inventory_collect_manual_packages_reason: ""
+    # O que esta maquina SERVE e o que esta INSTALADO nela sao dois universos
+    # distintos nesta plataforma: as roles/features vem do catalogo da propria
+    # release, e os programas vem do registro de Uninstall. Declarar o universo
+    # aqui e' o que impede o ETL de exigir que um esteja contido no outro.
+    inventory_collect_manual_packages_kind: platform-feature-catalog
+  when:
+    - inventory_collect_win_features is defined
+    - (inventory_collect_win_features.rc | default(1)) == 0
+  tags: [inventory_collect, collect]
+
+- name: "[inventory_collect] Record failed Windows workload observation"
+  ansible.builtin.set_fact:
+    inventory_collect_manual_packages_status: unavailable
+    inventory_collect_manual_packages_reason: manual_package_observation_failed
+  when:
+    - inventory_collect_win_features is defined
+    - (inventory_collect_win_features.rc | default(1)) != 0
+  tags: [inventory_collect, collect]
+
+- name: "[inventory_collect] Observe automatic services health (read-only)"
+  ansible.windows.win_shell: |
+    $stopped = Get-Service | Where-Object {
+      $_.StartType -eq 'Automatic' -and $_.Status -ne 'Running'
+    } | Select-Object -ExpandProperty Name
+    if ($stopped) { $stopped -join ',' } else { 'running' }
+  register: inventory_collect_win_services
+  changed_when: false
+  failed_when: false
+  tags: [inventory_collect, collect, functional]
+
+- name: "[inventory_collect] Record functional observations (Windows)"
+  ansible.builtin.set_fact:
+    inventory_collect_functional:
+      # Chegar até aqui pela conexão da máquina prova a conversa SSH usada
+      # por esta coleta — o OpenSSH nativo do Windows Server.
+      ssh_ok: true
+      # cloud-init não existe na plataforma: evidência indisponível declarada,
+      # nunca um falso "ok" (o playbook de validação só cobra as capabilities
+      # que a policy da plataforma declarar).
+      cloud_init_ok: false
+      # A evidência LITERAL (quais serviços automáticos não rodam) e a
+      # CLASSIFICAÇÃO em vocabulário de domínio — o mesmo par do braço Linux.
+      systemd_state: >-
+        {{ ((inventory_collect_win_services.stdout | default('') | trim) or 'unknown')
+           if (inventory_collect_win_services.rc | default(1)) == 0
+           else 'not_observed' }}
+      systemd_health: >-
+        {{ ('healthy'
+            if (inventory_collect_win_services.stdout | default('') | trim) == 'running'
+            else 'degraded')
+           if (inventory_collect_win_services.rc | default(1)) == 0
+           else 'not_observed' }}
+      systemd_no_degraded: >-
+        {{ (inventory_collect_win_services.stdout | default('') | trim) == 'running'
+           if (inventory_collect_win_services.rc | default(1)) == 0
+           else false }}
+  tags: [inventory_collect, collect, functional]

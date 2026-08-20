@@ -508,6 +508,29 @@
     build_finished_at: "{{ now(utc=True).isoformat() }}"
   tags: [image_build]
 
+# O NOME do arquivo é da família: POSIX exporta .tar.gz (tar + gzip), o
+# Windows exporta .zip (Compress-Archive — não há tar nem /tmp lá). O que o
+# contrato garante é o mesmo nos dois: UM arquivo chamado sbom-source.<ext>
+# dentro do diretório de export desta execução. Fixar a extensão aqui
+# recusaria a família Windows depois de um build caro já ter rodado.
+- name: "[image_build] Discover the SBOM source archive exported by Packer"
+  when: image_build_provider == 'packer'
+  ansible.builtin.find:
+    paths: "{{ image_build_sbom_export_dir }}"
+    patterns: "sbom-source.*"
+    file_type: file
+  register: image_build_sbom_archive_found
+  changed_when: false
+  tags: [image_build, sbom]
+
+- name: "[image_build] Bind the discovered archive as the SBOM source"
+  when:
+    - image_build_provider == 'packer'
+    - (image_build_sbom_archive_found.files | default([])) | length > 0
+  ansible.builtin.set_fact:
+    image_build_sbom_archive_path: "{{ (image_build_sbom_archive_found.files | sort(attribute='path'))[0].path }}"
+  tags: [image_build, sbom]
+
 - name: "[image_build] Confirm the SBOM source archive exported by Packer"
   when: image_build_provider == 'packer'
   ansible.builtin.stat:
@@ -544,9 +567,10 @@
     src: "{{ image_build_sbom_archive_path }}"
     dest: "{{ image_build_sbom_rootfs_dir }}"
     remote_src: true
-    extra_opts:
-      - "--no-same-owner"
-      - "--no-same-permissions"
+    # ``--no-same-owner``/``--no-same-permissions`` são opções do TAR; passá-las
+    # para um .zip faz o unarchive falhar. A extração continua idêntica onde a
+    # família exporta tar.
+    extra_opts: "{{ ['--no-same-owner', '--no-same-permissions'] if image_build_sbom_archive_path.endswith('.tar.gz') else omit }}"
   tags: [image_build, sbom]
 
 - name: "[image_build] Select the extracted rootfs for SBOM scanning"
