@@ -1,0 +1,7 @@
+---
+galaxy_info:
+  author: SamurAI Shield
+  description: Cria e monitora um k8s Job Terraform disparado pelo Cloud Executor
+  min_ansible_version: "2.15"
+  license: proprietary
+dependencies: []

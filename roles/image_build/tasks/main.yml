@@ -1,0 +1,999 @@
+---
+# ============================================================================
+# Role: image_build
+# Purpose: build a golden image via Packer (Fase 1 — Image Factory,
+# RFC-004 §17.1) and publish the MANDATORY evidence envelope
+# `samurai.image_build_evidence/v1` (plano L2I §10) for
+# image_registration_service to validate before it ever registers an
+# ImageVersion(status=draft). Never mutates a managed server (I2 does not
+# apply — nothing here touches an existing ManagedServer) and NEVER receives
+# a cloud credential via extra_vars — packer, the DescribeImages proof and
+# the evidence upload all inherit the AAP job template's own credential
+# injection (I10).
+#
+# Evidence is not best-effort anymore: for a real (provider=packer) build,
+# SBOM/CVE-scan tools exiting non-zero (or missing) FAIL the job, the AMI is
+# independently confirmed via `aws ec2 describe-images` (state available,
+# expected owner, region, execution tags), and log/SBOM/scan/describe proofs
+# are uploaded to an org-scoped S3 prefix with explicit SSE-KMS headers
+# (issue #1711: the bucket policy denies any unencrypted PutObject).
+#
+# Idempotent: re-running the same samurai_execution_id reuses the same
+# artifact directory/S3 prefix and overwrites them with the latest build's
+# outputs; the control plane resolves the same draft for the same run.
+# ============================================================================
+
+- name: "[image_build] Display incoming payload"
+  ansible.builtin.debug:
+    msg:
+      execution_id: "{{ samurai_execution_id | default('unknown') }}"
+      organization_id: "{{ image_build_organization_id }}"
+      family: "{{ image_build_family }}"
+      base_image: "{{ image_build_base_image }}"
+      template_path: "{{ image_build_template_path }}"
+      provider: "{{ image_build_provider }}"
+      proposal_transport: "{{ (image_build_artifact_read_urls | length > 0) | ternary('presigned', 'repo') }}"
+      evidence_destination: "s3://{{ image_build_evidence_s3_bucket }}/{{ image_build_evidence_s3_prefix }}"
+  tags: [image_build, debug]
+
+- name: "[image_build] Validate required inputs are present"
+  ansible.builtin.assert:
+    that:
+      - samurai_execution_id | default('') | length > 0
+      - image_build_organization_id | string | length > 0
+      - image_build_template_path | length > 0
+      - image_build_family | length > 0
+      - image_build_base_image | length > 0
+      - image_build_provider in ['packer', 'stub']
+    fail_msg: >-
+      image_build requires samurai_execution_id, organization_id,
+      image_build.template_path, image_build.family and
+      image_build.base_image, and image_build_provider must be 'packer' or
+      'stub' (got template_path={{ image_build_template_path }},
+      family={{ image_build_family }}, base_image={{ image_build_base_image }},
+      provider={{ image_build_provider }}).
+  tags: [image_build]
+
+# Real builds carry the FULL v1 evidence contract — refuse up front when the
+# launch cannot possibly satisfy it, instead of failing halfway through a
+# paid Packer build. (fail+when rather than assert: these gates apply only
+# to provider=packer; the stub keeps the offline harness runnable.)
+- name: "[image_build] Refuse a real build without an SBOM scan target (v1 evidence is mandatory)"
+  ansible.builtin.fail:
+    msg: >-
+      image_build.sbom_scan_target is required for a real build since the
+      samurai.image_build_evidence/v1 contract — without a locally-scannable
+      source there is no SBOM/CVE evidence and the run would be reproved at
+      registration. See ansible/README.md #image_build.
+  when:
+    - image_build_provider == 'packer'
+    - image_build_sbom_scan_target | length == 0
+  tags: [image_build]
+
+- name: "[image_build] Refuse a real build without an evidence destination (bucket/prefix/KMS)"
+  ansible.builtin.fail:
+    msg: >-
+      image_build.evidence_s3_bucket, image_build.evidence_s3_prefix and
+      image_build.evidence_kms_key_id are required for a real build — the v1
+      contract stores every evidence artifact in S3 (SSE-KMS) and publishes
+      its URI + sha256. The control plane injects these at launch
+      (AAPProvider._image_build_evidence_destination).
+  when:
+    - image_build_provider == 'packer'
+    - (image_build_evidence_s3_bucket | length == 0)
+      or (image_build_evidence_s3_prefix | length == 0)
+      or (image_build_evidence_kms_key_id | length == 0)
+  tags: [image_build]
+
+- name: "[image_build] Resolve artifact directory for this execution"
+  ansible.builtin.set_fact:
+    image_build_run_dir: "{{ image_build_artifact_dir }}/{{ samurai_execution_id }}"
+  tags: [image_build]
+
+# 0700, not 0755: this tree holds the build log, the SBOM, the CVE scan and the
+# APPROVED recipe, and its default base is `/tmp` (mode 1777, shared with every
+# local user). The sticky bit only stops OTHERS from removing the directory —
+# it does nothing against reading it. On an execution node that is not
+# containerized, 0755 would publish the whole evidence set to any local user.
+# Within a run this costs nothing — everything executes as one UID
+# (`hosts: localhost`, no `become`), so the S3 upload tasks of the same play
+# re-read these files as the same user. ACROSS runs it is not free: ansible
+# applies the mode to the parents it creates as well, so a second UID on a
+# shared bare node cannot create its own run dir under the same base (layout
+# trade-off registered in issue #2028).
+- name: "[image_build] Ensure artifact directory exists"
+  ansible.builtin.file:
+    path: "{{ image_build_run_dir }}"
+    state: directory
+    mode: "0700"
+  tags: [image_build]
+
+- name: "[image_build] Define the Execution Environment SBOM export directory"
+  ansible.builtin.set_fact:
+    image_build_sbom_export_dir: "{{ image_build_run_dir }}/sbom-export"
+    image_build_sbom_archive_path: "{{ image_build_run_dir }}/sbom-export/sbom-source.tar.gz"
+    image_build_sbom_rootfs_dir: "{{ image_build_run_dir }}/sbom-export/rootfs"
+  tags: [image_build, evidence]
+
+- name: "[image_build] Reset the Execution Environment SBOM export directory for this run"
+  when: image_build_provider == 'packer'
+  ansible.builtin.file:
+    path: "{{ image_build_sbom_export_dir }}"
+    state: absent
+  tags: [image_build, evidence]
+
+- name: "[image_build] Create the Execution Environment SBOM export directory"
+  ansible.builtin.file:
+    path: "{{ image_build_sbom_export_dir }}"
+    state: directory
+    mode: "0700"
+  tags: [image_build, evidence]
+
+- name: "[image_build] Select the locally scannable SBOM target"
+  ansible.builtin.set_fact:
+    image_build_effective_sbom_scan_target: >-
+      {{ ('dir:' ~ image_build_sbom_export_dir)
+         if image_build_provider == 'packer'
+         else image_build_sbom_scan_target }}
+  tags: [image_build, evidence]
+
+- name: "[image_build] Record build start timestamp (UTC)"
+  ansible.builtin.set_fact:
+    build_started_at: "{{ now(utc=True).isoformat() }}"
+  tags: [image_build]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Template resolution — two sources:
+#  a) approved proposal (plano L2I §9): the control plane sent presigned READ
+#     URLs; download the exact approved bytes and verify the combined sha256
+#     against the frozen proposal_artifact_sha256 BEFORE building anything.
+#  b) repo template (family-based): resolve relative paths at the repo root.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: "[image_build] Fetch and verify the APPROVED recipe artifacts"
+  when: image_build_artifact_read_urls | length > 0
+  tags: [image_build, proposal]
+  block:
+    - name: "[image_build] Require the frozen approved hash alongside the read URLs"
+      ansible.builtin.fail:
+        msg: >-
+          image_build.artifact_read_urls was provided without
+          image_build.proposal_artifact_sha256 — the downloaded recipe cannot
+          be verified against the approved snapshot, so the build is refused.
+      when: image_build_proposal_artifact_sha256 | length == 0
+
+    - name: "[image_build] Download the approved recipe artifacts (presigned READ)"
+      ansible.builtin.get_url:
+        url: "{{ image_build_artifact_read_urls[item.short] }}"
+        dest: "{{ image_build_run_dir }}/{{ item.filename }}"
+        mode: "0644"
+        force: true
+      loop:
+        - { short: "template", filename: "template.pkr.hcl" }
+        - { short: "playbook", filename: "playbook.yml" }
+        - { short: "variables", filename: "variables.json" }
+      loop_control:
+        label: "{{ item.filename }}"
+      # The presigned URL embeds a signature — never log it.
+      no_log: true
+
+    - name: "[image_build] Recompute the combined recipe sha256 (template \\x00 playbook \\x00 variables)"
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import hashlib, sys
+            parts = [open(p, "rb").read() for p in sys.argv[1:4]]
+            print(hashlib.sha256(b"\x00".join(parts)).hexdigest())
+          - "{{ image_build_run_dir }}/template.pkr.hcl"
+          - "{{ image_build_run_dir }}/playbook.yml"
+          - "{{ image_build_run_dir }}/variables.json"
+      register: image_build_recipe_hash
+      changed_when: false
+
+    - name: "[image_build] Refuse to build when the downloaded recipe does not hash to the approved snapshot"
+      ansible.builtin.assert:
+        that:
+          - image_build_recipe_hash.stdout | trim == image_build_proposal_artifact_sha256
+        fail_msg: >-
+          Downloaded recipe hash {{ image_build_recipe_hash.stdout | trim }}
+          does not match the approved proposal_artifact_sha256 — the artifacts
+          changed after approval; refusing to build an unapproved
+          specification (plano L2I: "execução não relê um artefato mutável
+          sem conferir o hash aprovado").
+
+    - name: "[image_build] Use the downloaded approved template as the build source"
+      ansible.builtin.set_fact:
+        image_build_resolved_template_path: "{{ image_build_run_dir }}/template.pkr.hcl"
+
+- name: "[image_build] Resolve template path (relative paths anchor at the repo root)"
+  when: image_build_artifact_read_urls | length == 0
+  ansible.builtin.set_fact:
+    # `playbook_dir` is ansible-core's own magic variable for "the directory
+    # of the top-level playbook being run" — deterministic regardless of the
+    # shell cwd at invocation (validated empirically: local-connection module
+    # execution does NOT inherit the caller's cwd). playbooks/image_build.yml
+    # lives at ansible/playbooks/, so two levels up is the repo root, where
+    # packer/ (owned separately, Fase 1) sits as a sibling of ansible/.
+    image_build_resolved_template_path: >-
+      {{ image_build_template_path
+         if image_build_template_path.startswith('/')
+         else (playbook_dir ~ '/../../' ~ image_build_template_path) }}
+  tags: [image_build, hash]
+
+- name: "[image_build] Confirm packer template exists"
+  ansible.builtin.stat:
+    path: "{{ image_build_resolved_template_path }}"
+    checksum_algorithm: sha256
+  register: image_build_template_stat
+  tags: [image_build, hash]
+
+- name: "[image_build] Fail loud when the template path does not resolve"
+  ansible.builtin.assert:
+    that:
+      - image_build_template_stat.stat.exists
+    fail_msg: >-
+      Packer template not found at '{{ image_build_resolved_template_path }}'
+      (from image_build.template_path='{{ image_build_template_path }}').
+      Relative paths resolve against the repo root (two levels above
+      ansible/playbooks/) — pass an absolute path instead if the AAP
+      Project checkout layout differs. See ansible/README.md #image_build.
+  tags: [image_build, hash]
+
+- name: "[image_build] Record template hash (sha256) and base image"
+  ansible.builtin.set_fact:
+    template_hash: "{{ image_build_template_stat.stat.checksum }}"
+    base_image: "{{ image_build_base_image }}"
+  tags: [image_build, hash]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Build — real packer invocation, or a synthetic stub for local/CI testing.
+# Mirrors provision_cloud_provider: stub in the provision role.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: "[image_build] Stub build — synthetic image_ref, packer is not invoked"
+  when: image_build_provider == 'stub'
+  ansible.builtin.set_fact:
+    image_ref: "stub-image-{{ samurai_execution_id }}"
+    image_build_region: "stub-region"
+    build_log_url: "stub build — packer was not invoked (image_build_provider=stub)"
+  tags: [image_build, stub]
+
+- name: "[image_build] Real build via packer"
+  when: image_build_provider == 'packer'
+  block:
+    - name: "[image_build] Confirm the packer binary is available"
+      ansible.builtin.command:
+        argv: ["{{ image_build_packer_binary }}", "version"]
+      register: image_build_packer_version
+      failed_when: false
+      changed_when: false
+      tags: [image_build, build]
+
+    - name: "[image_build] Fail loud when packer is missing"
+      ansible.builtin.assert:
+        that:
+          - image_build_packer_version.rc == 0
+        fail_msg: >-
+          '{{ image_build_packer_binary }}' was not found on the execution
+          node PATH. image_build cannot proceed without it — the build step
+          is never best-effort.
+      tags: [image_build, build]
+
+    - name: "[image_build] Fail loud when packer version output is not HashiCorp Packer"
+      ansible.builtin.assert:
+        that:
+          - image_build_packer_version.stdout is search('(?m)^Packer v[0-9]+\.[0-9]+\.[0-9]+')
+        fail_msg: >-
+          '{{ image_build_packer_binary }} version' exited 0 but did not return
+          the expected HashiCorp Packer signature ('Packer v<semver>'). Refusing
+          before packer init/build; stdout was:
+          {{ image_build_packer_version.stdout | default('') | trim }}.
+      tags: [image_build, build]
+
+    - name: "[image_build] Build the -var argument list from image_build.packer_vars"
+      ansible.builtin.set_fact:
+        image_build_var_args: "{{ image_build_var_args | default([]) + ['-var', item.key ~ '=' ~ item.value] }}"
+      loop: "{{ image_build_packer_vars | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      tags: [image_build, build]
+
+    # Execution identity ALWAYS reaches Packer as variables so the template
+    # tags the AMI with them (SamuraiExecutionId / SamuraiOrganizationId) —
+    # DescribeImages verifies those tags below. Every SamurAI Image Factory
+    # template MUST declare both variables (packer/README.md contract);
+    # packer fails loudly on an undeclared -var, which is the honest outcome
+    # for a template outside the contract.
+    - name: "[image_build] Append execution identity and SBOM transport vars"
+      ansible.builtin.set_fact:
+        image_build_var_args: >-
+          {{ (image_build_var_args | default([]))
+             + ['-var', 'samurai_execution_id=' ~ samurai_execution_id,
+                '-var', 'organization_id=' ~ (image_build_organization_id | string),
+                '-var', 'sbom_scan_target=' ~ image_build_sbom_scan_target,
+                '-var', 'sbom_export_dir=' ~ image_build_sbom_export_dir] }}
+      tags: [image_build, build]
+
+    - name: "[image_build] packer init (plugin install, idempotent)"
+      ansible.builtin.command:
+        argv: ["{{ image_build_packer_binary }}", "init", "{{ image_build_resolved_template_path }}"]
+      register: image_build_packer_init
+      failed_when: false
+      changed_when: false
+      tags: [image_build, build]
+
+    - name: "[image_build] Mark packer init failure for durable log upload"
+      ansible.builtin.set_fact:
+        image_build_failure_stage: packer_init
+        image_build_failure_message: "packer init exited {{ image_build_packer_init.rc }} before the build."
+      when: image_build_packer_init.rc != 0
+      tags: [image_build, build]
+
+    - name: "[image_build] packer validate (same vars as build)"
+      ansible.builtin.command:
+        argv: >-
+          {{ [image_build_packer_binary, 'validate'] + (image_build_var_args | default([])) + [image_build_resolved_template_path] }}
+      register: image_build_packer_validate
+      failed_when: false
+      changed_when: false
+      when: image_build_failure_stage is not defined
+      tags: [image_build, build]
+
+    - name: "[image_build] Mark packer validate failure for durable log upload"
+      ansible.builtin.set_fact:
+        image_build_failure_stage: packer_validate
+        image_build_failure_message: >-
+          packer validate exited {{ image_build_packer_validate.rc }} before the
+          build. The template/vars contract is invalid.
+      when:
+        - image_build_failure_stage is not defined
+        - image_build_packer_validate.rc != 0
+      tags: [image_build, build]
+
+    - name: "[image_build] packer build (machine-readable output)"
+      ansible.builtin.command:
+        argv: >-
+          {{ [image_build_packer_binary, 'build', '-color=false', '-machine-readable']
+             + (image_build_var_args | default([]))
+             + [image_build_resolved_template_path] }}
+      register: image_build_run
+      # Do NOT abort on a non-zero exit here: the build log is mandatory
+      # evidence (RFC-004 §17.1) and must be persisted EVEN when the build
+      # fails — that is exactly the case where it matters most. Capture the
+      # result, write the log to disk, and only THEN fail loud (assert below).
+      failed_when: false
+      changed_when: true
+      when: image_build_failure_stage is not defined
+      tags: [image_build, build]
+
+    - name: "[image_build] Persist the full build log to disk (success OR failure)"
+      ansible.builtin.copy:
+        dest: "{{ image_build_run_dir }}/build.log"
+        content: |
+          [packer init stdout]
+          {{ image_build_packer_init.stdout | default('') }}
+          [packer init stderr]
+          {{ image_build_packer_init.stderr | default('') }}
+          [packer validate stdout]
+          {{ image_build_packer_validate.stdout | default('') }}
+          [packer validate stderr]
+          {{ image_build_packer_validate.stderr | default('') }}
+          [packer build stdout]
+          {{ image_build_run.stdout | default('') }}
+          [packer build stderr]
+          {{ image_build_run.stderr | default('') }}
+        mode: "0644"
+      tags: [image_build, build]
+
+    - name: "[image_build] Mark packer build failure for durable log upload"
+      ansible.builtin.set_fact:
+        image_build_failure_stage: packer_build
+        image_build_failure_message: >-
+          packer build exited {{ image_build_run.rc }}. The full log was
+          persisted to {{ image_build_run_dir }}/build.log before this
+          failure — inspect it for the cause.
+      when:
+        - image_build_failure_stage is not defined
+        - image_build_run.rc != 0
+      tags: [image_build, build]
+
+    - name: "[image_build] Extract the artifact id(s) from packer's machine-readable output"
+      ansible.builtin.set_fact:
+        image_build_artifact_ids: "{{ image_build_run.stdout | regex_findall('(?m)^[0-9]+,[^,]*,artifact,[0-9]+,id,(.*)$') }}"
+      when: image_build_failure_stage is not defined
+      tags: [image_build, build]
+
+    - name: "[image_build] Default artifact id list after an earlier packer failure"
+      ansible.builtin.set_fact:
+        image_build_artifact_ids: []
+      when: image_build_failure_stage is defined
+      tags: [image_build, build]
+
+    - name: "[image_build] Mark artifact parsing failure when packer produced no artifact id"
+      ansible.builtin.set_fact:
+        image_build_failure_stage: artifact_parse
+        image_build_failure_message: >-
+          packer build finished with no 'artifact ... id' line in its
+          machine-readable output — cannot determine image_ref. See
+          {{ image_build_run_dir }}/build.log.
+      when:
+        - image_build_failure_stage is not defined
+        - image_build_artifact_ids | length == 0
+      tags: [image_build, build]
+
+    # The amazon-ebs artifact id is `<region>:<ami-id>` (comma-separated when
+    # the template copies to multiple regions — the FIRST entry is the build
+    # region). Split it so the envelope carries the bare AMI id + its region
+    # separately, exactly what DescribeImages and the control plane validate.
+    - name: "[image_build] Split the artifact id into region and image_ref"
+      ansible.builtin.set_fact:
+        image_build_primary_artifact: "{{ (image_build_artifact_ids | last).split(',') | first }}"
+      when: image_build_failure_stage is not defined
+      tags: [image_build, build]
+
+    - name: "[image_build] Split primary artifact fields"
+      ansible.builtin.set_fact:
+        image_build_primary_artifact_region: "{{ image_build_primary_artifact.split(':') | first if ':' in image_build_primary_artifact else '' }}"
+        image_build_primary_artifact_image_ref: "{{ image_build_primary_artifact.split(':') | last if ':' in image_build_primary_artifact else '' }}"
+      when: image_build_failure_stage is not defined
+      tags: [image_build, build]
+
+    - name: "[image_build] Mark artifact parsing failure when artifact id shape is invalid"
+      ansible.builtin.set_fact:
+        image_build_failure_stage: artifact_parse
+        image_build_failure_message: >-
+          packer artifact id '{{ image_build_primary_artifact }}' is not in
+          the '<region>:<ami-id>' shape the amazon-ebs builder emits — cannot
+          determine the AMI region and bare image_ref for the v1 evidence
+          contract.
+      when: >-
+        image_build_failure_stage is not defined
+        and (
+          (image_build_primary_artifact_region | length == 0)
+          or not (image_build_primary_artifact_image_ref is match('^ami-[0-9a-f]{8,}$'))
+        )
+      tags: [image_build, build]
+
+    - name: "[image_build] Upload build.log after packer/parsing failure"
+      ansible.builtin.command:
+        argv:
+          - "{{ image_build_aws_cli_binary }}"
+          - s3api
+          - put-object
+          - --bucket
+          - "{{ image_build_evidence_s3_bucket }}"
+          - --key
+          - "{{ image_build_evidence_s3_prefix }}/build.log"
+          - --body
+          - "{{ image_build_run_dir }}/build.log"
+          - --server-side-encryption
+          - "aws:kms"
+          - --ssekms-key-id
+          - "{{ image_build_evidence_kms_key_id }}"
+          - --content-type
+          - text/plain
+      register: image_build_failure_log_upload
+      failed_when: false
+      when: (image_build_failure_stage | default('')) in ['packer_init', 'packer_validate', 'packer_build', 'artifact_parse']
+      changed_when: (image_build_failure_log_upload.rc | default(1)) == 0
+      tags: [image_build, build, evidence]
+
+    - name: "[image_build] Fail loud after packer/parsing failure and log upload attempt"
+      ansible.builtin.fail:
+        msg: >-
+          {{ image_build_failure_message }}
+          {% if (image_build_failure_log_upload.rc | default(1)) == 0 -%}
+          build.log was uploaded to
+          s3://{{ image_build_evidence_s3_bucket }}/{{ image_build_evidence_s3_prefix }}/build.log.
+          {%- else -%}
+          build.log upload also failed (rc={{ image_build_failure_log_upload.rc | default('not-run') }}):
+          {{ image_build_failure_log_upload.stderr | default('') | trim }}
+          {%- endif %}
+      when: image_build_failure_stage is defined
+      tags: [image_build, build]
+
+    - name: "[image_build] Record image_ref, region and build_log_url"
+      ansible.builtin.set_fact:
+        image_ref: "{{ image_build_primary_artifact_image_ref }}"
+        image_build_region: "{{ image_build_primary_artifact_region }}"
+        # Tail of stdout+stderr combined, matching what is written to
+        # build.log on disk (stdout then stderr) — so the excerpt and the
+        # persisted file agree, and a failure's stderr shows up here too.
+        build_log_url: "{{ ((image_build_run.stdout_lines | default([])) + (image_build_run.stderr_lines | default([])))[-(image_build_log_tail_lines | int):] | join('\n') }}"
+      tags: [image_build, build]
+  tags: [image_build, build]
+
+- name: "[image_build] Record build finish timestamp (UTC)"
+  ansible.builtin.set_fact:
+    build_finished_at: "{{ now(utc=True).isoformat() }}"
+  tags: [image_build]
+
+- name: "[image_build] Confirm the SBOM source archive exported by Packer"
+  when: image_build_provider == 'packer'
+  ansible.builtin.stat:
+    path: "{{ image_build_sbom_archive_path }}"
+  register: image_build_sbom_archive_stat
+  changed_when: false
+  tags: [image_build, sbom]
+
+- name: "[image_build] Refuse when Packer exported no SBOM source archive"
+  when: image_build_provider == 'packer'
+  ansible.builtin.assert:
+    that:
+      - image_build_sbom_archive_stat.stat.exists
+      - image_build_sbom_archive_stat.stat.size | int > 0
+    fail_msg: >-
+      SBOM source archive is empty or absent: Packer did not download
+      image_build.sbom_scan_target={{ image_build_sbom_scan_target }} into
+      {{ image_build_sbom_archive_path }}. Refusing before extraction,
+      Syft/Grype because the v1 evidence contract requires SBOM/CVE evidence
+      over exported Execution Environment content, not an empty directory.
+  tags: [image_build, sbom]
+
+- name: "[image_build] Create the extracted SBOM source directory"
+  when: image_build_provider == 'packer'
+  ansible.builtin.file:
+    path: "{{ image_build_sbom_rootfs_dir }}"
+    state: directory
+    mode: "0700"
+  tags: [image_build, sbom]
+
+- name: "[image_build] Extract the SBOM source archive"
+  when: image_build_provider == 'packer'
+  ansible.builtin.unarchive:
+    src: "{{ image_build_sbom_archive_path }}"
+    dest: "{{ image_build_sbom_rootfs_dir }}"
+    remote_src: true
+    extra_opts:
+      - "--no-same-owner"
+      - "--no-same-permissions"
+  tags: [image_build, sbom]
+
+- name: "[image_build] Select the extracted rootfs for SBOM scanning"
+  when: image_build_provider == 'packer'
+  ansible.builtin.set_fact:
+    image_build_effective_sbom_scan_target: "dir:{{ image_build_sbom_rootfs_dir }}"
+  tags: [image_build, sbom]
+
+- name: "[image_build] Inspect extracted content for SBOM scanning"
+  when: image_build_provider == 'packer'
+  ansible.builtin.find:
+    paths: "{{ image_build_sbom_rootfs_dir }}"
+    file_type: any
+    hidden: true
+    recurse: true
+  register: image_build_sbom_export_find
+  changed_when: false
+  tags: [image_build, sbom]
+
+- name: "[image_build] Refuse when extracted SBOM source is empty"
+  when: image_build_provider == 'packer'
+  ansible.builtin.assert:
+    that:
+      - image_build_sbom_export_find.matched | int > 0
+    fail_msg: >-
+      Extracted SBOM source is empty: Packer returned no files in
+      {{ image_build_sbom_rootfs_dir }}. Refusing before Syft/Grype because the
+      v1 evidence contract requires package evidence over the exported tree.
+  tags: [image_build, sbom]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SBOM — MANDATORY evidence via syft (v1 contract). The tool missing from
+# PATH or exiting non-zero FAILS the job for a real build; the old
+# `unavailable` outcome no longer exists on this path. A stub run without a
+# scan target records `status: stub` (which the control plane reproves) so
+# the offline harness stays runnable — a stub WITH a scan target runs the
+# real gate, which is how the harness proves the tool-failure path.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: "[image_build] Record SBOM as stub (no scan target in stub mode)"
+  when: image_build_provider == 'stub' and image_build_sbom_scan_target | length == 0
+  ansible.builtin.set_fact:
+    sbom:
+      status: stub
+      reason: "stub build without a sbom_scan_target — no SBOM evidence produced"
+  tags: [image_build, sbom]
+
+- name: "[image_build] Generate the SBOM"
+  when: image_build_effective_sbom_scan_target | length > 0
+  block:
+    - name: "[image_build] Check for the SBOM tool on PATH"
+      ansible.builtin.command:
+        argv: ["which", "{{ image_build_sbom_binary }}"]
+      register: image_build_sbom_check
+      failed_when: false
+      changed_when: false
+
+    - name: "[image_build] Fail loud when the SBOM tool is missing"
+      ansible.builtin.assert:
+        that:
+          - image_build_sbom_check.rc == 0
+        fail_msg: >-
+          '{{ image_build_sbom_binary }}' was not found on the execution node
+          PATH — the SBOM is mandatory evidence
+          (samurai.image_build_evidence/v1); the job fails instead of
+          publishing 'unavailable'.
+
+    - name: "[image_build] Run the SBOM tool against the declared scan target"
+      ansible.builtin.command:
+        argv:
+          - "{{ image_build_sbom_binary }}"
+          - "scan"
+          - "{{ image_build_effective_sbom_scan_target }}"
+          - "-o"
+          - "cyclonedx-json={{ image_build_run_dir }}/sbom.cyclonedx.json"
+      register: image_build_sbom_run
+      changed_when: true
+      failed_when: false
+
+    - name: "[image_build] Fail loud when the SBOM tool exited non-zero"
+      ansible.builtin.assert:
+        that:
+          - image_build_sbom_run.rc == 0
+        fail_msg: >-
+          {{ image_build_sbom_binary }} exited {{ image_build_sbom_run.rc }}
+          scanning {{ image_build_effective_sbom_scan_target }} — SBOM evidence is
+          mandatory, the job fails instead of publishing 'unavailable'.
+          stderr: {{ image_build_sbom_run.stderr | default('') | trim }}
+
+    - name: "[image_build] Load the generated SBOM"
+      ansible.builtin.set_fact:
+        image_build_sbom_json: "{{ lookup('file', image_build_run_dir + '/sbom.cyclonedx.json') | from_json }}"
+
+    - name: "[image_build] Recompute SBOM component count from persisted JSON"
+      ansible.builtin.set_fact:
+        image_build_sbom_component_count: "{{ image_build_sbom_json.components | default([]) | length | int }}"
+
+    - name: "[image_build] Record SBOM result"
+      ansible.builtin.set_fact:
+        sbom:
+          status: generated
+          format: cyclonedx-json
+          component_count: "{{ image_build_sbom_component_count }}"
+          path: "{{ image_build_run_dir }}/sbom.cyclonedx.json"
+
+    - name: "[image_build] Refuse an empty package inventory"
+      ansible.builtin.assert:
+        that:
+          - image_build_sbom_json.components is sequence
+          - image_build_sbom_json.components is not string
+          - image_build_sbom_json.components is not mapping
+          - image_build_sbom_json.components | length > 0
+        fail_msg: >-
+          Syft produced no package components for
+          {{ image_build_effective_sbom_scan_target }}. A successful Syft exit
+          with an empty inventory is not valid build evidence and must not be
+          passed to Grype or registered as a draft.
+
+    - name: "[image_build] Select plausible package components"
+      ansible.builtin.set_fact:
+        image_build_sbom_package_components: >-
+          {{ image_build_sbom_json.components
+             | selectattr('type', 'in', ['library', 'application', 'framework', 'operating-system'])
+             | list }}
+
+    - name: "[image_build] Require a package component with identity"
+      ansible.builtin.assert:
+        that:
+          - image_build_sbom_package_components | length > 0
+          - (image_build_sbom_package_components | length) == (image_build_sbom_json.components | length)
+        fail_msg: >-
+          Syft produced an invalid package component in
+          {{ image_build_effective_sbom_scan_target }}. Every component must be
+          a plausible package with a usable identity.
+
+    - name: "[image_build] Validate SBOM component identity"
+      ansible.builtin.assert:
+        that:
+          - item is mapping
+          - item.type is string and item.type in ['library', 'application', 'framework', 'operating-system']
+          - item.name is string and (item.name | trim | length > 0)
+          - item.version is string and (item.version | trim | length > 0)
+        fail_msg: >-
+          Syft produced a package component without a usable name/version:
+          {{ item | to_json }}. The SBOM is not valid evidence.
+      loop: "{{ image_build_sbom_package_components }}"
+      loop_control:
+        label: "{{ item.name | default('unnamed') }}"
+  tags: [image_build, sbom]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CVE scan — MANDATORY evidence via grype, consuming the SBOM syft just
+# produced (`grype sbom:<path>`, the documented Anchore pattern). Missing
+# tool or non-zero exit FAILS the job whenever a real SBOM exists.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: "[image_build] Record CVE scan as stub (no SBOM was generated in stub mode)"
+  when: (sbom.status | default('')) != 'generated'
+  ansible.builtin.set_fact:
+    cve_scan:
+      status: stub
+      reason: "no generated SBOM to scan ({{ sbom.reason | default('sbom not generated') }})"
+  tags: [image_build, scan]
+
+- name: "[image_build] Run the CVE scan"
+  when: (sbom.status | default('')) == 'generated'
+  block:
+    - name: "[image_build] Check for the CVE scan tool on PATH"
+      ansible.builtin.command:
+        argv: ["which", "{{ image_build_cve_scan_binary }}"]
+      register: image_build_cve_scan_check
+      failed_when: false
+      changed_when: false
+
+    - name: "[image_build] Fail loud when the CVE scan tool is missing"
+      ansible.builtin.assert:
+        that:
+          - image_build_cve_scan_check.rc == 0
+        fail_msg: >-
+          '{{ image_build_cve_scan_binary }}' was not found on the execution
+          node PATH — the CVE scan is mandatory evidence
+          (samurai.image_build_evidence/v1); the job fails instead of
+          publishing 'unavailable'.
+
+    - name: "[image_build] Scan the SBOM"
+      ansible.builtin.command:
+        argv:
+          - "{{ image_build_cve_scan_binary }}"
+          - "sbom:{{ sbom.path }}"
+          - "-o"
+          - "json"
+          - "--file"
+          - "{{ image_build_run_dir }}/scan.grype.json"
+      register: image_build_cve_scan_run
+      changed_when: true
+      failed_when: false
+
+    - name: "[image_build] Fail loud when the CVE scan tool exited non-zero"
+      ansible.builtin.assert:
+        that:
+          - image_build_cve_scan_run.rc == 0
+        fail_msg: >-
+          {{ image_build_cve_scan_binary }} exited
+          {{ image_build_cve_scan_run.rc }} scanning {{ sbom.path }} — CVE
+          scan evidence is mandatory, the job fails instead of publishing
+          'unavailable'. stderr:
+          {{ image_build_cve_scan_run.stderr | default('') | trim }}
+
+    - name: "[image_build] Load the scan result"
+      ansible.builtin.set_fact:
+        image_build_cve_scan_json: "{{ lookup('file', image_build_run_dir + '/scan.grype.json') | from_json }}"
+
+    - name: "[image_build] Record CVE scan result"
+      ansible.builtin.set_fact:
+        cve_scan:
+          status: generated
+          tool: "{{ image_build_cve_scan_binary }}"
+          total_count: "{{ image_build_cve_scan_json.matches | default([]) | length }}"
+          critical_count: "{{ image_build_cve_scan_json.matches | default([]) | selectattr('vulnerability.severity', 'equalto', 'Critical') | list | length }}"
+          high_count: "{{ image_build_cve_scan_json.matches | default([]) | selectattr('vulnerability.severity', 'equalto', 'High') | list | length }}"
+          medium_count: "{{ image_build_cve_scan_json.matches | default([]) | selectattr('vulnerability.severity', 'equalto', 'Medium') | list | length }}"
+          low_count: "{{ image_build_cve_scan_json.matches | default([]) | selectattr('vulnerability.severity', 'equalto', 'Low') | list | length }}"
+          path: "{{ image_build_run_dir }}/scan.grype.json"
+  tags: [image_build, scan]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DescribeImages — the post-build AWS proof (plano L2I §10): the AMI the
+# build claims must be independently consultable, `available`, owned by the
+# build credential's own account, in the artifact's region, and tagged with
+# this execution's identity. Uses the JT's injected AWS credential via the
+# aws CLI — no credential in extra_vars.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: "[image_build] Confirm the built AMI via DescribeImages"
+  when: image_build_provider == 'packer'
+  block:
+    - name: "[image_build] Check for the aws CLI on PATH"
+      ansible.builtin.command:
+        argv: ["which", "{{ image_build_aws_cli_binary }}"]
+      register: image_build_aws_cli_check
+      failed_when: false
+      changed_when: false
+
+    - name: "[image_build] Fail loud when the aws CLI is missing"
+      ansible.builtin.assert:
+        that:
+          - image_build_aws_cli_check.rc == 0
+        fail_msg: >-
+          '{{ image_build_aws_cli_binary }}' was not found on the execution
+          node PATH — the DescribeImages confirmation and the evidence upload
+          are mandatory (samurai.image_build_evidence/v1).
+
+    - name: "[image_build] Resolve the expected AMI owner (the build credential's own account)"
+      ansible.builtin.command:
+        argv: ["{{ image_build_aws_cli_binary }}", "sts", "get-caller-identity", "--output", "json"]
+      register: image_build_caller_identity
+      changed_when: false
+
+    - name: "[image_build] DescribeImages until the AMI is available"
+      ansible.builtin.command:
+        argv:
+          - "{{ image_build_aws_cli_binary }}"
+          - ec2
+          - describe-images
+          - --image-ids
+          - "{{ image_ref }}"
+          - --region
+          - "{{ image_build_region }}"
+          - --output
+          - json
+      register: image_build_describe_run
+      changed_when: false
+      retries: "{{ image_build_describe_retries | int }}"
+      delay: "{{ image_build_describe_delay | int }}"
+      until: >-
+        image_build_describe_run.rc == 0
+        and ((image_build_describe_run.stdout | from_json).Images | default([]) | length > 0)
+        and ((image_build_describe_run.stdout | from_json).Images | first).State == 'available'
+
+    - name: "[image_build] Parse the DescribeImages proof"
+      ansible.builtin.set_fact:
+        image_build_described: "{{ (image_build_describe_run.stdout | from_json).Images | first }}"
+        image_build_expected_owner: "{{ (image_build_caller_identity.stdout | from_json).Account }}"
+
+    - name: "[image_build] Verify AMI identity, owner and execution tags"
+      ansible.builtin.assert:
+        that:
+          - image_build_described.ImageId == image_ref
+          - image_build_described.State == 'available'
+          - image_build_described.OwnerId == image_build_expected_owner
+          - >-
+            (image_build_described.Tags | default([])
+             | selectattr('Key', 'equalto', 'SamuraiExecutionId')
+             | map(attribute='Value') | first | default(''))
+            == (samurai_execution_id | string)
+          - >-
+            (image_build_described.Tags | default([])
+             | selectattr('Key', 'equalto', 'SamuraiOrganizationId')
+             | map(attribute='Value') | first | default(''))
+            == (image_build_organization_id | string)
+        fail_msg: >-
+          DescribeImages did not confirm the built AMI: expected
+          {{ image_ref }} available, owned by
+          {{ image_build_expected_owner }}, tagged
+          SamuraiExecutionId={{ samurai_execution_id }} and
+          SamuraiOrganizationId={{ image_build_organization_id }} — got
+          ImageId={{ image_build_described.ImageId | default('?') }},
+          State={{ image_build_described.State | default('?') }},
+          OwnerId={{ image_build_described.OwnerId | default('?') }},
+          Tags={{ image_build_described.Tags | default([]) }}.
+          Every Image Factory template must declare the
+          samurai_execution_id/organization_id variables and tag the AMI with
+          them (packer/README.md contract).
+
+    - name: "[image_build] Persist the DescribeImages proof to disk"
+      ansible.builtin.copy:
+        dest: "{{ image_build_run_dir }}/describe_images.json"
+        content: "{{ image_build_described | to_nice_json }}"
+        mode: "0644"
+  tags: [image_build, describe]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Evidence upload — every artifact goes to the org-scoped S3 prefix with an
+# EXPLICIT SSE-KMS header pair (issue #1711: the bucket policy denies any
+# unencrypted PutObject; the bucket's own default encryption does NOT
+# populate the request-level header). URIs + sha256 feed the v1 envelope.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: "[image_build] Upload the evidence artifacts (SSE-KMS)"
+  when: image_build_provider == 'packer'
+  block:
+    - name: "[image_build] Hash the evidence artifacts (sha256)"
+      ansible.builtin.stat:
+        path: "{{ image_build_run_dir }}/{{ item }}"
+        checksum_algorithm: sha256
+      register: image_build_evidence_stats
+      loop:
+        - build.log
+        - sbom.cyclonedx.json
+        - scan.grype.json
+        - describe_images.json
+      loop_control:
+        label: "{{ item }}"
+
+    - name: "[image_build] Fail loud when an evidence artifact is missing on disk"
+      ansible.builtin.assert:
+        that:
+          - image_build_evidence_stats.results | rejectattr('stat.exists') | list | length == 0
+        fail_msg: >-
+          One or more evidence artifacts are missing under
+          {{ image_build_run_dir }} — nothing to upload, the v1 contract
+          cannot be satisfied.
+
+    - name: "[image_build] Put each evidence artifact to S3 with explicit SSE-KMS"
+      ansible.builtin.command:
+        argv:
+          - "{{ image_build_aws_cli_binary }}"
+          - s3api
+          - put-object
+          - --bucket
+          - "{{ image_build_evidence_s3_bucket }}"
+          - --key
+          - "{{ image_build_evidence_s3_prefix }}/{{ item.item }}"
+          - --body
+          - "{{ image_build_run_dir }}/{{ item.item }}"
+          - --server-side-encryption
+          - "aws:kms"
+          - --ssekms-key-id
+          - "{{ image_build_evidence_kms_key_id }}"
+          - --content-type
+          - "{{ 'application/json' if item.item.endswith('.json') else 'text/plain' }}"
+      loop: "{{ image_build_evidence_stats.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      changed_when: true
+
+    - name: "[image_build] Record the evidence references (S3 URI + sha256)"
+      ansible.builtin.set_fact:
+        image_build_evidence_sha256: >-
+          {{ dict(image_build_evidence_stats.results | map(attribute='item')
+                  | zip(image_build_evidence_stats.results | map(attribute='stat.checksum'))) }}
+
+    - name: "[image_build] Assemble the v1 artifact references"
+      ansible.builtin.set_fact:
+        packer_log:
+          uri: "s3://{{ image_build_evidence_s3_bucket }}/{{ image_build_evidence_s3_prefix }}/build.log"
+          sha256: "{{ image_build_evidence_sha256['build.log'] }}"
+        sbom: >-
+          {{ sbom | combine({
+               'uri': 's3://' ~ image_build_evidence_s3_bucket ~ '/' ~ image_build_evidence_s3_prefix ~ '/sbom.cyclonedx.json',
+               'sha256': image_build_evidence_sha256['sbom.cyclonedx.json'],
+             }) }}
+        cve_scan: >-
+          {{ cve_scan | combine({
+               'uri': 's3://' ~ image_build_evidence_s3_bucket ~ '/' ~ image_build_evidence_s3_prefix ~ '/scan.grype.json',
+               'sha256': image_build_evidence_sha256['scan.grype.json'],
+             }) }}
+        describe_images:
+          uri: "s3://{{ image_build_evidence_s3_bucket }}/{{ image_build_evidence_s3_prefix }}/describe_images.json"
+          sha256: "{{ image_build_evidence_sha256['describe_images.json'] }}"
+          image_id: "{{ image_build_described.ImageId }}"
+          state: "{{ image_build_described.State }}"
+          owner_id: "{{ image_build_described.OwnerId }}"
+          region: "{{ image_build_region }}"
+          execution_tag_verified: true
+  tags: [image_build, evidence]
+
+- name: "[image_build] Record stub evidence references (control plane reproves these)"
+  when: image_build_provider == 'stub'
+  ansible.builtin.set_fact:
+    packer_log:
+      status: stub
+      reason: "stub build — no evidence uploaded"
+    describe_images:
+      status: stub
+      reason: "stub build — no AMI to describe"
+  tags: [image_build, stub]
+
+# Promoted to a FACT (not only a set_stats key) so the playbook's final
+# consolidation play republishes the REAL value — set_stats data never
+# becomes a variable across plays, only facts do.
+- name: "[image_build] Summarise the CVE scan for the registration text column"
+  ansible.builtin.set_fact:
+    cve_scan_summary: >-
+      {{ ('stub: ' ~ (cve_scan.reason | default('no reason')))
+         if (cve_scan.status | default('stub')) != 'generated'
+         else ((cve_scan.total_count | default(0)) ~ ' CVEs ('
+               ~ (cve_scan.critical_count | default(0)) ~ ' critical, '
+               ~ (cve_scan.high_count | default(0)) ~ ' high)') }}
+  tags: [image_build]
+
+- name: "[image_build] Publish outputs to set_stats (cross-playbook)"
+  ansible.builtin.set_stats:
+    data:
+      # ── samurai.image_build_evidence/v1 (plano L2I §4.1) ──────────────────
+      schema_version: "samurai.image_build_evidence/v1"
+      image_ref: "{{ image_ref }}"
+      cloud_provider: "{{ 'aws' if image_build_provider == 'packer' else 'stub' }}"
+      region: "{{ image_build_region | default('') }}"
+      template_hash: "{{ template_hash }}"
+      base_image: "{{ base_image }}"
+      packer_log: "{{ packer_log }}"
+      sbom: "{{ sbom }}"
+      cve_scan: "{{ cve_scan }}"
+      describe_images: "{{ describe_images }}"
+      build_started_at: "{{ build_started_at }}"
+      build_finished_at: "{{ build_finished_at }}"
+      # ── Convenience keys (UI/registration text columns, harness) ──────────
+      build_log_url: "{{ build_log_url }}"
+      packer_log_url: "{{ build_log_url }}"
+      cve_scan_summary: "{{ cve_scan_summary }}"
+    aggregate: false
+    per_host: false
+  tags: [image_build]

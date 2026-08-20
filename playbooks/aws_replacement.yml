@@ -1,0 +1,36 @@
+---
+# ============================================================================
+# Playbook driven by the AAP job template "samurai_aws_replacement" (Fase 1 —
+# Image Factory, RFC-004 §17.1, PR 8 L2I). It is the mechanical arm of the AWS
+# replacement: a NEW EC2 is created from the APPROVED image, tagged with the
+# run identity, confirmed via DescribeInstances and reported back via
+# set_stats — the ORIGIN server is NEVER touched. The role is limited to
+# create/consult/tag the NEW instance: there is no stop, terminate, patch,
+# cutover or decommission task anywhere in it. The only reads against the
+# origin are read-only DescribeInstances calls, taken before and after the
+# creation, so the control plane can audit that the origin state is identical
+# (plano L2I §13 — source preservation proof).
+#
+# The AAP carries NO AWS credential in extra_vars — every aws-cli call inherits
+# the job template's own credential injection (same posture as image_build /
+# image_validate). Idempotent: a retry finds the instance already tagged with
+# this run's identity (SamuraiOrganizationId + SamuraiExecutionId) and ADOPTS
+# it instead of creating a second one.
+#
+# Inputs (extra_vars from the control plane):
+#   samurai_execution_id   correlation id, stamped everywhere (required)
+#   organization_id        tenant scope (required)
+#   aws_replacement        dict: preserve_source (constant true), image_ref,
+#                          region, hostname, source_instance_id (read-only
+#                          preservation proof), instance_type, subnet_id,
+#                          security_group_id, tags
+# ============================================================================
+
+- name: "SamurAI :: aws_replacement :: create the substitute EC2 (origin preserved)"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: "Run the aws_replacement role"
+      ansible.builtin.import_role:
+        name: aws_replacement
+      tags: [aws_replacement]

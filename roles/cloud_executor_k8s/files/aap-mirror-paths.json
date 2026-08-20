@@ -1,0 +1,16 @@
+{
+  "_sobre": [
+    "Manifesto de espelho AAP da role cloud_executor_k8s — fonte única da verdade",
+    "do mapeamento de arquivos que esta role publica no repositório do AAP.",
+    "",
+    "Lista CONFIRMADA contra o espelho AAP em 01/08/2026.",
+    "",
+    "Estrutura: mesma do .github/aap-mirror-paths.json — source (caminho no repo",
+    "samurai-shield) -> mirror (caminho correspondente no repo aap do Azure DevOps)."
+  ],
+  "paths": [
+    { "source": "ansible/roles/cloud_executor_k8s",      "mirror": "roles/cloud_executor_k8s",      "kind": "dir"  },
+    { "source": "ansible/playbooks/cloud_executor_k8s.yml", "mirror": "playbooks/cloud_executor_k8s.yml", "kind": "file" },
+    { "source": ".k8s/workflows/cloud_executor_k8s/files/entrypoint.sh", "mirror": "files/cloud_executor_k8s/entrypoint.sh", "kind": "file" }
+  ]
+}

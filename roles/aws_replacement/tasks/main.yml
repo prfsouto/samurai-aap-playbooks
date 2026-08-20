@@ -1,0 +1,260 @@
+---
+# ============================================================================
+# Role: aws_replacement  (Fase 1 — Image Factory, RFC-004 §17.1, PR 8 L2I)
+#
+# Creates the SUBSTITUTE EC2 from the APPROVED image, tagged with this run's
+# identity (SamuraiOrganizationId + SamuraiExecutionId + SamuraiRole), waits
+# for it to be running, confirms it via DescribeInstances and publishes the
+# proof via set_stats. The ORIGIN is read-only: the only calls that mention it
+# are two DescribeInstances reads (before/after) feeding the control plane's
+# source-preservation audit. There is NO stop-instances, terminate-instances,
+# modify-*, reboot-*, cutover or decommission task in this role — by contract
+# (plano L2I §13), not by accident.
+#
+# Idempotent: a retry finds the instance already carrying this run's identity
+# tags and ADOPTS it instead of creating a second one.
+# ============================================================================
+
+- name: "[aws_replacement] Display incoming payload"
+  ansible.builtin.debug:
+    msg:
+      provider: "{{ aws_replacement_provider }}"
+      execution_id: "{{ samurai_execution_id | default('unknown') }}"
+      organization_id: "{{ aws_replacement_organization_id }}"
+      image_ref: "{{ aws_replacement_image_ref | default('') }}"
+      region: "{{ aws_replacement_region | default('') }}"
+      hostname: "{{ aws_replacement_hostname | default('') }}"
+      source_instance_id: "{{ aws_replacement_source_instance_id | default('') }}"
+  tags: [aws_replacement, debug]
+
+- name: "[aws_replacement] Validate identity + the preserve_source constant"
+  ansible.builtin.assert:
+    that:
+      - samurai_execution_id | default('') | length > 0
+      # organization_id is an int on the wire (the engine passes the PK) — | string
+      # before | length so | length never runs on a bare int (same care as
+      # inventory_collect / image_build / image_validate).
+      - aws_replacement_organization_id | string | length > 0
+      - aws_replacement_image_ref | length > 0
+      - aws_replacement_region | length > 0
+      # The flow constant: a payload without preserve_source=true never runs.
+      - aws_replacement_preserve_source | bool
+    fail_msg: >-
+      aws_replacement requires samurai_execution_id, organization_id,
+      image_ref, region and the preserve_source=true constant
+      (got execution_id='{{ samurai_execution_id | default('') }}',
+      organization_id='{{ aws_replacement_organization_id }}',
+      image_ref='{{ aws_replacement_image_ref }}',
+      preserve_source='{{ aws_replacement_preserve_source }}').
+  tags: [aws_replacement]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STUB provider — offline/CI harness, no cloud call at all.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: "[aws_replacement] Stub run — synthesize the substitute"
+  when: aws_replacement_provider == 'stub'
+  tags: [aws_replacement, stub]
+  block:
+    - name: "[aws_replacement] Stub facts"
+      ansible.builtin.set_fact:
+        aws_replacement_instance_id: "i-stub{{ samurai_execution_id | hash('sha1') | truncate(12, true, '') }}"
+        aws_replacement_private_ip: "10.0.0.250"
+        aws_replacement_adopted: false
+        aws_replacement_describe_proof:
+          InstanceId: "stubbed"
+          State: { Name: "running" }
+        aws_replacement_source_state_before: {}
+        aws_replacement_source_state_after: {}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AWS provider — create/consult/tag the NEW instance. Origin: read-only.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: "[aws_replacement] Create the substitute (AWS)"
+  when: aws_replacement_provider == 'aws'
+  tags: [aws_replacement]
+  block:
+    # ── Read-only preservation read: origin BEFORE ─────────────────────────
+    - name: "[aws_replacement] Describe the ORIGIN instance (read-only, before)"
+      when: aws_replacement_source_instance_id | length > 0
+      ansible.builtin.command:
+        argv:
+          - "{{ aws_replacement_aws_cli_binary }}"
+          - ec2
+          - describe-instances
+          - --instance-ids
+          - "{{ aws_replacement_source_instance_id }}"
+          - --region
+          - "{{ aws_replacement_region }}"
+          - --query
+          - "Reservations[].Instances[].{InstanceId:InstanceId,State:State.Name,PrivateIp:PrivateIpAddress,Type:InstanceType}"
+          - --output
+          - json
+      register: aws_replacement_source_before_raw
+      changed_when: false
+      failed_when: false
+
+    - name: "[aws_replacement] Record origin state (before)"
+      ansible.builtin.set_fact:
+        aws_replacement_source_state_before: >-
+          {{ (aws_replacement_source_before_raw.stdout | default('[]') | from_json | first)
+             if (aws_replacement_source_before_raw is defined
+                 and aws_replacement_source_before_raw.rc | default(1) == 0
+                 and (aws_replacement_source_before_raw.stdout | default('[]') | from_json | length) > 0)
+             else {} }}
+
+    # ── Idempotent adoption: an instance of THIS run already exists? ──────
+    - name: "[aws_replacement] Find an instance already tagged with this run's identity"
+      ansible.builtin.command:
+        argv:
+          - "{{ aws_replacement_aws_cli_binary }}"
+          - ec2
+          - describe-instances
+          - --filters
+          - "Name=tag:SamuraiOrganizationId,Values={{ aws_replacement_organization_id | string }}"
+          - "Name=tag:SamuraiExecutionId,Values={{ samurai_execution_id }}"
+          - "Name=tag:SamuraiRole,Values=replacement"
+          - "Name=instance-state-name,Values=pending,running"
+          - --region
+          - "{{ aws_replacement_region }}"
+          - --query
+          - "Reservations[].Instances[].InstanceId"
+          - --output
+          - json
+      register: aws_replacement_adopt_describe
+      changed_when: false
+
+    - name: "[aws_replacement] Adopt the existing instance of this run (retry-safe)"
+      ansible.builtin.set_fact:
+        aws_replacement_instance_id: "{{ (aws_replacement_adopt_describe.stdout | from_json) | first }}"
+        aws_replacement_adopted: true
+      when: (aws_replacement_adopt_describe.stdout | from_json) | length > 0
+
+    # ── Create the NEW instance (only when none exists for this run) ──────
+    - name: "[aws_replacement] Run the substitute instance from the approved image"
+      when: aws_replacement_instance_id is not defined
+      ansible.builtin.command:
+        argv: >-
+          {{ [aws_replacement_aws_cli_binary, 'ec2', 'run-instances',
+              '--image-id', aws_replacement_image_ref,
+              '--instance-type', aws_replacement_instance_type,
+              '--count', '1',
+              '--region', aws_replacement_region,
+              '--tag-specifications',
+              'ResourceType=instance,Tags=[{Key=Name,Value=' ~ (aws_replacement_hostname | default('samurai-replacement', true)) ~
+              '},{Key=SamuraiOrganizationId,Value=' ~ (aws_replacement_organization_id | string) ~
+              '},{Key=SamuraiExecutionId,Value=' ~ samurai_execution_id ~
+              '},{Key=SamuraiRole,Value=replacement},{Key=SamuraiManaged,Value=true}]',
+              '--query', 'Instances[0].InstanceId', '--output', 'text']
+             + (['--subnet-id', aws_replacement_subnet_id] if (aws_replacement_subnet_id | length > 0) else [])
+             + (['--security-group-ids', aws_replacement_security_group_id] if (aws_replacement_security_group_id | length > 0) else []) }}
+      register: aws_replacement_run_instances
+      changed_when: true
+
+    - name: "[aws_replacement] Record the created instance id"
+      when: aws_replacement_instance_id is not defined
+      ansible.builtin.set_fact:
+        aws_replacement_instance_id: "{{ aws_replacement_run_instances.stdout | trim }}"
+        aws_replacement_adopted: false
+
+    # ── Wait + confirm (DescribeInstances proof) ──────────────────────────
+    - name: "[aws_replacement] Wait for the substitute to be running"
+      ansible.builtin.command:
+        argv:
+          - "{{ aws_replacement_aws_cli_binary }}"
+          - ec2
+          - describe-instances
+          - --instance-ids
+          - "{{ aws_replacement_instance_id }}"
+          - --region
+          - "{{ aws_replacement_region }}"
+          - --query
+          - "Reservations[].Instances[].State.Name"
+          - --output
+          - text
+      register: aws_replacement_state
+      changed_when: false
+      retries: "{{ aws_replacement_boot_retries | int }}"
+      delay: "{{ aws_replacement_boot_delay | int }}"
+      until: aws_replacement_state.stdout | trim == 'running'
+
+    - name: "[aws_replacement] Confirm the substitute (DescribeInstances proof)"
+      ansible.builtin.command:
+        argv:
+          - "{{ aws_replacement_aws_cli_binary }}"
+          - ec2
+          - describe-instances
+          - --instance-ids
+          - "{{ aws_replacement_instance_id }}"
+          - --region
+          - "{{ aws_replacement_region }}"
+          - --query
+          - "Reservations[].Instances[].{InstanceId:InstanceId,State:State.Name,PrivateIp:PrivateIpAddress,ImageId:ImageId,Type:InstanceType,Tags:Tags}"
+          - --output
+          - json
+      register: aws_replacement_confirm
+      changed_when: false
+
+    - name: "[aws_replacement] Record the substitute proof + private IP"
+      ansible.builtin.set_fact:
+        aws_replacement_describe_proof: "{{ (aws_replacement_confirm.stdout | from_json) | first }}"
+        aws_replacement_private_ip: "{{ ((aws_replacement_confirm.stdout | from_json) | first).PrivateIp | default('') }}"
+
+    - name: "[aws_replacement] Assert the substitute booted from the approved image"
+      ansible.builtin.assert:
+        that:
+          - aws_replacement_describe_proof.ImageId == aws_replacement_image_ref
+        fail_msg: >-
+          The substitute '{{ aws_replacement_instance_id }}' reports image
+          '{{ aws_replacement_describe_proof.ImageId | default('') }}' instead of the
+          approved '{{ aws_replacement_image_ref }}'.
+
+    # ── Read-only preservation read: origin AFTER ─────────────────────────
+    - name: "[aws_replacement] Describe the ORIGIN instance (read-only, after)"
+      when: aws_replacement_source_instance_id | length > 0
+      ansible.builtin.command:
+        argv:
+          - "{{ aws_replacement_aws_cli_binary }}"
+          - ec2
+          - describe-instances
+          - --instance-ids
+          - "{{ aws_replacement_source_instance_id }}"
+          - --region
+          - "{{ aws_replacement_region }}"
+          - --query
+          - "Reservations[].Instances[].{InstanceId:InstanceId,State:State.Name,PrivateIp:PrivateIpAddress,Type:InstanceType}"
+          - --output
+          - json
+      register: aws_replacement_source_after_raw
+      changed_when: false
+      failed_when: false
+
+    - name: "[aws_replacement] Record origin state (after)"
+      ansible.builtin.set_fact:
+        aws_replacement_source_state_after: >-
+          {{ (aws_replacement_source_after_raw.stdout | default('[]') | from_json | first)
+             if (aws_replacement_source_after_raw is defined
+                 and aws_replacement_source_after_raw.rc | default(1) == 0
+                 and (aws_replacement_source_after_raw.stdout | default('[]') | from_json | length) > 0)
+             else {} }}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Publish the envelope the control plane consumes (finalize_replacement).
+# ─────────────────────────────────────────────────────────────────────────────
+- name: "[aws_replacement] Publish the replacement envelope to set_stats"
+  ansible.builtin.set_stats:
+    data:
+      replacement:
+        created: true
+        adopted: "{{ aws_replacement_adopted | default(false) }}"
+        instance_id: "{{ aws_replacement_instance_id }}"
+        region: "{{ aws_replacement_region }}"
+        private_ip: "{{ aws_replacement_private_ip | default('') }}"
+        hostname: "{{ aws_replacement_hostname | default('') }}"
+        source_instance_id: "{{ aws_replacement_source_instance_id | default('') }}"
+        describe_instances: "{{ aws_replacement_describe_proof | default({}) }}"
+        source_state_before: "{{ aws_replacement_source_state_before | default({}) }}"
+        source_state_after: "{{ aws_replacement_source_state_after | default({}) }}"
+        execution_id: "{{ samurai_execution_id }}"
+        organization_id: "{{ aws_replacement_organization_id | string }}"
+    per_host: false
+  tags: [aws_replacement]

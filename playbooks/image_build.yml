@@ -1,0 +1,51 @@
+---
+# ============================================================================
+# Single-stage playbook used by the AAP job template "samurai_image_build"
+# (Fase 1 — Image Factory, RFC-004 §17.1; plano L2I §10). Builds a golden
+# image via Packer and hands the MANDATORY evidence envelope
+# `samurai.image_build_evidence/v1` back to the control plane via set_stats —
+# image_registration_service validates EVERY field before it registers an
+# ImageVersion(status=draft); incomplete/`unavailable` evidence is reproved,
+# never registered. Runs entirely on the AAP execution node — it never
+# targets a managed server, so it has no bootstrap/validation/cutover/
+# decommission stages.
+# ============================================================================
+
+- name: "SamurAI :: image_build"
+  hosts: localhost
+  gather_facts: true
+  tasks:
+    - ansible.builtin.import_role:
+        name: image_build
+
+- name: "SamurAI :: image_build :: emit final outputs"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: "Emit consolidated samurai outputs"
+      ansible.builtin.set_stats:
+        data:
+          samurai_execution_id: "{{ samurai_execution_id | default('') }}"
+          organization_id: "{{ organization_id | default('') }}"
+          # ── samurai.image_build_evidence/v1 (plano L2I §4.1) ──────────────
+          # The role publishes the real values; the defaults below only cover
+          # a role that never ran — an empty envelope the control plane
+          # reproves (no draft), which is exactly the intended outcome.
+          schema_version: "samurai.image_build_evidence/v1"
+          image_ref: "{{ image_ref | default('') }}"
+          cloud_provider: "{{ (image_build_provider | default('packer') == 'packer') | ternary('aws', 'stub') }}"
+          region: "{{ image_build_region | default('') }}"
+          template_hash: "{{ template_hash | default('') }}"
+          base_image: "{{ base_image | default('') }}"
+          packer_log: "{{ packer_log | default({'status': 'unavailable', 'reason': 'image_build role did not run'}) }}"
+          sbom: "{{ sbom | default({'status': 'unavailable', 'reason': 'image_build role did not run'}) }}"
+          cve_scan: "{{ cve_scan | default({'status': 'unavailable', 'reason': 'image_build role did not run'}) }}"
+          describe_images: "{{ describe_images | default({'status': 'unavailable', 'reason': 'image_build role did not run'}) }}"
+          build_started_at: "{{ build_started_at | default('') }}"
+          build_finished_at: "{{ build_finished_at | default('') }}"
+          # ── Convenience keys (UI/registration text columns, harness) ──────
+          build_log_url: "{{ build_log_url | default('') }}"
+          packer_log_url: "{{ build_log_url | default('') }}"
+          cve_scan_summary: "{{ cve_scan_summary | default('stub: image_build role did not run') }}"
+        aggregate: false
+        per_host: false

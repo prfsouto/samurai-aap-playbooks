@@ -1,0 +1,10 @@
+---
+# Playbook de entrada do Job Template AAP para o Cloud Executor (k8s).
+# Recebe extra_vars do KubernetesJobProvider (Python) e delega à role cloud_executor_k8s.
+# Requer: collections kubernetes.core (instalado no EE).
+- name: Cloud Executor — k8s Job Terraform
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  roles:
+    - role: cloud_executor_k8s

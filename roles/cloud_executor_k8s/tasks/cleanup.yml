@@ -1,0 +1,14 @@
+---
+- name: "[cek] Remover k8s Secret de credenciais"
+  kubernetes.core.k8s:
+    state: absent
+    api_version: v1
+    kind: Secret
+    name: "samurai-tf-{{ plan_id }}"
+    namespace: "{{ cek_namespace }}"
+  register: cek_cleanup_result
+  failed_when: >-
+    cek_cleanup_result.failed is defined and
+    cek_cleanup_result.failed and
+    'not found' not in (cek_cleanup_result.msg | default('') | lower)
+  when: aws_credential_ref == ""
