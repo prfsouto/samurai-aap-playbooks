@@ -12,65 +12,38 @@
 #   2. Run pre-check, optional update and post-check on each target host.
 #   3. Emit a consolidated samurai_shield_result JSON block on stdout.
 #
-# Extra-vars contract: HOSTNAMES (required), ACTION (Check|Apply, default Check),
-# UPDATE_MODE (all|security, default all), EXCLUDE_PACKAGES (csv, optional),
-# ALLOW_REBOOT (bool, default false), EVIDENCE_BASE_DIR (default
-# /var/tmp/samurai-shield/yum-update), SERIAL_BATCH (default 1),
-# LOG_LEVEL (summary|package|full, default package). LOG_LEVEL controls how
-# much of the package-manager output is echoed into the AAP/Execution Center
-# job log (it never changes what is applied and never disables the structured
-# evidence files):
-#   - summary: approximate affected-package count + evidence_dir + reboot flags.
-#   - package: relevant transaction lines (Installing/Upgrading/Removing/...),
-#              capped at 300 lines.
-#   - full:    complete stdout + stderr, capped at 1000 lines each. WARNING:
-#              can produce very large job logs — use for deep troubleshooting.
-# See README.md at the repository root for full documentation.
+# Extra-vars contract — see ansible/playbooks/README_linux_yum_update_with_evidence.md
 # ============================================================================
 
 - name: "SamurAI :: yum-update :: build dynamic inventory from HOSTNAMES"
   hosts: localhost
   gather_facts: false
   vars:
-    # NOTE: NEVER redeclare an extra-var in terms of ITSELF
-    # (`HOSTNAMES: "{{ HOSTNAMES | default('') }}"`) — when the extra-var is
-    # absent the right-hand side resolves to the play-var itself and Ansible
-    # dies with "recursive loop detected in template string". This bit a real
-    # run (AAP job 186) when HOSTNAMES was not injected. Seed distinct internal
-    # names from the optional extra-vars instead. The `(X | default('') | trim)
-    # or Y` form also handles a blank AAP survey answer (an empty string, which
-    # a plain `| default(Y)` would keep).
-    effective_hostnames: "{{ HOSTNAMES | default('') | string | trim }}"
-    effective_action: "{{ (ACTION | default('') | string | trim) or 'Check' }}"
-    effective_update_mode: "{{ (UPDATE_MODE | default('') | string | trim) or 'all' }}"
-    effective_log_level: "{{ (LOG_LEVEL | default('') | string | trim) or 'package' }}"
+    HOSTNAMES: "{{ HOSTNAMES | default('') }}"
+    ACTION: "{{ ACTION | default('Check') }}"
+    UPDATE_MODE: "{{ UPDATE_MODE | default('all') }}"
   tasks:
     - name: "Validate HOSTNAMES is provided"
       ansible.builtin.fail:
         msg: "HOSTNAMES extra-var is required (single host, IP, or comma-separated list)."
-      when: effective_hostnames == ''
+      when: HOSTNAMES is not defined or (HOSTNAMES | trim) == ''
 
     - name: "Validate ACTION is Check or Apply"
       ansible.builtin.fail:
-        msg: "Invalid ACTION '{{ effective_action }}'. Allowed values: Check, Apply."
-      when: effective_action not in ['Check', 'Apply']
+        msg: "Invalid ACTION '{{ ACTION }}'. Allowed values: Check, Apply."
+      when: ACTION not in ['Check', 'Apply']
 
     - name: "Validate UPDATE_MODE is all or security"
       ansible.builtin.fail:
-        msg: "Invalid UPDATE_MODE '{{ effective_update_mode }}'. Allowed values: all, security."
-      when: effective_update_mode not in ['all', 'security']
+        msg: "Invalid UPDATE_MODE '{{ UPDATE_MODE }}'. Allowed values: all, security."
+      when: UPDATE_MODE not in ['all', 'security']
 
-    - name: "Validate LOG_LEVEL is summary, package or full"
-      ansible.builtin.fail:
-        msg: "Invalid LOG_LEVEL '{{ effective_log_level }}'. Allowed values: summary, package, full."
-      when: effective_log_level not in ['summary', 'package', 'full']
-
-    - name: "Parse HOSTNAMES into a list (tolerant: space OR comma) — samurai-shield#1418"
+    - name: "Parse HOSTNAMES into a list (tolerant: space OR comma) — #1418"
       ansible.builtin.set_fact:
-        # The engine sends HOSTNAMES space-separated (Oraex fleet convention);
-        # accept both delimiters so a space-joined wave never collapses to 1 host.
+        # The engine now sends HOSTNAMES space-separated (Oraex fleet convention);
+        # accept both delimiters so a comma-joined caller never collapses to 1 host.
         samurai_target_hosts: >-
-          {{ effective_hostnames.replace(',', ' ').split() | reject('equalto', '') | list }}
+          {{ HOSTNAMES.replace(',', ' ').split() | reject('equalto', '') | list }}
 
     - name: "Add hosts to dynamic group samurai_yum_update_targets"
       ansible.builtin.add_host:
@@ -81,7 +54,7 @@
 
     - name: "Show resolved target hosts"
       ansible.builtin.debug:
-        msg: "Targets: {{ samurai_target_hosts | join(', ') }} | ACTION={{ effective_action }} | UPDATE_MODE={{ effective_update_mode }} | LOG_LEVEL={{ effective_log_level }}"
+        msg: "Targets: {{ samurai_target_hosts | join(', ') }} | ACTION={{ ACTION }} | UPDATE_MODE={{ UPDATE_MODE }}"
 
 
 - name: "SamurAI :: yum-update :: pre-check, update and post-check"
@@ -91,16 +64,11 @@
   serial: "{{ SERIAL_BATCH | default(1) }}"
 
   vars:
-    ACTION: "{{ ACTION | default('Check') }}"
-    UPDATE_MODE: "{{ UPDATE_MODE | default('all') }}"
-    # see comment in play 1 — avoid LOG_LEVEL self-reference
-    effective_log_level: "{{ LOG_LEVEL | default('package') }}"
-    EXCLUDE_PACKAGES_RAW: "{{ EXCLUDE_PACKAGES | default('') }}"
-    ALLOW_REBOOT: "{{ ALLOW_REBOOT | default(false) | bool }}"
-    EVIDENCE_BASE_DIR: "{{ EVIDENCE_BASE_DIR | default('/var/tmp/samurai-shield/yum-update') }}"
-    log_package_max_lines: 300
-    log_full_max_lines: 1000
-    pkg_tx_regex: '^[[:space:]]*(Installing|Installed|Upgrading|Upgraded|Updating|Updated|Removing|Removed|Obsoleting|Replacing|Downgrading|Running scriptlet)\b'
+    ACTION: "{{ hostvars['localhost']['ACTION'] | default('Check') }}"
+    UPDATE_MODE: "{{ hostvars['localhost']['UPDATE_MODE'] | default('all') }}"
+    EXCLUDE_PACKAGES_RAW: "{{ hostvars['localhost']['EXCLUDE_PACKAGES'] | default('') }}"
+    ALLOW_REBOOT: "{{ hostvars['localhost']['ALLOW_REBOOT'] | default(false) | bool }}"
+    EVIDENCE_BASE_DIR: "{{ hostvars['localhost']['EVIDENCE_BASE_DIR'] | default('/var/tmp/samurai-shield/yum-update') }}"
 
     exclude_packages_list: >-
       {{
@@ -114,41 +82,13 @@
   tasks:
 
     # ------------------------------------------------------------------------
-    # Phase 1: Input + OS compatibility validation
+    # Phase 1: timestamps + evidence directory (sempre, antes do bloco — o
+    # `always` escreve o summary.json aqui inclusive quando o host reprova)
     # ------------------------------------------------------------------------
-    - name: "Capture execution start timestamp (UTC, controller-side)"
+    - name: "Capture execution start timestamp"
       ansible.builtin.set_fact:
-        execution_started_at: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
-        execution_timestamp: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
-
-    - name: "Fail when target OS family is not RedHat"
-      ansible.builtin.fail:
-        msg: >-
-          Unsupported OS family '{{ ansible_os_family }}' on host {{ inventory_hostname }}.
-          This playbook only supports Red Hat-like systems (RHEL, CentOS, Rocky,
-          AlmaLinux, Oracle Linux, Amazon Linux 2/2023).
-      when: ansible_os_family != 'RedHat'
-
-    - name: "Detect dnf binary"
-      ansible.builtin.stat:
-        path: /usr/bin/dnf
-      register: dnf_stat
-
-    - name: "Detect yum binary"
-      ansible.builtin.stat:
-        path: /usr/bin/yum
-      register: yum_stat
-
-    - name: "Fail when neither dnf nor yum is available"
-      ansible.builtin.fail:
-        msg: "Neither /usr/bin/dnf nor /usr/bin/yum found on {{ inventory_hostname }}."
-      when:
-        - not dnf_stat.stat.exists
-        - not yum_stat.stat.exists
-
-    - name: "Select package manager (prefer dnf)"
-      ansible.builtin.set_fact:
-        pkg_manager: "{{ 'dnf' if dnf_stat.stat.exists else 'yum' }}"
+        execution_started_at: "{{ '%Y-%m-%dT%H:%M:%SZ' | strftime(ansible_date_time.epoch | int) }}"
+        execution_timestamp: "{{ '%Y%m%dT%H%M%S' | strftime(ansible_date_time.epoch | int) }}"
 
     - name: "Build evidence directory path"
       ansible.builtin.set_fact:
@@ -161,10 +101,43 @@
         mode: '0750'
 
     # ------------------------------------------------------------------------
-    # Phase 2: Pre-check (always runs, even when ACTION=Check)
+    # Phase 2: OS compatibility + pre-check (always runs, even when
+    # ACTION=Check). #3037 (C3): a validação de compatibilidade vive DENTRO do
+    # block — um host de família errada agora atravessa rescue/always e produz
+    # summary.json + samurai_shield_result estruturados (status=failed, erro
+    # legível), em vez de morrer antes de qualquer evidência.
     # ------------------------------------------------------------------------
     - name: "Pre-check + optional update + post-check"
       block:
+
+        - name: "Fail when target OS family is not RedHat"
+          ansible.builtin.fail:
+            msg: >-
+              Unsupported OS family '{{ ansible_os_family }}' on host {{ inventory_hostname }}.
+              This playbook only supports Red Hat-like systems (RHEL, CentOS, Rocky,
+              AlmaLinux, Oracle Linux, Amazon Linux 2/2023).
+          when: ansible_os_family != 'RedHat'
+
+        - name: "Detect dnf binary"
+          ansible.builtin.stat:
+            path: /usr/bin/dnf
+          register: dnf_stat
+
+        - name: "Detect yum binary"
+          ansible.builtin.stat:
+            path: /usr/bin/yum
+          register: yum_stat
+
+        - name: "Fail when neither dnf nor yum is available"
+          ansible.builtin.fail:
+            msg: "Neither /usr/bin/dnf nor /usr/bin/yum found on {{ inventory_hostname }}."
+          when:
+            - not dnf_stat.stat.exists
+            - not yum_stat.stat.exists
+
+        - name: "Select package manager (prefer dnf)"
+          ansible.builtin.set_fact:
+            pkg_manager: "{{ 'dnf' if dnf_stat.stat.exists else 'yum' }}"
 
         # ---- system info --------------------------------------------------
         - name: "Capture system info"
@@ -376,183 +349,32 @@
               {{
                 [pkg_manager, 'update', '-y']
                 + (['--security'] if UPDATE_MODE == 'security' else [])
-                + (exclude_packages_list | map('regex_replace', '^', '--exclude=') | list)
+                + (exclude_packages_list | map('regex_replace', '^(.*)$', '--exclude=\\1') | list)
               }}
           when: ACTION == 'Apply'
 
-        - name: "Execute package update with explicit stdout/stderr evidence capture"
-          ansible.builtin.shell: |
-            set -o pipefail
-            {{ update_argv | map('quote') | join(' ') }} > "{{ evidence_dir }}/update_stdout.txt" 2> "{{ evidence_dir }}/update_stderr.txt"
-          args:
-            executable: /bin/bash
+        - name: "Execute package update"
+          ansible.builtin.command: "{{ update_argv }}"
           register: update_result
-          changed_when: ACTION == 'Apply' and update_result.rc == 0
+          changed_when: ACTION == 'Apply' and update_result.rc == 0 and ('Nothing to do' not in (update_result.stdout | default('')))
           failed_when: false
           when: ACTION == 'Apply'
 
-        - name: "Ensure update_stdout.txt exists in Check mode"
+        - name: "Write update_stdout.txt"
           ansible.builtin.copy:
             dest: "{{ evidence_dir }}/update_stdout.txt"
             mode: '0640'
-            content: "not_applicable_check_mode\n"
-            force: false
-          when: ACTION != 'Apply'
+            content: "{{ (update_result.stdout | default('not_applicable_check_mode')) if ACTION == 'Apply' else 'not_applicable_check_mode' }}\n"
 
-        - name: "Ensure update_stderr.txt exists in Check mode"
+        - name: "Write update_stderr.txt"
           ansible.builtin.copy:
             dest: "{{ evidence_dir }}/update_stderr.txt"
             mode: '0640'
-            content: "not_applicable_check_mode\n"
-            force: false
-          when: ACTION != 'Apply'
-
-        - name: "Read update stdout/stderr tail on failure"
-          ansible.builtin.shell: |
-            echo "----- stdout tail -----"
-            tail -120 "{{ evidence_dir }}/update_stdout.txt" 2>/dev/null || true
-            echo "----- stderr tail -----"
-            tail -120 "{{ evidence_dir }}/update_stderr.txt" 2>/dev/null || true
-          args:
-            executable: /bin/bash
-          register: update_error_tail
-          changed_when: false
-          failed_when: false
-          when:
-            - ACTION == 'Apply'
-            - update_result.rc | default(0) != 0
-
-        # ------------------------------------------------------------------
-        # AAP / Execution Center observability (controlled by LOG_LEVEL).
-        # Renders the package-manager output into the job log WITHOUT touching
-        # the host and WITHOUT replacing the structured evidence files. Runs
-        # before the fail-on-error task so the operator still sees package and
-        # full detail even when the update returns non-zero.
-        # ------------------------------------------------------------------
-        - name: "Count package-transaction lines in update output (for AAP log)"
-          ansible.builtin.shell: |
-            set -o pipefail
-            f="{{ evidence_dir }}/update_stdout.txt"
-            if [ -f "$f" ]; then
-              grep -Ec '{{ pkg_tx_regex }}' "$f" || true
-            else
-              echo 0
-            fi
-          args:
-            executable: /bin/bash
-          register: pkg_tx_count
-          changed_when: false
-          failed_when: false
-
-        - name: "Compute approximate affected-package count"
-          ansible.builtin.set_fact:
-            approx_affected_packages: "{{ pkg_tx_count.stdout | default('0') | trim | int }}"
-
-        - name: "AAP log :: summary level"
-          ansible.builtin.debug:
-            msg:
-              - "SamurAI Shield :: yum-update :: SUMMARY"
-              - "host={{ inventory_hostname }} action={{ ACTION }} update_mode={{ UPDATE_MODE }}"
-              - "approx_affected_packages={{ approx_affected_packages }}"
-              - "updates_available_before={{ updates_available_count | default('unknown') }}"
-              - "evidence_dir={{ evidence_dir }}"
-              - "reboot_required_before={{ reboot_required_before | default('unknown') }}"
-              - "reboot_required_after={{ reboot_required_after | default('not_yet_computed') }}"
-          when: effective_log_level == 'summary'
-
-        - name: "Extract package-transaction lines (capped) for AAP log"
-          ansible.builtin.shell: |
-            set -o pipefail
-            f="{{ evidence_dir }}/update_stdout.txt"
-            if [ -f "$f" ]; then
-              grep -E '{{ pkg_tx_regex }}' "$f" | head -n {{ log_package_max_lines | int }} || true
-            fi
-          args:
-            executable: /bin/bash
-          register: pkg_transaction_lines
-          changed_when: false
-          failed_when: false
-          when: effective_log_level == 'package'
-
-        # In Check mode nothing is installed, so update_stdout.txt is empty and the
-        # grep above finds nothing. The packages that WOULD be updated are in the
-        # `check-update` output — its lines (pkg.arch  version  repo) do NOT match
-        # the transaction regex, so show them directly instead of reporting "none".
-        - name: "Build available-updates lines for the AAP log (Check mode)"
-          ansible.builtin.set_fact:
-            yum_available_lines: >-
-              {{
-                check_update_out.stdout_lines | default([])
-                | reject('match', '^\\s*$') | reject('match', '^Obsoleting')
-                | reject('match', '^Last metadata') | reject('match', '^Loaded plugins')
-                | reject('match', '^Loading mirror') | list
-              }}
-          when: effective_log_level == 'package'
-
-        - name: "AAP log :: package level (max {{ log_package_max_lines }} lines)"
-          ansible.builtin.debug:
-            msg: >-
-              {{
-                (pkg_transaction_lines.stdout_lines | default([]))[0:(log_package_max_lines | int)]
-                if (ACTION == 'Apply' and (pkg_transaction_lines.stdout_lines | default([]) | length) > 0)
-                else (
-                  (yum_available_lines | default([]))[0:(log_package_max_lines | int)]
-                  if (ACTION != 'Apply' and (yum_available_lines | default([]) | length) > 0)
-                  else [('no packages to install (host already up to date)') if ACTION == 'Apply'
-                        else ('no updates available (host already up to date)')]
-                )
-              }}
-          when: effective_log_level == 'package'
-
-        - name: "Read full update stdout/stderr (capped) for AAP log"
-          ansible.builtin.shell: |
-            {% if ACTION == 'Apply' %}
-            echo "===== update_stdout.txt (max {{ log_full_max_lines }} lines) ====="
-            head -n {{ log_full_max_lines | int }} "{{ evidence_dir }}/update_stdout.txt" 2>/dev/null || echo "(update_stdout.txt not available)"
-            echo ""
-            echo "===== update_stderr.txt (max {{ log_full_max_lines }} lines) ====="
-            head -n {{ log_full_max_lines | int }} "{{ evidence_dir }}/update_stderr.txt" 2>/dev/null || echo "(update_stderr.txt not available)"
-            {% else %}
-            echo "===== available updates (Check mode — {{ pkg_manager | default('yum') }} check-update) (max {{ log_full_max_lines }} lines) ====="
-            head -n {{ log_full_max_lines | int }} "{{ evidence_dir }}/updates_available_before.txt" 2>/dev/null || echo "(check-update output not available)"
-            {% endif %}
-          args:
-            executable: /bin/bash
-          register: full_update_log
-          changed_when: false
-          failed_when: false
-          when: effective_log_level == 'full'
-
-        - name: "AAP log :: full level"
-          ansible.builtin.debug:
-            msg: "{{ full_update_log.stdout_lines | default(['(no update output captured)']) }}"
-          when: effective_log_level == 'full'
+            content: "{{ (update_result.stderr | default('not_applicable_check_mode')) if ACTION == 'Apply' else 'not_applicable_check_mode' }}\n"
 
         - name: "Fail playbook when update returned non-zero"
           ansible.builtin.fail:
-            msg: |
-              {% if UPDATE_MODE == 'security' %}
-              Security update failed (rc={{ update_result.rc }}) on {{ inventory_hostname }}.
-              UPDATE_MODE=security requires that the package manager, the security plugin
-              (e.g. dnf-plugin-security / yum-plugin-security) AND the enabled repositories
-              expose security advisory metadata (updateinfo.xml). When any of these is
-              missing the command --security may be rejected, return no candidates, or
-              fail with 'No such command' / 'unknown option'. The playbook deliberately
-              does NOT fall back to a full update — fix the security metadata or relaunch
-              with UPDATE_MODE=all if a full update is acceptable.
-              Evidence files:
-              - {{ evidence_dir }}/update_stdout.txt
-              - {{ evidence_dir }}/update_stderr.txt
-              Diagnostic tail:
-              {{ update_error_tail.stdout | default('no diagnostic output captured') }}
-              {% else %}
-              Package update failed (rc={{ update_result.rc }}) on {{ inventory_hostname }}.
-              Evidence files:
-              - {{ evidence_dir }}/update_stdout.txt
-              - {{ evidence_dir }}/update_stderr.txt
-              Diagnostic tail:
-              {{ update_error_tail.stdout | default('no diagnostic output captured') }}
-              {% endif %}
+            msg: "Package update failed (rc={{ update_result.rc }}). See {{ evidence_dir }}/update_stderr.txt"
           when:
             - ACTION == 'Apply'
             - update_result.rc | default(0) != 0
@@ -583,15 +405,11 @@
           when: ACTION == 'Apply'
 
         - name: "Identify updated packages (changed NVR)"
-          # Strip from the first '|' to end to leave just the package name. We do
-          # NOT use a capture-group backreference ('\1'): inside a YAML block
-          # scalar Ansible hands re.sub the replacement as a LITERAL '\1' (not
-          # group 1), so every line collapses to '\1' and the count becomes 1.
           ansible.builtin.set_fact:
             packages_updated: >-
               {{
                 (pkgs_after_set | difference(pkgs_before_set))
-                | map('regex_replace', '\\|.*$', '') | unique | list
+                | map('regex_replace', '^([^|]+)\\|.*$', '\\1') | unique | list
               }}
           when: ACTION == 'Apply'
 
@@ -634,14 +452,11 @@
             - systemctl_stat.stat.exists | default(false)
 
         - name: "Build failed services list"
-          # Same backreference caveat as packages_updated: trim, then strip from
-          # the first whitespace to end to keep the unit name (no '\1').
           ansible.builtin.set_fact:
             failed_services_list: >-
               {{
                 (failed_units.stdout_lines | default([]))
-                | map('trim') | map('regex_replace', '\\s.*$', '')
-                | reject('equalto', '') | list
+                | map('regex_replace', '^\\s*(\\S+).*$', '\\1') | list
               }}
           when: ACTION == 'Apply'
 
@@ -746,9 +561,12 @@
                 )
               }}
 
-        - name: "Capture finished_at timestamp (UTC, controller-side)"
+        - name: "Capture finished_at timestamp"
           ansible.builtin.set_fact:
-            execution_finished_at: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+            # bedin/PR #3083 — ansible_date_time e coletado UMA vez no fact
+            # gathering: usa-lo aqui repetia o started_at e zerava a duracao
+            # aparente na evidencia. strftime sem epoch = agora (UTC).
+            execution_finished_at: "{{ '%Y-%m-%dT%H:%M:%SZ' | strftime(utc=true) }}"
 
         - name: "Build per-host summary"
           ansible.builtin.set_fact:
@@ -766,7 +584,6 @@
               package_manager: "{{ pkg_manager | default('unknown') }}"
               action: "{{ ACTION }}"
               update_mode: "{{ UPDATE_MODE }}"
-              log_level: "{{ effective_log_level }}"
               exclude_packages: "{{ exclude_packages_list }}"
               updates_available_before_count: "{{ updates_available_count | default(0) | int }}"
               packages_updated_count: "{{ (packages_updated | default([])) | length }}"
@@ -794,6 +611,19 @@
               samurai_yum_update_summary: "{{ host_summary }}"
             per_host: true
             aggregate: false
+
+    # #3037 (C3) — o rescue recupera o host para o `always` conseguir escrever
+    # a evidência estruturada; SEM este re-fail o host recuperado sairia
+    # `failed=0` no PLAY RECAP e o grading do Execution Center o contaria como
+    # sucesso (FAILED TARGETS ficava em 0 com o job reprovado). Depois da
+    # evidência publicada, o host falho volta a FALHAR — com o erro capturado
+    # legível no stdout, perto do recap.
+    - name: "Fail the host when execution ended failed (structured evidence already published)"
+      ansible.builtin.fail:
+        msg: >-
+          Remediation failed on {{ inventory_hostname }}:
+          {{ (samurai_errors | join(' | ')) if (samurai_errors | length) > 0 else 'see summary.json' }}
+      when: (execution_status | default('')) == 'failed'
 
 
 - name: "SamurAI :: yum-update :: emit consolidated stdout JSON"
@@ -823,7 +653,6 @@
           playbook: "linux_yum_update_with_evidence"
           action: "{{ ACTION | default('Check') }}"
           update_mode: "{{ UPDATE_MODE | default('all') }}"
-          log_level: "{{ LOG_LEVEL | default('package') }}"
           status: "{{ consolidated_status }}"
           host_count: "{{ all_host_summaries | length }}"
           hosts: "{{ all_host_summaries }}"
@@ -838,8 +667,3 @@
           samurai_shield_result: "{{ samurai_shield_result }}"
         aggregate: false
         per_host: false
-
-    - name: "Fail job when one or more hosts failed"
-      ansible.builtin.fail:
-        msg: "One or more hosts failed during yum/dnf update. See samurai_shield_result in stdout."
-      when: consolidated_status == 'failed'
