@@ -16,9 +16,11 @@
 #
 # Inputs (extra_vars from the control plane):
 #   target_host                IP/hostname of the existing host to collect (required)
-#   target_port                SSH port of that host (optional, defaults to 22 —
-#                              the engine always sends it; the default only covers
-#                              a manual/legacy launch)
+#   target_connection_type     transport to the host: `ssh` (default) or `winrm`
+#   target_winrm_cert_validation  WinRM TLS policy, only sent on a WinRM launch
+#   target_port                connection port of that host (optional, defaults to
+#                              22 — the engine always sends it; the default only
+#                              covers a manual/legacy launch)
 #   samurai_execution_id       correlation id, stamped everywhere (required, I8)
 #   organization_id            tenant scope, carried in the document (required)
 #   facts_s3_presigned_put_url presigned S3 PUT URL for this run's inbox object (required)
@@ -63,18 +65,42 @@
       ansible.builtin.add_host:
         name: "{{ target_host }}"
         groups: samurai_collect_target
-        # The host's SSH port, from the linked host credential (#1671). It CANNOT
-        # ride on the Machine credential — `port` is not a Machine credential
-        # input — so the in-memory host is the only place it can be set. Without
-        # it the play dials 22: a NAT'd lab host published on 8513 reached a
-        # different sshd on the shared public IP and failed as "Permission
-        # denied" (real STG job 210), which reads as a wrong password.
-        # default(22) keeps older callers that omit target_port working.
+        # O TRANSPORTE que leva a credencial até o alvo. Uma credencial de conta
+        # Windows (`windows_local_admin`, `domain_account`) autentica por WinRM,
+        # não por OpenSSH: sem isto a coleta pedia banner OpenSSH numa porta que
+        # só fala WSMan e morria em timeout. default('ssh') preserva byte a byte
+        # todo chamador anterior.
+        ansible_connection: "{{ target_connection_type | default('ssh') }}"
+        # NTLM é a autenticação de conta LOCAL do Windows por WinRM (kerberos
+        # exige domínio). Só viaja quando o transporte é WinRM — no SSH o
+        # `omit` mantém a task idêntica à de antes.
+        ansible_winrm_transport: >-
+          {{ 'ntlm' if (target_connection_type | default('ssh')) == 'winrm'
+             else omit }}
+        # A política TLS do WinRM, que viaja COM o transporte dono dela. Um
+        # Windows Server brownfield publica o WinRM HTTPS com o certificado
+        # self-signed que ele mesmo gera, então a validação de cadeia falha por
+        # construção (medido no STG no Managed Server 22: a 5986 respondeu na
+        # hora e o handshake morreu em CERTIFICATE_VERIFY_FAILED). O canal segue
+        # cifrado e o NTLM segue autenticando; o que se dispensa é confiar numa
+        # CA que nenhuma máquina cliente registrou. No SSH o `omit` mantém a
+        # task idêntica — nada de afrouxar TLS global no `ansible.cfg`.
+        ansible_winrm_server_cert_validation: >-
+          {{ target_winrm_cert_validation | default('ignore')
+             if (target_connection_type | default('ssh')) == 'winrm'
+             else omit }}
+        # A porta da conexão, resolvida junto com o transporte (#1671): a do
+        # host credential no SSH, 5986 no WinRM. Ela NÃO pode viajar na Machine
+        # credential — `port` não é input dela — então o host em memória é o
+        # único lugar onde dá pra setar. Sem isto o play disca 22: um lab NAT'd
+        # publicado na 8513 caiu num sshd diferente do mesmo IP público e falhou
+        # como "Permission denied" (job real 210 no STG), que se lê como senha
+        # errada. default(22) mantém funcionando quem omite target_port.
         ansible_port: "{{ target_port | default(22) }}"
-        # O shell que o alvo fala (OSA #2809, fundação Windows): o Windows
-        # conecta pelo MESMO OpenSSH, mas o Ansible precisa saber que o shell
-        # padrão é PowerShell para usar os wrappers certos. default('sh')
-        # preserva todo chamador anterior byte a byte.
+        # O shell que o alvo fala (OSA #2809, fundação Windows): o Ansible
+        # precisa saber que o shell padrão é PowerShell para usar os wrappers
+        # certos — vale tanto pro Windows por OpenSSH quanto por WinRM.
+        # default('sh') preserva todo chamador anterior byte a byte.
         ansible_shell_type: "{{ target_shell_type | default('sh') }}"
         # A CONTA que existe no alvo. Numa máquina do cliente é a da credencial
         # governada, e o omitido aqui deixa a Machine credential mandar — é o
@@ -103,6 +129,9 @@
   gather_facts: false
   tasks:
     - name: "[inventory_collect] Wait until the target actually serves SSH"
+      # Só no transporte SSH: um alvo WinRM nunca emite banner OpenSSH, e
+      # esperar por ele queimava o timeout inteiro antes de tocar na máquina.
+      when: (target_connection_type | default('ssh')) == 'ssh'
       # Espera do lado do CONTROLADOR, olhando a porta e o banner — de propósito.
       # `wait_for_connection` executa `ansible.legacy.ping`, que precisa de Python
       # no alvo e portanto nunca responde numa candidata Windows; esperar o banner
@@ -122,6 +151,19 @@
         timeout: "{{ inventory_collect_connection_timeout | default(600) | int }}"
         sleep: 10
       delegate_to: localhost
+      tags: [inventory_collect]
+
+    - name: "[inventory_collect] Wait until the target's WinRM listener answers"
+      # Readiness MÍNIMA compatível com WinRM: porta aberta, sem banner. Quem
+      # prova a conexão de verdade é o connection plugin no gather logo abaixo —
+      # aqui só se espera a máquina subir (no Windows o boot leva minutos).
+      ansible.builtin.wait_for:
+        host: "{{ target_host }}"
+        port: "{{ target_port | default(5986) | int }}"
+        timeout: "{{ inventory_collect_connection_timeout | default(600) | int }}"
+        sleep: 10
+      delegate_to: localhost
+      when: (target_connection_type | default('ssh')) == 'winrm'
       tags: [inventory_collect]
 
     - name: "[inventory_collect] Gather facts once the target is reachable"
