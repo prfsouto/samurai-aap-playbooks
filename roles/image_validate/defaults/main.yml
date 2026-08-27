@@ -59,8 +59,16 @@ image_validate_terraform_module_dir: >-
 # compartilhariam o mesmo workdir, uma sobrescrevendo o estado da outra. Falhar
 # alto é o comportamento correto: a variável indefinida quebra a expansão.
 image_validate_terraform_workdir: >-
-  {{ samurai_image_validate_terraform_workdir
-     | default('/tmp/samurai/image-validate-tf/' ~ samurai_execution_id, true) }}
+ {{ samurai_image_validate_terraform_workdir
+    | default('/tmp/samurai/image-validate-tf/' ~ samurai_execution_id, true) }}
+
+# Workdir do caminho NÃO-Terraform (o default de provision): guarda o user-data
+# que autoriza a chave efêmera da execução. Mesmo raciocínio do workdir Terraform
+# — `/tmp` pelo UID arbitrário do EE, `samurai_execution_id` SEM fallback para
+# duas execuções nunca dividirem o arquivo.
+image_validate_native_workdir: >-
+ {{ samurai_image_validate_native_workdir
+    | default('/tmp/samurai/image-validate-native/' ~ samurai_execution_id, true) }}
 
 # Remote state is NOT optional for this module. The apply and the destroy are
 # two different jobs, minutes or hours apart: without durable state the destroy
@@ -114,6 +122,7 @@ image_validate_source_server_id: "{{ image_validate.source_server_id | default('
 image_validate_asset_id: "{{ image_validate.asset_id | default('', true) }}"
 image_validate_ssh_username: "{{ image_validate.ssh_username | default('ubuntu', true) }}"
 image_validate_ssh_public_key: "{{ image_validate.ssh_public_key | default('', true) }}"
+image_validate_candidate_bootstrap: "{{ image_validate.candidate_bootstrap | default('posix_shell', true) }}"
 
 # ── Identity + tenant scope ─────────────────────────────────────────────────
 image_validate_organization_id: "{{ organization_id | default('', true) }}"

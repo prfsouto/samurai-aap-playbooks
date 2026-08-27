@@ -536,9 +536,12 @@
     that:
       - image_validate_ssh_username | string | length > 0
       - image_validate_ssh_public_key | string | length > 0
+      - image_validate_candidate_bootstrap in ['posix_shell', 'windows_powershell']
     fail_msg: >-
       AWS Candidate B requires the source host SSH username and public key
-      before the instance is created.
+      before the instance is created, and candidate_bootstrap must name a known
+      dialect (posix_shell or windows_powershell — got
+      '{{ image_validate_candidate_bootstrap }}').
   tags: [image_validate, provision]
 
 - name: "[image_validate] Record provision start timestamp (UTC)"
@@ -606,7 +609,8 @@
           'execution_id': samurai_execution_id | string,
           'image_version_id': image_validate_image_version_id | string,
           'ssh_username': image_validate_ssh_username,
-          'ssh_public_key': image_validate_ssh_public_key} | to_nice_json }}"
+          'ssh_public_key': image_validate_ssh_public_key,
+          'candidate_bootstrap': image_validate_candidate_bootstrap} | to_nice_json }}"
 
     - name: "[image_validate] Terraform init against the run's own state key"
       ansible.builtin.command:
@@ -780,6 +784,79 @@
     - not (image_validate_use_terraform | bool)
   tags: [image_validate, provision]
   block:
+    - name: "[image_validate] Ensure the native bootstrap workdir exists"
+      ansible.builtin.file:
+        path: "{{ image_validate_native_workdir }}"
+        state: directory
+        mode: "0700"
+
+    - name: "[image_validate] Record the native bootstrap user-data path"
+      ansible.builtin.set_fact:
+        image_validate_candidate_user_data_path: >-
+          {{ image_validate_native_workdir }}/candidate-bootstrap.userdata
+
+    - name: "[image_validate] Render the Candidate B bootstrap dialects"
+      # Os MESMOS dialetos do modulo Terraform (files/terraform/live-demo):
+      # autorizar a chave do coletor na conta declarada pela policy e um
+      # contrato so - o caminho native nao tem bootstrap proprio.
+      ansible.builtin.set_fact:
+        image_validate_candidate_bootstrap_posix: |
+          #cloud-boothook
+          #!/bin/sh
+          set -eu
+          candidate_user='{{ image_validate_ssh_username }}'
+          candidate_key='{{ image_validate_ssh_public_key }}'
+          candidate_home="$(getent passwd "$candidate_user" | cut -d: -f6)"
+          test -n "$candidate_home"
+          candidate_uid="$(id -u "$candidate_user")"
+          candidate_gid="$(id -g "$candidate_user")"
+          install -d -m 700 -o "$candidate_uid" -g "$candidate_gid" "$candidate_home/.ssh"
+          touch "$candidate_home/.ssh/authorized_keys"
+          chown "$candidate_uid:$candidate_gid" "$candidate_home/.ssh/authorized_keys"
+          chmod 600 "$candidate_home/.ssh/authorized_keys"
+          if ! grep -Fqx -- "$candidate_key" "$candidate_home/.ssh/authorized_keys"; then
+            printf '%s\n' "$candidate_key" >> "$candidate_home/.ssh/authorized_keys"
+          fi
+        image_validate_candidate_bootstrap_windows: |
+          <powershell>
+          $ErrorActionPreference = 'Stop'
+          $candidateUser = '{{ image_validate_ssh_username }}'
+          $candidateKey  = '{{ image_validate_ssh_public_key }}'
+          if (-not (Get-LocalUser -Name $candidateUser -ErrorAction SilentlyContinue)) {
+            throw "candidate account $candidateUser does not exist in this image"
+          }
+          $isAdmin = $false
+          foreach ($member in (Get-LocalGroupMember -Group 'Administrators' -ErrorAction SilentlyContinue)) {
+            if ($member.Name -eq "$env:COMPUTERNAME\$candidateUser") { $isAdmin = $true }
+          }
+          if ($isAdmin) {
+            $target = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
+          } else {
+            $target = Join-Path 'C:\Users' $candidateUser
+            $target = Join-Path $target '.ssh\authorized_keys'
+          }
+          New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
+          if (-not (Test-Path $target)) { New-Item -ItemType File -Force -Path $target | Out-Null }
+          if (-not (Select-String -Path $target -SimpleMatch -Pattern $candidateKey -Quiet)) {
+            $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+            [System.IO.File]::AppendAllText($target, ($candidateKey + "`n"), $utf8NoBom)
+          }
+          if ($isAdmin) {
+            icacls.exe $target /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null
+          }
+          </powershell>
+          <persist>false</persist>
+
+    - name: "[image_validate] Stage the Candidate B bootstrap user-data"
+      # Em arquivo com file://: a aws-cli le o arquivo e faz o base64 - o
+      # script nunca aparece na linha de comando nem no log do job.
+      ansible.builtin.copy:
+        dest: "{{ image_validate_candidate_user_data_path }}"
+        mode: "0600"
+        content: "{{ image_validate_candidate_bootstrap_windows
+          if (image_validate_candidate_bootstrap == 'windows_powershell')
+          else image_validate_candidate_bootstrap_posix }}"
+
     - name: "[image_validate] Launch the throwaway bench (tagged with run identity)"
       ansible.builtin.command:
         argv: >-
@@ -795,6 +872,7 @@
                 ~ '},{Key=SamuraiImageVersionId,Value=' ~ image_validate_image_version_id
                 ~ '},{Key=Name,Value=samurai-image-validate-' ~ samurai_execution_id
                 ~ '},{Key=managed_by,Value=samurai-shield}]',
+                '--user-data', 'file://' ~ image_validate_candidate_user_data_path,
                 '--output', 'json'] }}
       register: image_validate_run_instances
       changed_when: true
