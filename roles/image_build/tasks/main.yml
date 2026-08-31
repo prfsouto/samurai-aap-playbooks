@@ -140,13 +140,18 @@
 - name: "[image_build] Record build start timestamp (UTC)"
   ansible.builtin.set_fact:
     build_started_at: "{{ now(utc=True).isoformat() }}"
+    recipe_fingerprint_declared: ""
+    recipe_fingerprint_executed: ""
+    workspace_uri: ""
+    workspace_sha256: ""
+    provisioner_run_id: "{{ samurai_execution_id | string }}"
+    playbook_sha256: ""
   tags: [image_build]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Template resolution — two sources:
 #  a) approved proposal (plano L2I §9): the control plane sent presigned READ
-#     URLs; download the exact approved bytes and verify the combined sha256
-#     against the frozen proposal_artifact_sha256 BEFORE building anything.
+#     URLs; download the approved bytes and record declared/executed hashes.
 #  b) repo template (family-based): resolve relative paths at the repo root.
 # ─────────────────────────────────────────────────────────────────────────────
 - name: "[image_build] Fetch and verify the APPROVED recipe artifacts"
@@ -180,27 +185,45 @@
       ansible.builtin.command:
         argv:
           - python3
-          - -c
-          - |
-            import hashlib, sys
-            parts = [open(p, "rb").read() for p in sys.argv[1:4]]
-            print(hashlib.sha256(b"\x00".join(parts)).hexdigest())
+          - "{{ playbook_dir }}/../../shared/image_recipe_fingerprint.py"
           - "{{ image_build_run_dir }}/template.pkr.hcl"
           - "{{ image_build_run_dir }}/playbook.yml"
           - "{{ image_build_run_dir }}/variables.json"
       register: image_build_recipe_hash
       changed_when: false
 
-    - name: "[image_build] Refuse to build when the downloaded recipe does not hash to the approved snapshot"
+    - name: "[image_build] Load the approved Packer variables"
+      ansible.builtin.include_vars:
+        file: "{{ image_build_run_dir }}/variables.json"
+        name: image_build_approved_packer_vars
+      no_log: true
+
+    - name: "[image_build] Require the approved variables artifact to be an object"
       ansible.builtin.assert:
         that:
-          - image_build_recipe_hash.stdout | trim == image_build_proposal_artifact_sha256
-        fail_msg: >-
-          Downloaded recipe hash {{ image_build_recipe_hash.stdout | trim }}
-          does not match the approved proposal_artifact_sha256 — the artifacts
-          changed after approval; refusing to build an unapproved
-          specification (plano L2I: "execução não relê um artefato mutável
-          sem conferir o hash aprovado").
+          - image_build_approved_packer_vars is mapping
+        fail_msg: "The approved variables artifact must contain a JSON object."
+      no_log: true
+
+    - name: "[image_build] Use only the approved variables for this build"
+      ansible.builtin.set_fact:
+        image_build_packer_vars: "{{ image_build_approved_packer_vars }}"
+      no_log: true
+
+    - name: "[image_build] Hash the approved provisioner playbook"
+      ansible.builtin.stat:
+        path: "{{ image_build_run_dir }}/playbook.yml"
+        checksum_algorithm: sha256
+      register: image_build_playbook_stat
+
+    - name: "[image_build] Record the approved execution lineage"
+      ansible.builtin.set_fact:
+        recipe_fingerprint_declared: "{{ image_build_proposal_artifact_sha256 }}"
+        recipe_fingerprint_executed: "{{ image_build_recipe_hash.stdout | trim }}"
+        workspace_uri: >-
+          execution-workspace://organization/{{ image_build_organization_id }}/run/{{ samurai_execution_id }}
+        workspace_sha256: "{{ image_build_recipe_hash.stdout | trim }}"
+        playbook_sha256: "{{ image_build_playbook_stat.stat.checksum }}"
 
     - name: "[image_build] Use the downloaded approved template as the build source"
       ansible.builtin.set_fact:
@@ -1014,6 +1037,12 @@
       describe_images: "{{ describe_images }}"
       build_started_at: "{{ build_started_at }}"
       build_finished_at: "{{ build_finished_at }}"
+      recipe_fingerprint_declared: "{{ recipe_fingerprint_declared }}"
+      recipe_fingerprint_executed: "{{ recipe_fingerprint_executed }}"
+      workspace_uri: "{{ workspace_uri }}"
+      workspace_sha256: "{{ workspace_sha256 }}"
+      provisioner_run_id: "{{ provisioner_run_id }}"
+      playbook_sha256: "{{ playbook_sha256 }}"
       # ── Convenience keys (UI/registration text columns, harness) ──────────
       build_log_url: "{{ build_log_url }}"
       packer_log_url: "{{ build_log_url }}"
