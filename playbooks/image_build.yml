@@ -43,6 +43,12 @@
           describe_images: "{{ describe_images | default({'status': 'unavailable', 'reason': 'image_build role did not run'}) }}"
           build_started_at: "{{ build_started_at | default('') }}"
           build_finished_at: "{{ build_finished_at | default('') }}"
+          recipe_fingerprint_declared: "{{ recipe_fingerprint_declared | default('') }}"
+          recipe_fingerprint_executed: "{{ recipe_fingerprint_executed | default('') }}"
+          workspace_uri: "{{ workspace_uri | default('') }}"
+          workspace_sha256: "{{ workspace_sha256 | default('') }}"
+          provisioner_run_id: "{{ provisioner_run_id | default('') }}"
+          playbook_sha256: "{{ playbook_sha256 | default('') }}"
           # ── Convenience keys (UI/registration text columns, harness) ──────
           build_log_url: "{{ build_log_url | default('') }}"
           packer_log_url: "{{ build_log_url | default('') }}"
