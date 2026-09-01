@@ -1,0 +1,30 @@
+---
+# Uma tentativa de provar EXECUÇÃO AUTENTICADA no alvo, com espera entre
+# tentativas do lado do controlador. `raw` não exige Python nem wrappers de
+# PowerShell e vale para SSH e WinRM; a credencial continua só no connection
+# plugin. `unreachable` aqui é espera de primeiro boot, nunca evidência.
+# O sucesso trava em `set_fact` (task pulada REESCREVE `register` — um
+# registro simples perderia o rc=0 na iteração seguinte do loop).
+- name: "[inventory_collect] Attempt authenticated execution on the target"
+  ansible.builtin.raw: echo samurai-collect-ready
+  register: samurai_collect_probe
+  ignore_unreachable: true
+  ignore_errors: true
+  changed_when: false
+  when: not (samurai_collect_ready_ok | default(false) | bool)
+  tags: [inventory_collect]
+
+- name: "[inventory_collect] Latch the authenticated-execution proof"
+  ansible.builtin.set_fact:
+    samurai_collect_ready_ok: true
+  when:
+    - not (samurai_collect_ready_ok | default(false) | bool)
+    - (samurai_collect_probe.rc | default(1)) == 0
+  tags: [inventory_collect]
+
+- name: "[inventory_collect] Give the candidate boot time before the next attempt"
+  ansible.builtin.wait_for:
+    timeout: 15
+  delegate_to: localhost
+  when: not (samurai_collect_ready_ok | default(false) | bool)
+  tags: [inventory_collect]

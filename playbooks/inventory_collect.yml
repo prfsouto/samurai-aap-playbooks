@@ -166,6 +166,31 @@
       when: (target_connection_type | default('ssh')) == 'winrm'
       tags: [inventory_collect]
 
+    - name: "[inventory_collect] Prove authenticated execution before collecting"
+      # O banner prova que o SERVIÇO atende; numa candidata recém-provisionada
+      # ele aparece minutos ANTES do primeiro boot terminar — no Windows o
+      # user-data que autoriza a chave roda depois do sshd subir, e a coleta
+      # batia em "Connection reset by port 22" com o banner de pé (medido no
+      # STG, validação 185 / job AAP 517). Só a EXECUÇÃO autenticada prova a
+      # máquina pronta, e `unreachable` no meio do boot é espera, nunca
+      # evidência — por isso as tentativas toleram unreachable e o veredito
+      # fica para o assert abaixo (falha limpa → evidência NÃO coletada).
+      ansible.builtin.include_tasks:
+        file: inventory_collect_probe_auth.yml
+      loop: "{{ range(0, ((inventory_collect_connection_timeout | default(600) | int) // 15) | int) | list }}"
+      loop_control:
+        label: "attempt {{ item + 1 }}"
+      tags: [inventory_collect]
+
+    - name: "[inventory_collect] Refuse to collect without authenticated execution"
+      ansible.builtin.assert:
+        that:
+          - samurai_collect_ready_ok | default(false) | bool
+        fail_msg: >-
+          target never accepted authenticated command execution within the
+          connection window — evidence was NOT collected
+      tags: [inventory_collect]
+
     - name: "[inventory_collect] Gather facts once the target is reachable"
       ansible.builtin.setup:
       tags: [inventory_collect]
