@@ -28,6 +28,7 @@ aws_replacement_hostname: "{{ aws_replacement.hostname | default('') }}"
 aws_replacement_instance_type: "{{ aws_replacement.instance_type | default('t3.small') }}"
 aws_replacement_subnet_id: "{{ aws_replacement.subnet_id | default(samurai_aws_replacement_subnet_id | default('')) }}"
 aws_replacement_security_group_id: "{{ aws_replacement.security_group_id | default(samurai_aws_replacement_security_group_id | default('')) }}"
+aws_replacement_associate_public_ip: "{{ aws_replacement.associate_public_ip | default(false) | bool }}"
 aws_replacement_extra_tags: "{{ aws_replacement.tags | default({}) }}"
 
 # Read-only reference to the ORIGIN instance — used exclusively for the two

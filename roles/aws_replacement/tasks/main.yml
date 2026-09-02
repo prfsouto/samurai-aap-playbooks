@@ -174,6 +174,7 @@
               '--query', 'Instances[0].InstanceId', '--output', 'text']
              + (['--subnet-id', aws_replacement_subnet_id] if (aws_replacement_subnet_id | length > 0) else [])
              + (['--security-group-ids', aws_replacement_security_group_id] if (aws_replacement_security_group_id | length > 0) else [])
+             + (['--associate-public-ip-address'] if aws_replacement_associate_public_ip else [])
              + ['--user-data', aws_replacement_user_data] }}
       register: aws_replacement_run_instances
       changed_when: true
@@ -216,7 +217,7 @@
           - --region
           - "{{ aws_replacement_region }}"
           - --query
-          - "Reservations[].Instances[].{InstanceId:InstanceId,State:State.Name,PrivateIp:PrivateIpAddress,ImageId:ImageId,Type:InstanceType,Tags:Tags}"
+          - "Reservations[].Instances[].{InstanceId:InstanceId,State:State.Name,PrivateIp:PrivateIpAddress,PublicIp:PublicIpAddress,ImageId:ImageId,Type:InstanceType,Tags:Tags}"
           - --output
           - json
       register: aws_replacement_confirm
@@ -226,6 +227,7 @@
       ansible.builtin.set_fact:
         aws_replacement_describe_proof: "{{ (aws_replacement_confirm.stdout | from_json) | first }}"
         aws_replacement_private_ip: "{{ ((aws_replacement_confirm.stdout | from_json) | first).PrivateIp | default('') }}"
+        aws_replacement_public_ip: "{{ ((aws_replacement_confirm.stdout | from_json) | first).PublicIp | default('', true) }}"
 
     - name: "[aws_replacement] Assert the substitute booted from the approved image"
       ansible.builtin.assert:
@@ -277,6 +279,7 @@
         instance_id: "{{ aws_replacement_instance_id }}"
         region: "{{ aws_replacement_region }}"
         private_ip: "{{ aws_replacement_private_ip | default('') }}"
+        public_ip: "{{ aws_replacement_public_ip | default('') }}"
         hostname: "{{ aws_replacement_hostname | default('') }}"
         source_instance_id: "{{ aws_replacement_source_instance_id | default('') }}"
         describe_instances: "{{ aws_replacement_describe_proof | default({}) }}"
