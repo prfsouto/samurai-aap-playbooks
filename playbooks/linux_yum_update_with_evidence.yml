@@ -259,7 +259,7 @@
             updates_available_count: >-
               {{
                 (check_update_out.stdout_lines
-                 | reject('match', '^\\s*$')
+                 | map('trim') | reject('equalto', '')
                  | reject('match', '^Obsoleting')
                  | reject('match', '^Last metadata')
                  | reject('match', '^Loaded plugins')
@@ -323,12 +323,14 @@
           failed_when: false
           when: needs_restarting_stat.stat.exists
 
+        # States are 'required' / 'not_required' / 'unknown' — never 'yes'/'no':
+        # set_fact coerces those to booleans, and `== 'yes'` never matches again.
         - name: "Compute reboot_required_before status"
           ansible.builtin.set_fact:
             reboot_required_before: >-
               {{
                 'unknown' if not needs_restarting_stat.stat.exists
-                else ('yes' if reboot_before.rc == 1 else ('no' if reboot_before.rc == 0 else 'unknown'))
+                else ('required' if reboot_before.rc == 1 else ('not_required' if reboot_before.rc == 0 else 'unknown'))
               }}
 
         - name: "Write reboot_required_before.txt"
@@ -350,12 +352,16 @@
               {{
                 [pkg_manager, 'update', '-y']
                 + (['--security'] if UPDATE_MODE == 'security' else [])
-                + (exclude_packages_list | map('regex_replace', '^(.*)$', '--exclude=\\1') | list)
+                + (exclude_packages_list | map('regex_replace', '^', '--exclude=') | list)
               }}
           when: ACTION == 'Apply'
 
+        # argv:, never free-form `command: "{{ update_argv }}"` — a list in the
+        # free-form slot is stringified and shlex-split, so the module tries to
+        # run the program `[dnf,` and returns rc=2 with empty stdout/stderr.
         - name: "Execute package update"
-          ansible.builtin.command: "{{ update_argv }}"
+          ansible.builtin.command:
+            argv: "{{ update_argv }}"
           register: update_result
           changed_when: ACTION == 'Apply' and update_result.rc == 0 and ('Nothing to do' not in (update_result.stdout | default('')))
           failed_when: false
@@ -407,12 +413,15 @@
             pkgs_after_set: "{{ pkgs_after.stdout_lines | default([]) | list }}"
           when: ACTION == 'Apply'
 
+        # Backslash-free on purpose: Ansible doubles backslashes inside {{ }}
+        # before Jinja, so a '\\' typed in a block scalar reaches re as '\\'
+        # and '^([^|]+)\\|.*$' becomes an alternation that swallows the line.
         - name: "Identify updated packages (changed NVR)"
           ansible.builtin.set_fact:
             packages_updated: >-
               {{
                 (pkgs_after_set | difference(pkgs_before_set))
-                | map('regex_replace', '^([^|]+)\\|.*$', '\\1') | unique | list
+                | map('split', '|') | map('first') | unique | list
               }}
           when: ACTION == 'Apply'
 
@@ -459,7 +468,8 @@
             failed_services_list: >-
               {{
                 (failed_units.stdout_lines | default([]))
-                | map('regex_replace', '^\\s*(\\S+).*$', '\\1') | list
+                | map('trim') | reject('equalto', '')
+                | map('split') | map('first') | list
               }}
           when: ACTION == 'Apply'
 
@@ -492,7 +502,7 @@
               {{
                 'not_applicable_check_mode' if ACTION != 'Apply'
                 else ('unknown' if not needs_restarting_stat.stat.exists
-                      else ('yes' if reboot_after.rc == 1 else ('no' if reboot_after.rc == 0 else 'unknown')))
+                      else ('required' if reboot_after.rc == 1 else ('not_required' if reboot_after.rc == 0 else 'unknown')))
               }}
 
         - name: "Write reboot_required_after.txt"
@@ -537,7 +547,7 @@
           when:
             - ACTION == 'Apply'
             - ALLOW_REBOOT | bool
-            - reboot_required_after == 'yes'
+            - reboot_required_after == 'required'
           register: reboot_action
 
       rescue:
