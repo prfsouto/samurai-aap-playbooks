@@ -13,6 +13,46 @@ Supported actions:
 - `Check`: validates the host and lists available updates without changing packages.
 - `Apply`: applies yum/dnf updates and collects before/after evidence.
 
+### linux_yum_targeted_package_update_with_evidence.yml
+
+The **targeted** sibling of the yum playbook. It updates only the packages
+named in `PACKAGES` (e.g. `httpd` or `httpd,mod_ssl`) and never runs a
+full-system `yum update`. It exists to close a scope mismatch: when the
+remediation intent is "patch the Apache component", the generic playbook's
+whole-system update is refused by the SamurAI Shield AI evaluation.
+
+Same shape as the generic playbook: dynamic inventory from `HOSTNAMES`, one host
+at a time (`serial: 1`, `any_errors_fatal`), evidence under
+`/var/tmp/samurai-shield/yum-targeted-update/<host>/<timestamp>`, rescue/always
+so `summary.json` is written even when the host fails, and a consolidated
+`samurai_shield_result` JSON block on stdout.
+
+Supported actions:
+
+- `Check`: `yum check-update <packages>` for the named packages only
+  (rc 100 = update available, not an error). Nothing is changed.
+- `Apply`: `yum update -y <packages>` restricted to the list, then re-queries
+  the installed versions.
+
+Scope rules enforced by the playbook:
+
+1. `PACKAGES` is required; plain package names only — globs, wildcards and
+   version specs are rejected so the scope can never widen.
+2. A target package that is **not installed** fails the host. The playbook
+   updates, it never installs.
+3. The central evidence is `target_packages_diff.txt` /
+   `summary.json.target_package_diff`: per target, the installed version
+   before, the version `check-update` offered, the version after, and whether it
+   changed. Dependencies pulled in by the targeted update are listed separately
+   as `dependency_packages_updated`.
+
+Reboot follows the two-source rule: the engine's lowercase `allow_reboot` wins
+over the survey's `ALLOW_REBOOT`, and `summary.json` records the winner as
+`allow_reboot_source`. `reboot_required_before` / `reboot_required_after` are
+`required`, `not_required` or `unknown`.
+
+Survey: [linux_yum_targeted_package_update.survey_spec.json](playbooks/linux_yum_targeted_package_update.survey_spec.json).
+
 ### linux_apt_update_with_evidence.yml
 
 The Debian-family counterpart of the yum playbook — **Ubuntu** is the primary

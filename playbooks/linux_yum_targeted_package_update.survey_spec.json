@@ -1,0 +1,53 @@
+{
+  "name": "SamurAI Shield :: Linux yum/dnf targeted package update (RHEL-like)",
+  "description": "Input contract for playbooks/linux_yum_targeted_package_update_with_evidence.yml (repo: prfsouto/samurai-aap-playbooks). Updates ONLY the packages named in PACKAGES (never a full-system update). HOSTNAMES is auto-filled by SamurAI Shield from the governed asset and hidden from the operator form. IMPORTANT: enable 'Prompt on launch -> Extra variables' (ask_variables_on_launch) on the Job Template so the engine's governed HOSTNAMES (space-separated multi-host wave) overrides the survey's blank default instead of being discarded.",
+  "spec": [
+    {
+      "question_name": "Target host(s)",
+      "question_description": "Single host, IP, or space/comma-separated list. Filled automatically by SamurAI Shield from the selected asset — do not type it by hand.",
+      "variable": "HOSTNAMES",
+      "type": "text",
+      "required": true,
+      "default": "",
+      "new_question": true
+    },
+    {
+      "question_name": "Target package(s)",
+      "question_description": "Comma-separated package NAMES to update, e.g. httpd or httpd,mod_ssl. Plain names only: globs and wildcards are rejected. Packages not installed on the host fail the run (this playbook updates, it never installs).",
+      "variable": "PACKAGES",
+      "type": "text",
+      "required": true,
+      "default": "",
+      "new_question": true
+    },
+    {
+      "question_name": "Action",
+      "question_description": "Check lists the available updates for the named packages without changing anything. Apply runs yum/dnf update restricted to the named packages.",
+      "variable": "ACTION",
+      "type": "multiplechoice",
+      "choices": "Check\nApply",
+      "required": true,
+      "default": "Check",
+      "new_question": true
+    },
+    {
+      "question_name": "Allow reboot",
+      "question_description": "true lets the playbook reboot the target after Apply, and only when a reboot is required (needs-restarting -r).",
+      "variable": "ALLOW_REBOOT",
+      "type": "multiplechoice",
+      "choices": "false\ntrue",
+      "required": false,
+      "default": "false",
+      "new_question": true
+    },
+    {
+      "question_name": "Evidence base directory",
+      "question_description": "Base directory on the target where the structured evidence files are written.",
+      "variable": "EVIDENCE_BASE_DIR",
+      "type": "text",
+      "required": false,
+      "default": "/var/tmp/samurai-shield/yum-targeted-update",
+      "new_question": true
+    }
+  ]
+}
