@@ -1,0 +1,774 @@
+---
+# ============================================================================
+# SamurAI Shield :: Linux yum/dnf TARGETED package update with evidence
+# ----------------------------------------------------------------------------
+# Controlled update of a NAMED set of packages (e.g. "httpd") on Red Hat-like
+# Linux servers, executed from Ansible Automation Platform (AAP).
+#
+# Why this playbook exists (scope): the generic linux_yum_update_with_evidence
+# playbook updates the WHOLE system. When the remediation intent is "patch the
+# Apache component", a full-system update is a scope mismatch and is refused by
+# the SamurAI Shield AI evaluation. This playbook closes that gap: it updates
+# ONLY the packages listed in PACKAGES and never falls back to a general
+# `yum update`. The central evidence is the per-package version diff
+# (before / available / after) for the named targets.
+#
+# Stages:
+#   1. Validate extra-vars and build the dynamic in-memory inventory from
+#      HOSTNAMES (localhost play).
+#   2. On each target (serial: 1, any_errors_fatal): assert RedHat family,
+#      baseline rpm -q of the targets, targeted check-update or targeted
+#      update, post rpm -q, needs-restarting, evidence files (also on failure).
+#   3. Emit a consolidated samurai_shield_result JSON block on stdout.
+#
+# Extra-vars contract:
+#   HOSTNAMES  (required) host, IP or space/comma-separated list.
+#   PACKAGES   (required) comma/space-separated package NAMES, e.g. "httpd" or
+#              "httpd,mod_ssl". Plain names only — globs and wildcards are
+#              rejected so the scope can never widen to the whole system.
+#   ACTION     Check | Apply (default Check).
+#              Check = `yum check-update <packages>` (rc 100 = update available,
+#                      not an error). Nothing is changed.
+#              Apply = `yum update -y <packages>` restricted to the list.
+#              A target package that is not installed fails the host: this
+#              playbook updates, it never installs.
+#   ALLOW_REBOOT (bool, default false) reboot after Apply, only when
+#              needs-restarting -r reports a reboot is required
+#              (reboot_required_* = required | not_required | unknown). On the governed
+#              path the engine injects lowercase `allow_reboot`, which wins over
+#              ALLOW_REBOOT; summary.json records the winner as
+#              allow_reboot_source (governed | survey | default).
+#   EVIDENCE_BASE_DIR (default /var/tmp/samurai-shield/yum-targeted-update)
+#
+# Internal variables (samurai_*, tp_*) never become extra-vars.
+# ============================================================================
+
+- name: "SamurAI :: yum-targeted-update :: validate extra-vars and build dynamic inventory"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    # Distinct internal names: a play var that references its own name recurses
+    # when the extra-var is absent. Survey blanks arrive as '' (defined), so the
+    # fallback is `(X | default('') | trim) or <default>`, never `default()`.
+    tp_hostnames_raw: "{{ HOSTNAMES | default('') | string | trim }}"
+    tp_packages_raw: "{{ PACKAGES | default('') | string | trim }}"
+    tp_action_raw: "{{ (ACTION | default('') | string | trim) or 'Check' }}"
+    tp_reboot_governed: "{{ allow_reboot | default('') | string | trim }}"
+    tp_reboot_survey: "{{ ALLOW_REBOOT | default('') | string | trim }}"
+    tp_evidence_base_raw: >-
+      {{ (EVIDENCE_BASE_DIR | default('') | string | trim) or '/var/tmp/samurai-shield/yum-targeted-update' }}
+  tasks:
+    - name: "Validate HOSTNAMES is provided"
+      ansible.builtin.fail:
+        msg: "HOSTNAMES extra-var is required (single host, IP, or space/comma-separated list)."
+      when: tp_hostnames_raw == ''
+
+    - name: "Validate PACKAGES is provided"
+      ansible.builtin.fail:
+        msg: >-
+          PACKAGES extra-var is required (comma-separated package names, e.g. "httpd").
+          This playbook performs a TARGETED update and refuses to run without an explicit package list.
+      when: tp_packages_raw == ''
+
+    - name: "Validate ACTION is Check or Apply"
+      ansible.builtin.fail:
+        msg: "Invalid ACTION '{{ tp_action_raw }}'. Allowed values: Check, Apply."
+      when: tp_action_raw not in ['Check', 'Apply']
+
+    - name: "Parse HOSTNAMES into a list (tolerant: space OR comma)"
+      ansible.builtin.set_fact:
+        samurai_target_hosts: >-
+          {{ tp_hostnames_raw.replace(',', ' ').split() | reject('equalto', '') | unique | list }}
+
+    - name: "Parse PACKAGES into a list (tolerant: space OR comma)"
+      ansible.builtin.set_fact:
+        samurai_target_packages: >-
+          {{ tp_packages_raw.replace(',', ' ').split() | map('trim') | reject('equalto', '') | unique | list }}
+
+    - name: "Reject package entries that are not plain package names (scope guard)"
+      ansible.builtin.fail:
+        msg: >-
+          PACKAGES entry '{{ item }}' is not a plain package name. Globs, wildcards and
+          version specs are rejected: a targeted update must name its packages explicitly.
+      loop: "{{ samurai_target_packages }}"
+      when: item is not match('^[A-Za-z0-9][A-Za-z0-9._+-]*$')
+
+    - name: "Resolve ALLOW_REBOOT (governed lowercase allow_reboot wins over survey ALLOW_REBOOT)"
+      ansible.builtin.set_fact:
+        # Coalesce on "defined and non-blank", NOT with `or`: a governed
+        # allow_reboot=false is a legitimate explicit "no" and is falsy.
+        samurai_allow_reboot: >-
+          {{
+            (tp_reboot_governed if tp_reboot_governed != ''
+             else (tp_reboot_survey if tp_reboot_survey != '' else 'false')) | bool
+          }}
+        samurai_allow_reboot_source: >-
+          {{
+            'governed' if tp_reboot_governed != ''
+            else ('survey' if tp_reboot_survey != '' else 'default')
+          }}
+
+    - name: "Publish resolved run parameters as localhost facts"
+      ansible.builtin.set_fact:
+        samurai_action: "{{ tp_action_raw }}"
+        samurai_evidence_base: "{{ tp_evidence_base_raw }}"
+
+    - name: "Add hosts to dynamic group samurai_yum_targeted_targets"
+      ansible.builtin.add_host:
+        name: "{{ item }}"
+        groups: samurai_yum_targeted_targets
+      loop: "{{ samurai_target_hosts }}"
+      changed_when: false
+
+    - name: "Show resolved targets and packages"
+      ansible.builtin.debug:
+        msg: >-
+          Targets: {{ samurai_target_hosts | join(', ') }} |
+          PACKAGES={{ samurai_target_packages | join(', ') }} |
+          ACTION={{ samurai_action }} |
+          ALLOW_REBOOT={{ samurai_allow_reboot }} ({{ samurai_allow_reboot_source }})
+
+
+- name: "SamurAI :: yum-targeted-update :: baseline, targeted check/apply and post-check"
+  hosts: samurai_yum_targeted_targets
+  gather_facts: true
+  become: true
+  serial: 1
+  any_errors_fatal: true
+
+  vars:
+    tp_action: "{{ hostvars['localhost']['samurai_action'] }}"
+    tp_packages: "{{ hostvars['localhost']['samurai_target_packages'] }}"
+    tp_allow_reboot: "{{ hostvars['localhost']['samurai_allow_reboot'] | bool }}"
+    tp_allow_reboot_source: "{{ hostvars['localhost']['samurai_allow_reboot_source'] }}"
+    tp_evidence_base: "{{ hostvars['localhost']['samurai_evidence_base'] }}"
+
+    samurai_warnings: []
+    samurai_errors: []
+
+  tasks:
+
+    # ------------------------------------------------------------------------
+    # Phase 1: timestamps + evidence directory (before the block, so `always`
+    # can write summary.json even when the host fails the OS assert)
+    # ------------------------------------------------------------------------
+    - name: "Capture execution start timestamp"
+      ansible.builtin.set_fact:
+        execution_started_at: "{{ '%Y-%m-%dT%H:%M:%SZ' | strftime(ansible_date_time.epoch | int) }}"
+        execution_timestamp: "{{ '%Y%m%dT%H%M%S' | strftime(ansible_date_time.epoch | int) }}"
+
+    - name: "Build evidence directory path"
+      ansible.builtin.set_fact:
+        evidence_dir: "{{ tp_evidence_base }}/{{ inventory_hostname }}/{{ execution_timestamp }}"
+
+    - name: "Create evidence directory"
+      ansible.builtin.file:
+        path: "{{ evidence_dir }}"
+        state: directory
+        mode: '0750'
+
+    # ------------------------------------------------------------------------
+    # Phase 2..5 inside one block so rescue/always capture evidence on failure
+    # ------------------------------------------------------------------------
+    - name: "Baseline + targeted check/apply + post-check"
+      block:
+
+        # ---- OS family guard (assert `that:` — does not pollute os_support) --
+        - name: "Assert target OS family is RedHat"
+          ansible.builtin.assert:
+            that: ansible_os_family == 'RedHat'
+            fail_msg: >-
+              Unsupported OS family '{{ ansible_os_family }}' on host {{ inventory_hostname }}.
+              This playbook only supports Red Hat-like systems (RHEL, CentOS, Rocky,
+              AlmaLinux, Oracle Linux, Amazon Linux 2/2023).
+
+        - name: "Detect dnf binary"
+          ansible.builtin.stat:
+            path: /usr/bin/dnf
+          register: dnf_stat
+          when: ansible_os_family == 'RedHat'
+
+        - name: "Detect yum binary"
+          ansible.builtin.stat:
+            path: /usr/bin/yum
+          register: yum_stat
+          when: ansible_os_family == 'RedHat'
+
+        - name: "Fail when neither dnf nor yum is available"
+          ansible.builtin.fail:
+            msg: "Neither /usr/bin/dnf nor /usr/bin/yum found on {{ inventory_hostname }}."
+          when:
+            - not (dnf_stat.stat.exists | default(false))
+            - not (yum_stat.stat.exists | default(false))
+
+        - name: "Select package manager (prefer dnf)"
+          ansible.builtin.set_fact:
+            pkg_manager: "{{ 'dnf' if (dnf_stat.stat.exists | default(false)) else 'yum' }}"
+
+        # ---- system info --------------------------------------------------
+        - name: "Write system_before.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/system_before.txt"
+            mode: '0640'
+            content: |
+              hostname: {{ ansible_hostname }}
+              fqdn: {{ ansible_fqdn }}
+              primary_ip: {{ ansible_default_ipv4.address | default('unknown') }}
+              distribution: {{ ansible_distribution }} {{ ansible_distribution_version }}
+              kernel: {{ ansible_kernel }}
+              architecture: {{ ansible_architecture }}
+              package_manager: {{ pkg_manager }}
+              started_at: {{ execution_started_at }}
+              run_user: {{ ansible_user_id | default('root') }}
+              action: {{ tp_action }}
+              target_packages: {{ tp_packages | join(', ') }}
+
+        # ---- package manager locks ---------------------------------------
+        - name: "Detect real package manager lock files"
+          ansible.builtin.stat:
+            path: "{{ item }}"
+          register: lock_stat
+          loop:
+            - /var/run/yum.pid
+            - /var/run/dnf.pid
+            - /var/lib/rpm/.rpm.lock
+
+        - name: "Fail when an active package manager lock is held"
+          ansible.builtin.fail:
+            msg: "Active package manager lock detected at {{ item.item }}."
+          loop: "{{ lock_stat.results }}"
+          when: item.stat.exists and item.stat.size | default(0) > 0
+          loop_control:
+            label: "{{ item.item }}"
+
+        # ---- baseline: rpm -q of the TARGET packages ----------------------
+        - name: "Query installed version of each target package (before)"
+          ansible.builtin.command:
+            argv:
+              - rpm
+              - -q
+              - --qf
+              - '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n'
+              - "{{ item }}"
+          register: rpm_before
+          changed_when: false
+          failed_when: false
+          loop: "{{ tp_packages }}"
+          when: ansible_os_family == 'RedHat'
+
+        - name: "Build baseline dict (package -> installed NVRA or not_installed)"
+          ansible.builtin.set_fact:
+            packages_before: >-
+              {{
+                packages_before | default({})
+                | combine({item.item: ((item.stdout_lines | sort | join(', ')) if item.rc == 0 else 'not_installed')})
+              }}
+          loop: "{{ rpm_before.results }}"
+          loop_control:
+            label: "{{ item.item }}"
+
+        - name: "Write target_packages_before.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/target_packages_before.txt"
+            mode: '0640'
+            content: |
+              {% for name in tp_packages %}
+              {{ name }}: {{ packages_before[name] }}
+              {% endfor %}
+
+        - name: "Fail when a target package is not installed (targeted update never installs)"
+          ansible.builtin.fail:
+            msg: >-
+              Target package(s) not installed on {{ inventory_hostname }}:
+              {{ missing_targets | join(', ') }}.
+              A targeted update only updates packages that are already present.
+          vars:
+            missing_targets: >-
+              {{ packages_before | dict2items | selectattr('value', 'equalto', 'not_installed') | map(attribute='key') | list }}
+          when: missing_targets | length > 0
+
+        # ---- full installed list (scope proof: what else moved) -----------
+        - name: "List all installed packages (before)"
+          ansible.builtin.shell: |
+            set -o pipefail
+            rpm -qa --qf '%{NAME}|%{VERSION}|%{RELEASE}|%{ARCH}\n' | sort
+          args:
+            executable: /bin/bash
+          register: pkgs_before
+          changed_when: false
+          when: ansible_os_family == 'RedHat'
+
+        - name: "Write packages_before.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/packages_before.txt"
+            mode: '0640'
+            content: "{{ pkgs_before.stdout }}\n"
+
+        # ---- targeted check-update (Check AND Apply: records what is available)
+        - name: "Check available updates for the target packages only"
+          ansible.builtin.command:
+            argv: "{{ [pkg_manager, '-q', 'check-update'] + tp_packages }}"
+          register: check_update_out
+          changed_when: false
+          failed_when: check_update_out.rc not in [0, 100]
+          when: ansible_os_family == 'RedHat'
+
+        # check-update lines look like "httpd.x86_64   2.4.62-1.el9   appstream".
+        # The pattern is built without backslashes on purpose: inside a YAML
+        # block scalar Ansible hands '\\.' to the regex engine literally.
+        - name: "Extract check-update lines that belong to the target packages"
+          ansible.builtin.set_fact:
+            targeted_update_lines: >-
+              {{
+                (check_update_out.stdout_lines | default([]))
+                | select('match', '^(' ~ (tp_packages | map('regex_escape') | join('|')) ~ ')[.][^ ]+ +[^ ]+')
+                | list
+              }}
+
+        - name: "Build available-updates dict (package -> available version)"
+          ansible.builtin.set_fact:
+            targeted_updates_available: >-
+              {{
+                targeted_updates_available | default({})
+                | combine({(item.split()[0]).rsplit('.', 1)[0]: item.split()[1]})
+              }}
+          loop: "{{ targeted_update_lines }}"
+
+        - name: "Write updates_available_before.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/updates_available_before.txt"
+            mode: '0640'
+            content: |
+              command: {{ pkg_manager }} -q check-update {{ tp_packages | join(' ') }}
+              exit_code: {{ check_update_out.rc }}
+              updates_available_count: {{ targeted_updates_available | default({}) | length }}
+              ---
+              {{ check_update_out.stdout }}
+
+        # ---- reboot required before --------------------------------------
+        - name: "Detect needs-restarting binary"
+          ansible.builtin.stat:
+            path: /usr/bin/needs-restarting
+          register: needs_restarting_stat
+
+        - name: "Check reboot required (before)"
+          ansible.builtin.command: needs-restarting -r
+          register: reboot_before
+          changed_when: false
+          failed_when: false
+          when: needs_restarting_stat.stat.exists
+
+        # States are 'required' / 'not_required' / 'unknown' — never 'yes'/'no',
+        # which set_fact coerces to booleans and then never equal the string.
+        - name: "Compute reboot_required_before status"
+          ansible.builtin.set_fact:
+            reboot_required_before: >-
+              {{
+                'unknown' if not needs_restarting_stat.stat.exists
+                else ('required' if reboot_before.rc == 1 else ('not_required' if reboot_before.rc == 0 else 'unknown'))
+              }}
+
+        - name: "Write reboot_required_before.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/reboot_required_before.txt"
+            mode: '0640'
+            content: |
+              status: {{ reboot_required_before }}
+              needs_restarting_available: {{ needs_restarting_stat.stat.exists }}
+              ---
+              {{ (reboot_before.stdout | default('')) if needs_restarting_stat.stat.exists else 'needs-restarting not installed' }}
+
+        # ------------------------------------------------------------------
+        # Phase 3: targeted Apply (skipped in Check mode). The argv is the
+        # package manager + 'update' + the explicit package list. There is no
+        # code path that runs `update` without the list.
+        # ------------------------------------------------------------------
+        - name: "Build targeted update command argv"
+          ansible.builtin.set_fact:
+            update_argv: "{{ [pkg_manager, 'update', '-y'] + tp_packages }}"
+          when: tp_action == 'Apply'
+
+        - name: "Execute targeted package update"
+          ansible.builtin.command:
+            argv: "{{ update_argv }}"
+          register: update_result
+          changed_when: >-
+            update_result.rc == 0
+            and ('Nothing to do' not in (update_result.stdout | default('')))
+            and ((targeted_updates_available | default({})) | length) > 0
+          failed_when: false
+          when:
+            - tp_action == 'Apply'
+            - ansible_os_family == 'RedHat'
+
+        - name: "Write update_stdout.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/update_stdout.txt"
+            mode: '0640'
+            content: |
+              {% if tp_action == 'Apply' %}
+              command: {{ update_argv | join(' ') }}
+              exit_code: {{ update_result.rc | default('n/a') }}
+              ---
+              {{ update_result.stdout | default('') }}
+              {% else %}
+              not_applicable_check_mode
+              {% endif %}
+
+        - name: "Write update_stderr.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/update_stderr.txt"
+            mode: '0640'
+            content: "{{ (update_result.stderr | default('')) if tp_action == 'Apply' else 'not_applicable_check_mode' }}\n"
+
+        - name: "Fail host when targeted update returned non-zero"
+          ansible.builtin.fail:
+            msg: "Targeted update failed (rc={{ update_result.rc }}). See {{ evidence_dir }}/update_stderr.txt"
+          when:
+            - tp_action == 'Apply'
+            - update_result.rc | default(0) != 0
+
+        # ------------------------------------------------------------------
+        # Phase 4: post state of the TARGET packages (after Apply)
+        # ------------------------------------------------------------------
+        - name: "Query installed version of each target package (after)"
+          ansible.builtin.command:
+            argv:
+              - rpm
+              - -q
+              - --qf
+              - '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n'
+              - "{{ item }}"
+          register: rpm_after
+          changed_when: false
+          failed_when: false
+          loop: "{{ tp_packages }}"
+          when:
+            - tp_action == 'Apply'
+            - ansible_os_family == 'RedHat'
+
+        - name: "Build post-state dict (package -> installed NVRA)"
+          ansible.builtin.set_fact:
+            packages_after: >-
+              {{
+                packages_after | default({})
+                | combine({item.item: ((item.stdout_lines | sort | join(', ')) if (item.rc | default(1)) == 0 else 'not_installed')})
+              }}
+          loop: "{{ rpm_after.results | default([]) }}"
+          loop_control:
+            label: "{{ item.item | default('skipped') }}"
+          when: tp_action == 'Apply'
+
+        - name: "Write target_packages_after.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/target_packages_after.txt"
+            mode: '0640'
+            content: |
+              {% if tp_action == 'Apply' %}
+              {% for name in tp_packages %}
+              {{ name }}: {{ packages_after[name] | default('unknown') }}
+              {% endfor %}
+              {% else %}
+              not_applicable_check_mode
+              {% endif %}
+
+        # ---- central evidence: per-target version diff --------------------
+        - name: "Build per-target version diff (before / available / after)"
+          ansible.builtin.set_fact:
+            target_package_diff: >-
+              {{
+                target_package_diff | default([]) + [{
+                  'package': item,
+                  'before': packages_before[item],
+                  'available_before': (targeted_updates_available | default({}))[item] | default('none'),
+                  'after': (packages_after | default({}))[item] | default(packages_before[item]),
+                  'changed': ((packages_after | default({}))[item] | default(packages_before[item])) != packages_before[item]
+                }]
+              }}
+          loop: "{{ tp_packages }}"
+
+        - name: "Compute updated target list"
+          ansible.builtin.set_fact:
+            packages_updated: >-
+              {{ target_package_diff | selectattr('changed', 'equalto', true) | map(attribute='package') | list }}
+
+        - name: "Warn when an available update did not land on a target after Apply"
+          ansible.builtin.set_fact:
+            samurai_warnings: >-
+              {{ samurai_warnings + ['update was available for ' + item.package + ' but the installed version did not change'] }}
+          loop: "{{ target_package_diff }}"
+          loop_control:
+            label: "{{ item.package }}"
+          when:
+            - tp_action == 'Apply'
+            - item.available_before != 'none'
+            - not item.changed
+
+        # ---- scope proof: anything else that moved (dependencies) --------
+        - name: "List all installed packages (after)"
+          ansible.builtin.shell: |
+            set -o pipefail
+            rpm -qa --qf '%{NAME}|%{VERSION}|%{RELEASE}|%{ARCH}\n' | sort
+          args:
+            executable: /bin/bash
+          register: pkgs_after
+          changed_when: false
+          when:
+            - tp_action == 'Apply'
+            - ansible_os_family == 'RedHat'
+
+        - name: "Compute full package diff before/after"
+          ansible.builtin.set_fact:
+            pkgs_before_set: "{{ pkgs_before.stdout_lines | default([]) | list }}"
+            pkgs_after_set: "{{ pkgs_after.stdout_lines | default([]) | list }}"
+          when: tp_action == 'Apply'
+
+        - name: "Identify dependency packages updated outside the target list"
+          ansible.builtin.set_fact:
+            dependency_packages_updated: >-
+              {{
+                (pkgs_after_set | difference(pkgs_before_set))
+                | map('split', '|') | map('first')
+                | unique | difference(tp_packages) | list
+              }}
+          when: tp_action == 'Apply'
+
+        - name: "Write target_packages_diff.txt (central evidence)"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/target_packages_diff.txt"
+            mode: '0640'
+            content: |
+              # action: {{ tp_action }}
+              # target packages ({{ tp_packages | length }}): {{ tp_packages | join(', ') }}
+              # package | before | available_before | after | changed
+              {% for entry in target_package_diff %}
+              {{ entry.package }} | {{ entry.before }} | {{ entry.available_before }} | {{ entry.after }} | {{ entry.changed }}
+              {% endfor %}
+              {% if tp_action == 'Apply' %}
+              # updated targets ({{ packages_updated | length }}): {{ packages_updated | join(', ') if packages_updated else 'none' }}
+              # dependency packages updated outside the target list ({{ dependency_packages_updated | length }}):
+              {% for name in dependency_packages_updated %}
+              {{ name }}
+              {% endfor %}
+              # full rpm -qa lines only in BEFORE:
+              {% for line in pkgs_before_set | difference(pkgs_after_set) %}
+              - {{ line }}
+              {% endfor %}
+              # full rpm -qa lines only in AFTER:
+              {% for line in pkgs_after_set | difference(pkgs_before_set) %}
+              + {{ line }}
+              {% endfor %}
+              {% endif %}
+
+        # ---- failed services after ---------------------------------------
+        - name: "Detect systemctl"
+          ansible.builtin.stat:
+            path: /usr/bin/systemctl
+          register: systemctl_stat
+          when: tp_action == 'Apply'
+
+        - name: "List failed systemd units"  # noqa: command-instead-of-module
+          ansible.builtin.command: systemctl --failed --no-pager --no-legend
+          register: failed_units
+          changed_when: false
+          failed_when: false
+          when:
+            - tp_action == 'Apply'
+            - systemctl_stat.stat.exists | default(false)
+
+        - name: "Build failed services list"
+          ansible.builtin.set_fact:
+            failed_services_list: >-
+              {{
+                (failed_units.stdout_lines | default([]))
+                | map('trim') | reject('equalto', '')
+                | map('split') | map('first') | list
+              }}
+          when: tp_action == 'Apply'
+
+        - name: "Write failed_services_after.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/failed_services_after.txt"
+            mode: '0640'
+            content: |
+              {% if tp_action != 'Apply' %}
+              not_applicable_check_mode
+              {% elif not (systemctl_stat.stat.exists | default(false)) %}
+              not_applicable
+              {% else %}
+              {{ failed_units.stdout | default('') }}
+              {% endif %}
+
+        # ---- reboot required after ---------------------------------------
+        - name: "Check reboot required (after)"
+          ansible.builtin.command: needs-restarting -r
+          register: reboot_after
+          changed_when: false
+          failed_when: false
+          when:
+            - tp_action == 'Apply'
+            - needs_restarting_stat.stat.exists
+
+        - name: "Compute reboot_required_after status"
+          ansible.builtin.set_fact:
+            reboot_required_after: >-
+              {{
+                'not_applicable_check_mode' if tp_action != 'Apply'
+                else ('unknown' if not needs_restarting_stat.stat.exists
+                      else ('required' if reboot_after.rc == 1 else ('not_required' if reboot_after.rc == 0 else 'unknown')))
+              }}
+
+        - name: "Write reboot_required_after.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/reboot_required_after.txt"
+            mode: '0640'
+            content: |
+              status: {{ reboot_required_after }}
+              ---
+              {{ reboot_after.stdout | default('not_applicable') }}
+
+        # ---- optional reboot ---------------------------------------------
+        - name: "Reboot host when ALLOW_REBOOT and reboot is required"
+          ansible.builtin.reboot:
+            msg: "SamurAI Shield :: post targeted update reboot"
+            reboot_timeout: 600
+          when:
+            - tp_action == 'Apply'
+            - tp_allow_reboot | bool
+            - reboot_required_after == 'required'
+          register: reboot_action
+
+      rescue:
+        - name: "Capture rescue error"
+          ansible.builtin.set_fact:
+            samurai_errors: "{{ samurai_errors + [ansible_failed_result.msg | default('unknown failure')] }}"
+
+        - name: "Mark execution status as failed"
+          ansible.builtin.set_fact:
+            execution_status: "failed"
+
+      always:
+        # ------------------------------------------------------------------
+        # summary.json — runs even on failure
+        # ------------------------------------------------------------------
+        - name: "Compute final execution status"
+          ansible.builtin.set_fact:
+            execution_status: >-
+              {{
+                execution_status | default(
+                  'check_completed' if tp_action == 'Check'
+                  else ('updated' if (packages_updated | default([]) | length) > 0
+                        else 'no_updates')
+                )
+              }}
+
+        - name: "Capture finished_at timestamp"
+          ansible.builtin.set_fact:
+            # strftime without epoch = now (UTC); ansible_date_time is frozen at
+            # fact gathering and would repeat started_at.
+            execution_finished_at: "{{ '%Y-%m-%dT%H:%M:%SZ' | strftime(utc=true) }}"
+
+        - name: "Build per-host summary"
+          ansible.builtin.set_fact:
+            host_summary:
+              tool: "SamurAI Shield"
+              playbook: "linux_yum_targeted_package_update_with_evidence"
+              host: "{{ inventory_hostname }}"
+              fqdn: "{{ ansible_fqdn | default(inventory_hostname) }}"
+              primary_ip: "{{ ansible_default_ipv4.address | default('unknown') }}"
+              os_family: "{{ ansible_os_family | default('unknown') }}"
+              distribution: "{{ ansible_distribution | default('unknown') }}"
+              distribution_version: "{{ ansible_distribution_version | default('unknown') }}"
+              kernel: "{{ ansible_kernel | default('unknown') }}"
+              package_manager: "{{ pkg_manager | default('unknown') }}"
+              action: "{{ tp_action }}"
+              update_scope: "targeted"
+              target_packages: "{{ tp_packages }}"
+              target_packages_count: "{{ tp_packages | length }}"
+              packages_before: "{{ packages_before | default({}) }}"
+              updates_available_before: "{{ targeted_updates_available | default({}) }}"
+              updates_available_before_count: "{{ targeted_updates_available | default({}) | length }}"
+              packages_after: "{{ packages_after | default({}) }}"
+              target_package_diff: "{{ target_package_diff | default([]) }}"
+              packages_updated: "{{ packages_updated | default([]) }}"
+              packages_updated_count: "{{ packages_updated | default([]) | length }}"
+              dependency_packages_updated: "{{ dependency_packages_updated | default([]) }}"
+              reboot_required_before: "{{ reboot_required_before | default('unknown') }}"
+              reboot_required_after: "{{ reboot_required_after | default('not_applicable_check_mode') }}"
+              allow_reboot: "{{ tp_allow_reboot | bool }}"
+              allow_reboot_source: "{{ tp_allow_reboot_source }}"
+              rebooted: "{{ (reboot_action.rebooted | default(false)) | bool }}"
+              failed_services_after: "{{ failed_services_list | default([]) }}"
+              evidence_dir: "{{ evidence_dir }}"
+              started_at: "{{ execution_started_at }}"
+              finished_at: "{{ execution_finished_at }}"
+              status: "{{ execution_status }}"
+              warnings: "{{ samurai_warnings }}"
+              errors: "{{ samurai_errors }}"
+
+        - name: "Write summary.json"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/summary.json"
+            mode: '0640'
+            content: "{{ host_summary | to_nice_json }}\n"
+
+        - name: "Publish per-host summary as run stat"
+          ansible.builtin.set_stats:
+            data:
+              samurai_yum_targeted_update_summary: "{{ host_summary }}"
+            per_host: true
+            aggregate: false
+
+    # The rescue recovers the host so `always` can publish structured evidence;
+    # after that the failed host must FAIL again, otherwise the PLAY RECAP shows
+    # failed=0 and the Execution Center grades the job as a success.
+    - name: "Fail the host when execution ended failed (structured evidence already published)"
+      ansible.builtin.fail:
+        msg: >-
+          Targeted remediation failed on {{ inventory_hostname }}:
+          {{ (samurai_errors | join(' | ')) if (samurai_errors | length) > 0 else 'see summary.json' }}
+      when: (execution_status | default('')) == 'failed'
+
+
+- name: "SamurAI :: yum-targeted-update :: emit consolidated stdout JSON"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: "Collect per-host summaries"
+      ansible.builtin.set_fact:
+        all_host_summaries: >-
+          {{
+            groups['samurai_yum_targeted_targets'] | default([])
+            | map('extract', hostvars, 'host_summary')
+            | select('defined') | list
+          }}
+
+    - name: "Compute consolidated status"
+      ansible.builtin.set_fact:
+        consolidated_status: >-
+          {{
+            'failed' if (all_host_summaries | selectattr('status', 'equalto', 'failed') | list | length) > 0
+            else 'completed'
+          }}
+
+    - name: "Build consolidated samurai_shield_result block"
+      ansible.builtin.set_fact:
+        samurai_shield_result:
+          playbook: "linux_yum_targeted_package_update_with_evidence"
+          action: "{{ samurai_action | default('Check') }}"
+          update_scope: "targeted"
+          target_packages: "{{ samurai_target_packages | default([]) }}"
+          status: "{{ consolidated_status }}"
+          host_count: "{{ all_host_summaries | length }}"
+          hosts: "{{ all_host_summaries }}"
+
+    - name: "Print consolidated SamurAI Shield JSON to stdout"
+      ansible.builtin.debug:
+        msg: "{{ {'samurai_shield_result': samurai_shield_result} | to_nice_json }}"
+
+    - name: "Publish consolidated result as workflow stat"
+      ansible.builtin.set_stats:
+        data:
+          samurai_shield_result: "{{ samurai_shield_result }}"
+        aggregate: false
+        per_host: false
