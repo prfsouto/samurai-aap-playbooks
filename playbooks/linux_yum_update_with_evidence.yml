@@ -110,13 +110,13 @@
     - name: "Pre-check + optional update + post-check"
       block:
 
-        - name: "Fail when target OS family is not RedHat"
-          ansible.builtin.fail:
-            msg: >-
+        - name: "Assert target OS family is RedHat"
+          ansible.builtin.assert:
+            that: ansible_os_family == 'RedHat'
+            fail_msg: >-
               Unsupported OS family '{{ ansible_os_family }}' on host {{ inventory_hostname }}.
               This playbook only supports Red Hat-like systems (RHEL, CentOS, Rocky,
               AlmaLinux, Oracle Linux, Amazon Linux 2/2023).
-          when: ansible_os_family != 'RedHat'
 
         - name: "Detect dnf binary"
           ansible.builtin.stat:
@@ -252,6 +252,7 @@
           register: check_update_out
           changed_when: false
           failed_when: check_update_out.rc not in [0, 100]
+          when: ansible_os_family == 'RedHat'
 
         - name: "Determine updates available count"
           ansible.builtin.set_fact:
@@ -358,7 +359,9 @@
           register: update_result
           changed_when: ACTION == 'Apply' and update_result.rc == 0 and ('Nothing to do' not in (update_result.stdout | default('')))
           failed_when: false
-          when: ACTION == 'Apply'
+          when:
+            - ACTION == 'Apply'
+            - ansible_os_family == 'RedHat'
 
         - name: "Write update_stdout.txt"
           ansible.builtin.copy:
