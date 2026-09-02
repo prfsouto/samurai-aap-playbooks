@@ -117,14 +117,20 @@
 - name: "[inventory_collect] Observe automatic services health (read-only)"
   # Degradação é serviço automático que FALHOU (``ExitCode`` não-zero), não
   # serviço automático parado — parar é o desenho de boa parte deles.
+  # Consulta que quebrou sai com rc!=0 pra virar ``not_observed`` — engolir o
+  # erro publicaria 'running' como leitura boa.
   ansible.windows.win_shell: |
-    $failed = @(
-      Get-CimInstance Win32_Service -ErrorAction SilentlyContinue |
-        Where-Object {
-          $_.StartMode -eq 'Auto' -and $_.State -ne 'Running' -and
-          $_.ExitCode -ne 0
-        } | Select-Object -ExpandProperty Name | Sort-Object
-    )
+    try {
+      $failed = @(
+        Get-CimInstance Win32_Service -ErrorAction Stop |
+          Where-Object {
+            $_.StartMode -eq 'Auto' -and $_.State -ne 'Running' -and
+            $_.ExitCode -ne 0
+          } | Select-Object -ExpandProperty Name | Sort-Object
+      )
+    } catch {
+      exit 1
+    }
     if ($failed.Count -gt 0) { $failed -join ',' } else { 'running' }
   register: inventory_collect_win_services
   changed_when: false
