@@ -86,6 +86,14 @@
   register: data_sync_cloud_volume
   tags: [data_sync, cloud]
 
+# O id nasce AQUI, nao no fim do include: falha no attach ou no wait_for abaixo
+# ainda encontra o always do replicate.yml com a fact preenchida e destroi o
+# volume — copia de dado de cliente nao fica orfa por uma falha de anexacao.
+- name: "[data_sync] Remember the ephemeral volume id for cleanup"
+  ansible.builtin.set_fact:
+    data_sync_cloud_volume_id: "{{ data_sync_cloud_volume.volume_id }}"
+  tags: [data_sync, cloud]
+
 - name: "[data_sync] Attach it to the candidate, read-only for the engine"
   amazon.aws.ec2_vol:
     id: "{{ data_sync_cloud_volume.volume_id }}"
