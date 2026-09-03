@@ -117,16 +117,19 @@
     want=$(printf '%s' "{{ data_sync_cloud_volume_id }}" | tr -d '-' | tr '[:upper:]' '[:lower:]')
     deadline=$(( $(date +%s) + {{ data_sync_cloud_attach_timeout | int }} ))
 
+    # A saída é capturada ANTES de ser percorrida. Encadear o `while` num cano
+    # o joga num subshell: o `return` não encerra a função, e o laço segue
+    # imprimindo — dois caminhos na saída viram um caminho inválido.
     resolve() {
-      lsblk --nodeps --noheadings --output NAME,SERIAL 2>/dev/null | while read -r name serial rest; do
+      discos=$(lsblk --nodeps --noheadings --output NAME,SERIAL 2>/dev/null) || return 1
+      echo "$discos" | while read -r name serial rest; do
         [ -n "${serial:-}" ] || continue
         s=$(printf '%s' "$serial" | tr -d '-' | tr '[:upper:]' '[:lower:]')
         if [ "$s" = "$want" ]; then
           printf '/dev/%s\n' "$name"
-          return 0
+          break
         fi
       done
-      return 1
     }
 
     # Quantos discos deste host expõem serial. Se ALGUM expõe, a plataforma é
@@ -143,7 +146,7 @@
     # 1) ESGOTA a espera pelo serial. O device Nitro aparece depois do anexo, e
     #    desistir cedo é o que empurrava para o caminho legado.
     while [ "$(date +%s)" -lt "$deadline" ]; do
-      found=$(resolve || true)
+      found=$(resolve | head -n 1)
       if [ -n "${found:-}" ]; then
         printf '%s\n' "$found"
         exit 0
