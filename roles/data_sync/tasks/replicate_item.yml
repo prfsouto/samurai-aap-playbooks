@@ -7,11 +7,51 @@
     that:
       - data_sync_item.replication_execution_id | default('') | length > 0
       - data_sync_item.source_volume_stable_id | default('') | length > 0
-      - data_sync_item.destination | default('') | length > 0
+      - data_sync_item.destination_volume_stable_id | default('') | length > 0
     fail_msg: >-
       each data_sync item needs replication_execution_id, source_volume_stable_id and
-      destination. The execution id names the engine's journal: reusing one across
-      volumes or stages makes a resume pick up another copy's record.
+      destination_volume_stable_id. The execution id names the engine's journal:
+      reusing one across volumes or stages makes a resume pick up another copy's
+      record. The destination travels as the PROVIDER volume id — a device path
+      is a dated observation and names a different disk after the next reboot.
+    quiet: true
+  tags: [data_sync, guard]
+
+# O caminho é RESOLVIDO aqui, dentro da máquina, pelo serial NVMe que carrega o
+# id do volume. Aceitar o caminho pronto do control plane copiaria para o disco
+# que hoje atende por aquele nome, que pode ser outro.
+- name: "[data_sync] Resolve the destination device by its provider volume id"  # noqa: risky-shell-pipe
+  ansible.builtin.shell: |
+    set -eu
+    want=$(printf '%s' "{{ data_sync_item.destination_volume_stable_id }}" \
+      | tr -d '-' | tr '[:upper:]' '[:lower:]')
+    discos=$(lsblk --nodeps --noheadings --output NAME,SERIAL 2>/dev/null) || exit 3
+    echo "$discos" | while read -r name serial rest; do
+      [ -n "${serial:-}" ] || continue
+      s=$(printf '%s' "$serial" | tr -d '-' | tr '[:upper:]' '[:lower:]')
+      if [ "$s" = "$want" ]; then
+        printf '/dev/%s\n' "$name"
+        break
+      fi
+    done
+  args:
+    executable: /bin/sh
+  become: "{{ data_sync_become | bool }}"
+  register: data_sync_destination_resolution
+  changed_when: false
+  failed_when: false
+  tags: [data_sync, guard]
+
+- name: "[data_sync] Refuse a destination we could not identify on this host"
+  ansible.builtin.assert:
+    that:
+      - data_sync_destination_resolution.rc == 0
+      - data_sync_destination_resolution.stdout | trim | length > 0
+    fail_msg: >-
+      destination volume {{ data_sync_item.destination_volume_stable_id }} does not
+      match any block device on this candidate. Writing at block level into a disk
+      we cannot identify is how a replacement destroys the wrong volume, so the
+      stage refuses instead of guessing.
     quiet: true
   tags: [data_sync, guard]
 
@@ -20,7 +60,8 @@
     samurai_execution_id: "{{ data_sync_item.replication_execution_id }}"
     data_sync_source: "{{ data_sync_item.source | default('') }}"
     data_sync_source_snapshot: "{{ data_sync_item.source_snapshot | default('') }}"
-    data_sync_destination: "{{ data_sync_item.destination }}"
+    data_sync_destination: "{{ data_sync_destination_resolution.stdout | trim }}"
+    data_sync_destination_volume_id: "{{ data_sync_item.destination_volume_stable_id }}"
     data_sync_cloud_volume_id: ""
     data_sync_cloud_residue: []
     data_sync_cloud_residue_reason: ""
@@ -39,6 +80,11 @@
   ansible.builtin.set_stats:
     aggregate: true
     data:
+      data_sync_destination_bindings:
+        - replication_execution_id: "{{ samurai_execution_id }}"
+          source_volume_stable_id: "{{ data_sync_item_volume_id }}"
+          destination_volume_stable_id: "{{ data_sync_destination_volume_id }}"
+          device_path_observed: "{{ data_sync_destination }}"
       data_sync_volume_results:
         - replication_execution_id: "{{ samurai_execution_id }}"
           source_volume_stable_id: "{{ data_sync_item_volume_id }}"
