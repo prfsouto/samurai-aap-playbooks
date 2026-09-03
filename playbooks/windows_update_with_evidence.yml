@@ -18,7 +18,7 @@
 # remediation call only needs HOSTNAMES + ACTION:
 #   ALLOW_REBOOT (bool, default false) — reboot after Apply only when the host
 #     reports reboot_required. When false the host is left pending-reboot and
-#     the JSON reports reboot_required_after=yes. On the SamurAI governed path
+#     the JSON reports reboot_required_after=required. On the SamurAI governed path
 #     the engine instead injects a lowercase `allow_reboot` (from job.allow_reboot)
 #     which takes precedence over ALLOW_REBOOT — see wu_reboot_governed below.
 #     summary.json records which source won as allow_reboot_source
@@ -376,7 +376,9 @@
 
         - name: "Compute reboot_required_before status"
           ansible.builtin.set_fact:
-            reboot_required_before: "{{ 'yes' if 'status=yes' in reboot_before_raw.stdout else 'no' }}"
+            # 'required' / 'not_required' — never 'yes'/'no', which set_fact
+            # coerces to booleans so that `== 'yes'` never matches again.
+            reboot_required_before: "{{ 'required' if 'status=yes' in reboot_before_raw.stdout else 'not_required' }}"
 
         - name: "Write pending_reboot_before.txt"
           ansible.windows.win_copy:
@@ -391,7 +393,7 @@
             samurai_warnings: >-
               {{ samurai_warnings + ['host had a pending reboot BEFORE this run; Windows Update
                  results may be incomplete until it is rebooted'] }}
-          when: reboot_required_before == 'yes'
+          when: reboot_required_before == 'required'
 
         # ---- updates available before ------------------------------------
         - name: "Search available Windows Updates (before)"
@@ -573,15 +575,15 @@
 
         - name: "Compute hotfix diff before/after"
           ansible.builtin.set_fact:
-            # Strip from the first '|' to end to leave just the HotFixID. No
-            # capture-group backreference ('\1'): inside a YAML block scalar
-            # Ansible hands re.sub a LITERAL '\1' (not group 1), collapsing every
-            # line to '\1'. Match-and-remove is robust.
+            # Keep just the HotFixID (first '|' field). Backslash-free on
+            # purpose: Ansible doubles backslashes inside {{ }} before Jinja, so
+            # '\\|.*$' typed in a block scalar reaches re as the alternation
+            # '\\' OR '.*$' and swallows the whole line.
             hotfixes_added: >-
               {{
                 (hotfixes_after.stdout_lines | default([]))
                 | difference(hotfixes_before.stdout_lines | default([]))
-                | map('regex_replace', '\\|.*$', '') | unique | list
+                | map('split', '|') | map('first') | unique | list
               }}
           when: wu_action == 'Apply'
 
@@ -621,7 +623,7 @@
             reboot_required_after: >-
               {{
                 'not_applicable_check_mode' if wu_action != 'Apply'
-                else ('yes' if 'status=yes' in (reboot_after_raw.stdout | default('')) else 'no')
+                else ('required' if 'status=yes' in (reboot_after_raw.stdout | default('')) else 'not_required')
               }}
 
         - name: "Write pending_reboot_after.txt"

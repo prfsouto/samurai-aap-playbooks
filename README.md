@@ -160,7 +160,7 @@ Safety model:
 2. **Reboot is the playbook's decision, never the module's** — `win_updates` is
    always called with `reboot: false`. The host is rebooted only when reboot is
    allowed *and* it actually reports a pending reboot; otherwise it is left
-   pending and `reboot_required_after=yes` is reported in the JSON. The "allowed"
+   pending and `reboot_required_after=required` is reported in the JSON. The "allowed"
    flag has two sources: the SamurAI engine injects a lowercase `allow_reboot`
    from the governed job, which **takes precedence**; the uppercase `ALLOW_REBOOT`
    is the survey/manual knob (and the fallback default `false`). `summary.json`

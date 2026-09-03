@@ -349,9 +349,11 @@
             path: /var/run/reboot-required
           register: reboot_marker_before
 
+        # States are 'required' / 'not_required' — never 'yes'/'no': set_fact
+        # coerces those to booleans, and `== 'yes'` never matches again.
         - name: "Compute reboot_required_before status"
           ansible.builtin.set_fact:
-            reboot_required_before: "{{ 'yes' if reboot_marker_before.stat.exists else 'no' }}"
+            reboot_required_before: "{{ 'required' if reboot_marker_before.stat.exists else 'not_required' }}"
 
         - name: "Write reboot_required_before.txt"
           ansible.builtin.copy:
@@ -456,12 +458,15 @@
             pkgs_after_set: "{{ pkgs_after.stdout_lines | default([]) | list }}"
           when: ACTION == 'Apply'
 
+        # Backslash-free on purpose: Ansible doubles backslashes inside {{ }}
+        # before Jinja, so a '\\' typed in a block scalar reaches re as '\\'
+        # and '^([^|]+)\\|.*$' becomes an alternation that swallows the line.
         - name: "Identify updated packages (changed version)"
           ansible.builtin.set_fact:
             packages_updated: >-
               {{
                 (pkgs_after_set | difference(pkgs_before_set))
-                | map('regex_replace', '^([^|]+)\\|.*$', '\\1') | unique | list
+                | map('split', '|') | map('first') | unique | list
               }}
           when: ACTION == 'Apply'
 
@@ -508,7 +513,8 @@
             failed_services_list: >-
               {{
                 (failed_units.stdout_lines | default([]))
-                | map('regex_replace', '^\\s*(\\S+).*$', '\\1') | list
+                | map('trim') | reject('equalto', '')
+                | map('split') | map('first') | list
               }}
           when: ACTION == 'Apply'
 
@@ -537,7 +543,7 @@
             reboot_required_after: >-
               {{
                 'not_applicable_check_mode' if ACTION != 'Apply'
-                else ('yes' if (reboot_marker_after.stat.exists | default(false)) else 'no')
+                else ('required' if (reboot_marker_after.stat.exists | default(false)) else 'not_required')
               }}
 
         - name: "Write reboot_required_after.txt"
@@ -583,7 +589,7 @@
           when:
             - ACTION == 'Apply'
             - ALLOW_REBOOT | bool
-            - reboot_required_after == 'yes'
+            - reboot_required_after == 'required'
           register: reboot_action
 
       rescue:
