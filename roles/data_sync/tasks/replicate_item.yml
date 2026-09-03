@@ -45,7 +45,10 @@
       [ -n "${serial:-}" ] || continue
       s=$(printf '%s' "$serial" | tr -d '-' | tr '[:upper:]' '[:lower:]')
       if [ "$s" = "$want" ]; then
-        printf '/dev/%s\n' "$name"
+        # Caminho E serial: quem julga o vínculo no control plane precisa do
+        # serial LIDO, não de um derivado do id do volume — derivá-lo faria o
+        # casamento fechar sozinho, sem ninguém ter olhado a máquina.
+        printf '%s %s\n' "/dev/$name" "$serial"
         break
       fi
     done
@@ -75,7 +78,8 @@
     samurai_execution_id: "{{ data_sync_item.replication_execution_id }}"
     data_sync_source: "{{ data_sync_item.source | default('') }}"
     data_sync_source_snapshot: "{{ data_sync_item.source_snapshot | default('') }}"
-    data_sync_destination: "{{ data_sync_destination_resolution.stdout | trim }}"
+    data_sync_destination: "{{ data_sync_destination_resolution.stdout.split()[0] | trim }}"
+    data_sync_destination_serial: "{{ data_sync_destination_resolution.stdout.split()[1] | default('') }}"
     data_sync_destination_volume_id: "{{ data_sync_item_destination_volume }}"
     data_sync_cloud_volume_id: ""
     data_sync_cloud_residue: []
@@ -100,6 +104,7 @@
           source_volume_stable_id: "{{ data_sync_item_volume_id }}"
           destination_volume_stable_id: "{{ data_sync_destination_volume_id }}"
           device_path_observed: "{{ data_sync_destination }}"
+          os_serial_observed: "{{ data_sync_destination_serial }}"
       data_sync_volume_results:
         - replication_execution_id: "{{ samurai_execution_id }}"
           source_volume_stable_id: "{{ data_sync_item_volume_id }}"
