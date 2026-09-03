@@ -2,12 +2,27 @@
 # Um volume do plano. Recebe o item, aponta as variáveis do estágio para ele e
 # reusa o corpo de replicação — o motor segue fazendo um par por execução.
 
+# O destino nasce no estágio de provisionamento, dentro deste mesmo run: o
+# control plane despacha a INTENÇÃO e o provisionamento devolve o id do volume.
+# A junção é pelo volume de ORIGEM, a chave que os dois lados conhecem. O item já
+# trazer o destino é o caso da retomada, quando o volume veio de outra tentativa.
+- name: "[data_sync] Take the destination provisioning created for this item"
+  ansible.builtin.set_fact:
+    data_sync_item_destination_volume: >-
+      {{ (data_sync_destination_bindings | default([])
+          | selectattr('source_volume_stable_id', 'equalto',
+                       data_sync_item.source_volume_stable_id)
+          | map(attribute='destination_volume_stable_id') | list
+          | first)
+         | default(data_sync_item.destination_volume_stable_id | default(''), true) }}
+  tags: [data_sync]
+
 - name: "[data_sync] Require the item to carry its own execution identity"
   ansible.builtin.assert:
     that:
       - data_sync_item.replication_execution_id | default('') | length > 0
       - data_sync_item.source_volume_stable_id | default('') | length > 0
-      - data_sync_item.destination_volume_stable_id | default('') | length > 0
+      - data_sync_item_destination_volume | default('') | length > 0
     fail_msg: >-
       each data_sync item needs replication_execution_id, source_volume_stable_id and
       destination_volume_stable_id. The execution id names the engine's journal:
@@ -23,7 +38,7 @@
 - name: "[data_sync] Resolve the destination device by its provider volume id"  # noqa: risky-shell-pipe
   ansible.builtin.shell: |
     set -eu
-    want=$(printf '%s' "{{ data_sync_item.destination_volume_stable_id }}" \
+    want=$(printf '%s' "{{ data_sync_item_destination_volume }}" \
       | tr -d '-' | tr '[:upper:]' '[:lower:]')
     discos=$(lsblk --nodeps --noheadings --output NAME,SERIAL 2>/dev/null) || exit 3
     echo "$discos" | while read -r name serial rest; do
@@ -48,7 +63,7 @@
       - data_sync_destination_resolution.rc == 0
       - data_sync_destination_resolution.stdout | trim | length > 0
     fail_msg: >-
-      destination volume {{ data_sync_item.destination_volume_stable_id }} does not
+      destination volume {{ data_sync_item_destination_volume }} does not
       match any block device on this candidate. Writing at block level into a disk
       we cannot identify is how a replacement destroys the wrong volume, so the
       stage refuses instead of guessing.
@@ -61,7 +76,7 @@
     data_sync_source: "{{ data_sync_item.source | default('') }}"
     data_sync_source_snapshot: "{{ data_sync_item.source_snapshot | default('') }}"
     data_sync_destination: "{{ data_sync_destination_resolution.stdout | trim }}"
-    data_sync_destination_volume_id: "{{ data_sync_item.destination_volume_stable_id }}"
+    data_sync_destination_volume_id: "{{ data_sync_item_destination_volume }}"
     data_sync_cloud_volume_id: ""
     data_sync_cloud_residue: []
     data_sync_cloud_residue_reason: ""

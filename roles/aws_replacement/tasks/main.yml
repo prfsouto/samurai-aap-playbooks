@@ -268,6 +268,44 @@
              else {} }}
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Continuidade de dados: um volume de destino vazio por item do plano.
+#
+# Só aqui, porque só aqui o candidato existe. O plano congelado não pode carregar
+# um id de volume que ainda não nasceu, nem um caminho de dispositivo futuro.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: "[aws_replacement] Create a destination volume for each planned data volume"
+  ansible.builtin.include_tasks: destination_volumes.yml
+  loop: "{{ data_sync_items | default([]) }}"
+  loop_control:
+    loop_var: destination_item
+    index_var: destination_index
+  when:
+    - data_sync_items | default([]) | length > 0
+    - data_sync_destination_kms_key_id | default('') | length > 0
+  tags: [aws_replacement, data_sync]
+
+- name: "[aws_replacement] Refuse planned volumes with no platform key to encrypt the destination"
+  ansible.builtin.assert:
+    that:
+      - data_sync_destination_kms_key_id | default('') | length > 0
+    fail_msg: >-
+      this replacement carries {{ data_sync_items | length }} planned data volume(s)
+      but no data_sync_destination_kms_key_id. The destination holds a copy of
+      customer data at rest and must be encrypted under the platform key — the
+      account default is the same posture the platform already rejects elsewhere.
+    quiet: true
+  when: data_sync_items | default([]) | length > 0
+  tags: [aws_replacement, data_sync, guard]
+
+- name: "[aws_replacement] Publish the destination bindings for the control plane"
+  ansible.builtin.set_stats:
+    data:
+      data_sync_destination_bindings: "{{ aws_replacement_destination_bindings | default([]) }}"
+    per_host: false
+  when: data_sync_items | default([]) | length > 0
+  tags: [aws_replacement, data_sync]
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Publish the envelope the control plane consumes (finalize_replacement).
 # ─────────────────────────────────────────────────────────────────────────────
 - name: "[aws_replacement] Publish the replacement envelope to set_stats"
