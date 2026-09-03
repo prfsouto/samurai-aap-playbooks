@@ -1,0 +1,38 @@
+---
+# ============================================================================
+# Role: data_sync
+# Purpose: replicate the old server's DATA volume onto the candidate's freshly
+# attached (and still unmounted) device, using the samurai-replicate engine.
+#
+# Runs between `provision` and `bootstrap`: the target device has no filesystem in
+# use yet, so the engine writes to it without anything mounted on top.
+#
+# I10 is preserved because the AAP is the one executing — the engine is the tool it
+# wields, the same way Terraform runs inside the `provision` role.
+# ============================================================================
+
+# O estágio entra no workflow do rebuild, que hoje atende servidor sem estado local. Sem
+# origem E sem destino, não há volume de dados a replicar: o passo é inerte e o ciclo
+# segue igual ao que já rodava. Só um dos dois preenchido é configuração incoerente, e aí
+# falha — o silêncio ali esconderia um volume que deveria ter sido copiado.
+- name: "[data_sync] Decide whether there is anything to replicate"
+  ansible.builtin.set_fact:
+    data_sync_requested: >-
+      {{ (data_sync_source | default('') | length > 0)
+         or (data_sync_destination | default('') | length > 0)
+         or (data_sync_source_snapshot | default('') | length > 0) }}
+  tags: [data_sync]
+
+- name: "[data_sync] Nothing configured — the stage is a no-op for this rebuild"
+  ansible.builtin.set_stats:
+    data:
+      data_sync_done: false
+      data_sync_skipped: true
+      data_sync_skip_reason: "no data volume configured for this rebuild"
+  when: not (data_sync_requested | bool)
+  tags: [data_sync]
+
+- name: "[data_sync] Replicate the configured data volume"
+  ansible.builtin.include_tasks: replicate.yml
+  when: data_sync_requested | bool
+  tags: [data_sync]

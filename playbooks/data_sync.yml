@@ -1,0 +1,42 @@
+---
+# Single-stage playbook used by the AAP workflow node "data_sync".
+# Runs between `provision` and `bootstrap`, on the newly provisioned candidate.
+#
+# Sem `default('localhost')`: o role escreve em dispositivo de bloco, e cair no nó de
+# execução do AAP por falta de uma variável significaria escrever no disco errado. Um
+# playbook que não sabe onde rodar tem de falhar, não escolher.
+- name: "SamurAI :: guard against an undefined target"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    # Recusar só os literais locais não basta: o Ansible trata `:`, `,`, `;` e `&` como
+    # separadores de padrão de inventário, e `!` como negação. `candidate:localhost`
+    # passaria por uma comparação de igualdade e faria o segundo play incluir o próprio nó
+    # de execução — que é exatamente onde a escrita em bloco não pode acontecer.
+    #
+    # Curinga tem o mesmo efeito por outro caminho: `*` ou `all` alcançariam a frota
+    # inteira. O alvo tem de ser um nome único e literal.
+    - name: "[data_sync] Require a single, literal candidate host"
+      ansible.builtin.assert:
+        that:
+          - new_hostname is defined
+          - new_hostname | default('') | length > 0
+          - new_hostname is string
+          - new_hostname | regex_search('[:,;&!*?\[\]\s]') is none
+          - new_hostname | lower not in ['localhost', '127.0.0.1', '::1', 'all', 'ungrouped']
+        fail_msg: >-
+          new_hostname must be a single literal host name. Got '{{ new_hostname | default("<undefined>") }}'.
+          Inventory patterns (`:`, `,`, `;`, `&`, `!`, wildcards) and local aliases are
+          refused: data_sync writes at block level, and a pattern that resolves to the
+          execution node would write to the wrong disk.
+        quiet: true
+
+# O padrão é um grupo que não existe em inventário nenhum, não `localhost`: sem
+# `new_hostname` o play não casa com host algum e nada acontece. `hosts:` é resolvido no
+# parse, então deixar a variável nua aqui impediria até `--syntax-check` de rodar.
+- name: "SamurAI :: replicate the data volume onto the new server"
+  hosts: "{{ new_hostname | default('samurai_data_sync_no_target') }}"
+  gather_facts: true
+  tasks:
+    - ansible.builtin.import_role:
+        name: data_sync

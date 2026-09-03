@@ -1,0 +1,59 @@
+---
+# Origem: snapshot do volume antigo, ou export NBD. Nunca o host antigo em si — I1 exige
+# que o servidor que está sendo substituído não seja tocado.
+data_sync_source: ""
+
+# Destino: o dispositivo do volume de dados no servidor candidato, ainda NÃO montado.
+data_sync_destination: ""
+
+# Modo. `offline_disk` não pertence ao rebuild: o disco de sistema vem da golden image, e
+# sobrescrevê-lo apagaria a imagem que o ciclo acabou de produzir. O binário recusa, e
+# esta trava existe para o pedido nem chegar lá.
+data_sync_mode: "data_volume"
+
+data_sync_binary_src: "/opt/samurai/bin/samurai-replicate"
+data_sync_binary_dest: "/tmp/samurai-replicate"
+
+# Volume persistente no host: journal em diretório efêmero morre com a operação e a
+# retomada vira promessa vazia.
+data_sync_journal_dir: "/var/lib/samurai-replicate"
+
+data_sync_chunk_size: 4194304
+data_sync_in_flight: 32
+data_sync_epoch_bytes: 134217728
+data_sync_epoch_max_age_ms: 1000
+
+# TLS é obrigatório em origem/destino NBD. Sem CA declarada, vale a base do sistema.
+data_sync_tls_ca: ""
+data_sync_tls_server_name: ""
+data_sync_tls_cert: ""
+data_sync_tls_key: ""
+
+# Teto de tempo. Volume grande em rede lenta leva horas; um job sem teto trava a janela.
+data_sync_timeout_seconds: 86400
+
+data_sync_remove_binary: true
+
+# Escrever em dispositivo de bloco exige elevação no host real. O cenário local do
+# `run_scenario.sh` copia arquivo comum e desliga isto — não faz sentido pedir sudo para
+# validar a orquestração do estágio.
+data_sync_become: true
+
+# ── Origem na nuvem ─────────────────────────────────────────────────────────
+#
+# Preenchido, o estágio resolve o snapshot num volume efêmero anexado ao candidato e
+# aponta o motor para o dispositivo. Quem fala com a API é o Ansible, com a credencial que
+# o Job Template já carrega — o binário nunca vê credencial de nuvem.
+data_sync_source_snapshot: ""
+data_sync_cloud_region: "{{ region | default('') }}"
+data_sync_cloud_zone: "{{ availability_zone | default('') }}"
+data_sync_cloud_volume_type: gp3
+data_sync_cloud_attach_device: /dev/xvds
+data_sync_cloud_attach_timeout: 300
+
+# Tag que carrega o tenant. A posse é conferida contra o provider, nunca contra o que o
+# chamador afirmou — é o que fecha o vetor de confused deputy (plano §7.1).
+data_sync_org_tag: organization_id
+
+# Recusa origem que a plataforma não produziu.
+data_sync_require_managed_tag: true

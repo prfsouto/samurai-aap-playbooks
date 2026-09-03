@@ -1,0 +1,58 @@
+---
+# ============================================================================
+# Desfaz o que `cloud_source.yml` criou, em ordem inversa.
+#
+# O volume é efêmero por contrato: nasce no estágio e morre nele. Sobra que não pôde ser
+# removida é DECLARADA no resultado e derruba o passo — um volume órfão com dado de
+# cliente em repouso não pode virar silêncio, e a §0.1.1 da RFC-004 exige exatamente essa
+# declaração para a classe efêmera.
+# ============================================================================
+
+- name: "[data_sync] Detach the ephemeral volume"
+  amazon.aws.ec2_vol:
+    id: "{{ data_sync_cloud_volume_id }}"
+    instance: none
+    region: "{{ data_sync_cloud_region }}"
+    state: present
+  register: data_sync_detach
+  failed_when: false
+  tags: [data_sync, cloud, cleanup]
+
+- name: "[data_sync] Delete the ephemeral volume"
+  amazon.aws.ec2_vol:
+    id: "{{ data_sync_cloud_volume_id }}"
+    region: "{{ data_sync_cloud_region }}"
+    state: absent
+  register: data_sync_delete
+  failed_when: false
+  tags: [data_sync, cloud, cleanup]
+
+- name: "[data_sync] Confirm the volume is gone"
+  amazon.aws.ec2_vol_info:
+    filters:
+      volume-id: "{{ data_sync_cloud_volume_id }}"
+    region: "{{ data_sync_cloud_region }}"
+  register: data_sync_volume_check
+  failed_when: false
+  tags: [data_sync, cloud, cleanup]
+
+- name: "[data_sync] Record any residue that could not be removed"
+  ansible.builtin.set_fact:
+    data_sync_cloud_residue: >-
+      {{
+        [data_sync_cloud_volume_id]
+        if (data_sync_volume_check.volumes | default([]) | length) > 0
+        else []
+      }}
+  tags: [data_sync, cloud, cleanup]
+
+- name: "[data_sync] Fail the stage when residue survives"
+  ansible.builtin.assert:
+    that:
+      - data_sync_cloud_residue | length == 0
+    fail_msg: >-
+      ephemeral volume {{ data_sync_cloud_volume_id }} still exists after cleanup. It holds
+      a copy of customer data at rest and must be removed before this stage can be
+      considered complete.
+    quiet: true
+  tags: [data_sync, cloud, cleanup]
