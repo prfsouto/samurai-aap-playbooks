@@ -19,31 +19,41 @@
   hosts: localhost
   gather_facts: false
   vars:
-    HOSTNAMES: "{{ HOSTNAMES | default('') }}"
-    ACTION: "{{ ACTION | default('Check') }}"
-    UPDATE_MODE: "{{ UPDATE_MODE | default('all') }}"
+    # Distinct internal names: a play var that references its own name
+    # (`ACTION: "{{ ACTION | default('Check') }}"`) resolves to ITSELF when the
+    # extra-var is absent and dies with "recursive loop detected in template".
+    # Survey blanks arrive as '' (defined), so the fallback is
+    # `(X | default('') | trim) or Y`, never `default(Y)`.
+    samurai_hostnames_raw: "{{ HOSTNAMES | default('') | string | trim }}"
+    samurai_action_raw: "{{ (ACTION | default('') | string | trim) or 'Check' }}"
+    samurai_update_mode_raw: "{{ (UPDATE_MODE | default('') | string | trim) or 'all' }}"
   tasks:
     - name: "Validate HOSTNAMES is provided"
       ansible.builtin.fail:
         msg: "HOSTNAMES extra-var is required (single host, IP, or comma-separated list)."
-      when: HOSTNAMES is not defined or (HOSTNAMES | trim) == ''
+      when: samurai_hostnames_raw == ''
 
     - name: "Validate ACTION is Check or Apply"
       ansible.builtin.fail:
-        msg: "Invalid ACTION '{{ ACTION }}'. Allowed values: Check, Apply."
-      when: ACTION not in ['Check', 'Apply']
+        msg: "Invalid ACTION '{{ samurai_action_raw }}'. Allowed values: Check, Apply."
+      when: samurai_action_raw not in ['Check', 'Apply']
 
     - name: "Validate UPDATE_MODE is all or security"
       ansible.builtin.fail:
-        msg: "Invalid UPDATE_MODE '{{ UPDATE_MODE }}'. Allowed values: all, security."
-      when: UPDATE_MODE not in ['all', 'security']
+        msg: "Invalid UPDATE_MODE '{{ samurai_update_mode_raw }}'. Allowed values: all, security."
+      when: samurai_update_mode_raw not in ['all', 'security']
+
+    - name: "Publish resolved run parameters as localhost facts"
+      ansible.builtin.set_fact:
+        samurai_action: "{{ samurai_action_raw }}"
+        samurai_update_mode: "{{ samurai_update_mode_raw }}"
 
     - name: "Parse HOSTNAMES into a list (tolerant: space OR comma) — #1418"
       ansible.builtin.set_fact:
         # The engine now sends HOSTNAMES space-separated (Oraex fleet convention);
         # accept both delimiters so a comma-joined caller never collapses to 1 host.
         samurai_target_hosts: >-
-          {{ HOSTNAMES.replace(',', ' ').split() | reject('equalto', '') | list }}
+          {{ samurai_hostnames_raw.replace(',', ' ').split() | reject('equalto', '') | list }}
 
     - name: "Add hosts to dynamic group samurai_yum_update_targets"
       ansible.builtin.add_host:
@@ -54,7 +64,7 @@
 
     - name: "Show resolved target hosts"
       ansible.builtin.debug:
-        msg: "Targets: {{ samurai_target_hosts | join(', ') }} | ACTION={{ ACTION }} | UPDATE_MODE={{ UPDATE_MODE }}"
+        msg: "Targets: {{ samurai_target_hosts | join(', ') }} | ACTION={{ samurai_action }} | UPDATE_MODE={{ samurai_update_mode }}"
 
 
 - name: "SamurAI :: yum-update :: pre-check, update and post-check"
@@ -64,8 +74,10 @@
   serial: "{{ SERIAL_BATCH | default(1) }}"
 
   vars:
-    ACTION: "{{ hostvars['localhost']['ACTION'] | default('Check') }}"
-    UPDATE_MODE: "{{ hostvars['localhost']['UPDATE_MODE'] | default('all') }}"
+    # ACTION / UPDATE_MODE come from the facts play 1 published after
+    # validation, not from the raw extra-vars (blank survey answers, absence).
+    ACTION: "{{ hostvars['localhost']['samurai_action'] | default('Check') }}"
+    UPDATE_MODE: "{{ hostvars['localhost']['samurai_update_mode'] | default('all') }}"
     EXCLUDE_PACKAGES_RAW: "{{ hostvars['localhost']['EXCLUDE_PACKAGES'] | default('') }}"
     ALLOW_REBOOT: "{{ hostvars['localhost']['ALLOW_REBOOT'] | default(false) | bool }}"
     EVIDENCE_BASE_DIR: "{{ hostvars['localhost']['EVIDENCE_BASE_DIR'] | default('/var/tmp/samurai-shield/yum-update') }}"
@@ -664,8 +676,8 @@
       ansible.builtin.set_fact:
         samurai_shield_result:
           playbook: "linux_yum_update_with_evidence"
-          action: "{{ ACTION | default('Check') }}"
-          update_mode: "{{ UPDATE_MODE | default('all') }}"
+          action: "{{ samurai_action | default('Check') }}"
+          update_mode: "{{ samurai_update_mode | default('all') }}"
           status: "{{ consolidated_status }}"
           host_count: "{{ all_host_summaries | length }}"
           hosts: "{{ all_host_summaries }}"
