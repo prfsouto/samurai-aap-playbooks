@@ -241,6 +241,10 @@
     - name: "[data_sync] Parse the verification result"
       ansible.builtin.set_fact:
         data_sync_verify: "{{ data_sync_verify_run.stdout | from_json }}"
+        # O instante em que a MEDIDA foi tomada. O control plane compara a
+        # evidência com o nascimento do candidato; a hora da ingestão não
+        # responde quando o disco foi lido.
+        data_sync_verify_measured_at: "{{ ansible_date_time.iso8601 | default('') }}"
       when:
         - data_sync_verify_enabled | bool
         - data_sync_verify_run.stdout | default('') | length > 0
