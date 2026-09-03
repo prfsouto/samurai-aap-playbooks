@@ -13,22 +13,18 @@
     quiet: true
   tags: [data_sync, guard]
 
-# Snapshot informado: o Ansible resolve a origem num dispositivo antes de qualquer
-# validação de caminho, porque é ele quem passa a preencher `data_sync_source`.
-- name: "[data_sync] Resolve the source from a cloud snapshot"
-  ansible.builtin.include_tasks: cloud_source.yml
-  when: data_sync_source_snapshot | default('') | length > 0
-  tags: [data_sync, cloud]
-
-- name: "[data_sync] Require source, destination and tenant"
+# Estes três asserts são estáticos: não dependem de nada que o estágio produz. Rodam
+# ANTES do include da nuvem para que uma misconfig aborte antes de existir volume
+# efêmero — dado de cliente em repouso não nasce de uma configuração que já sabia
+# que ia falhar.
+- name: "[data_sync] Require destination and tenant"
   ansible.builtin.assert:
     that:
-      - data_sync_source | default('') | length > 0
       - data_sync_destination | default('') | length > 0
       - organization_id is defined
       - organization_id | int > 0
     fail_msg: >-
-      data_sync needs source, destination and organization_id. Multi-tenancy is enforced
+      data_sync needs destination and organization_id. Multi-tenancy is enforced
       end to end (I9); an untenanted replication has no blast radius boundary.
     quiet: true
   tags: [data_sync, guard]
@@ -41,10 +37,6 @@
       - samurai_execution_id is defined
       - samurai_execution_id | default('') | length > 0
       - samurai_execution_id | regex_search('^[A-Za-z0-9._-]+$') is not none
-    fail_msg: >-
-      samurai_execution_id is missing or malformed. It names the resume journal
-      (RFC-004 §16.5); a shared default would let one execution resume over another's
-      checkpoint.
     quiet: true
   tags: [data_sync, guard]
 
@@ -59,137 +51,160 @@
     quiet: true
   tags: [data_sync, guard]
 
-- name: "[data_sync] Collect mount facts"
-  ansible.builtin.setup:
-    gather_subset:
-      - "!all"
-      - "hardware"
-  become: "{{ data_sync_become | bool }}"
-  tags: [data_sync]
-
-# Escrever em bloco sob um filesystem montado corrompe o que estiver aberto nele.
-#
-# Comparar só o caminho exato não basta: com destino /dev/sdb e /dev/sdb1 montado, a
-# igualdade não casa e a escrita passaria por cima de um filesystem vivo. A checagem
-# cobre o dispositivo E qualquer filho dele.
-# Comparar texto não basta: `/dev/disk/by-id/…` e `/dev/nvme1n1` são o mesmo dispositivo
-# com nomes diferentes, e uma partição montada dele passaria batido pela igualdade. Os dois
-# lados são resolvidos ao caminho real antes da comparação.
-- name: "[data_sync] Resolve the destination to its real device path"
-  ansible.builtin.shell: |
-    set -eu
-    dest="{{ data_sync_destination }}"
-    if [ ! -e "$dest" ]; then
-      # Ainda não existe: nada pode estar montado nele, e o guard abaixo compara
-      # vazio contra vazio. O engine cria o arquivo na primeira cópia.
-      exit 0
-    fi
-    readlink -f "$dest"
-  register: data_sync_dest_real
-  changed_when: false
-  tags: [data_sync, guard]
-
-- name: "[data_sync] Refuse an existing destination that does not resolve"
-  ansible.builtin.assert:
-    that:
-      - data_sync_dest_real.rc | default(1) == 0
-    fail_msg: >-
-      data_sync_destination '{{ data_sync_destination }}' exists but readlink -f failed
-      (rc={{ data_sync_dest_real.rc | default("<failed>") }}). The mount guard compares
-      real paths; an unresolved destination would disarm it, so the stage refuses
-      instead of writing with the guard blind.
-    quiet: true
-  tags: [data_sync, guard]
-
-- name: "[data_sync] Resolve every mounted device to its real path"
-  ansible.builtin.shell:
-    cmd: >-
-      set -eu;
-      for d in {{ ansible_mounts | map(attribute='device') | map('quote') | join(' ') }}; do
-        readlink -f "$d" || printf '%s\n' "$d";
-      done
-  register: data_sync_mounts_real
-  changed_when: false
-  when: ansible_mounts | length > 0
-
-- name: "[data_sync] List every mount that lives on the destination device"
-  ansible.builtin.set_fact:
-    data_sync_blocking_mounts: >-
-      {{
-        (_dest_real | length > 0) | ternary(
-          (data_sync_mounts_real.stdout_lines | default([]))
-          | select('match', '^' ~ (_dest_real | regex_escape) ~ '(p?[0-9]+)?$')
-          | list,
-          []
-        )
-      }}
-  vars:
-    _dest_real: "{{ data_sync_dest_real.stdout | default('') | trim }}"
-  tags: [data_sync, guard]
-
-- name: "[data_sync] Refuse to write to a mounted device or partition"
-  ansible.builtin.assert:
-    that:
-      - data_sync_blocking_mounts | length == 0
-    fail_msg: >-
-      {{ data_sync_destination }} has mounted filesystems: {{ data_sync_blocking_mounts | join(', ') }}.
-      The engine writes at block level; doing that under a live filesystem corrupts
-      whatever is open on it.
-    quiet: true
-  tags: [data_sync, guard]
-
-- name: "[data_sync] Ensure the journal directory exists and survives the run"
-  ansible.builtin.file:
-    path: "{{ data_sync_journal_dir }}"
-    state: directory
-    owner: "{{ 'root' if data_sync_become | bool else omit }}"
-    group: "{{ 'root' if data_sync_become | bool else omit }}"
-    mode: "0700"
-  become: "{{ data_sync_become | bool }}"
-  tags: [data_sync]
-
-- name: "[data_sync] Stage the replication engine on the candidate"
-  ansible.builtin.copy:
-    src: "{{ data_sync_binary_src }}"
-    dest: "{{ data_sync_binary_dest }}"
-    mode: "0700"
-    owner: "{{ 'root' if data_sync_become | bool else omit }}"
-    group: "{{ 'root' if data_sync_become | bool else omit }}"
-  become: "{{ data_sync_become | bool }}"
-  tags: [data_sync]
-
-- name: "[data_sync] Build the argument list once"
-  ansible.builtin.set_fact:
-    data_sync_args: >-
-      {{
-        [
-          '--source', data_sync_source,
-          '--destination', data_sync_destination,
-          '--execution-id', samurai_execution_id,
-          '--organization-id', organization_id | string,
-          '--journal-dir', data_sync_journal_dir,
-          '--mode', data_sync_mode | replace('_', '-'),
-          '--chunk-size', data_sync_chunk_size | string,
-          '--in-flight', data_sync_in_flight | string,
-          '--epoch-bytes', data_sync_epoch_bytes | string,
-          '--epoch-max-age-ms', data_sync_epoch_max_age_ms | string
-        ]
-        + (['--tls-ca', data_sync_tls_ca] if data_sync_tls_ca | length > 0 else [])
-        + (['--tls-server-name', data_sync_tls_server_name] if data_sync_tls_server_name | length > 0 else [])
-        + (['--tls-cert', data_sync_tls_cert, '--tls-key', data_sync_tls_key] if data_sync_tls_cert | length > 0 else [])
-      }}
-  tags: [data_sync]
-
-- name: "[data_sync] Preflight — sizes, alignment and capabilities, without writing"
-  ansible.builtin.command:
-    argv: "{{ [data_sync_binary_dest, 'preflight'] + data_sync_args }}"
-  become: "{{ data_sync_become | bool }}"
-  register: data_sync_preflight
-  changed_when: false
-  tags: [data_sync]
-
-- name: "[data_sync] Replicate, cleaning up even when the engine fails"
+# Do attach do volume efêmero até o parse do resultado, TUDO vive neste block: qualquer
+# falha — guard de montagem, preflight, morte do engine — passa pelo always e devolve
+# o binário e o volume antes de o estágio declarar a falha. Sem isso, um preflight que
+# recusa origem maior que destino abortava com cópia de dado de cliente anexada e viva.
+- name: "[data_sync] Resolve, guard and replicate — cleaning up on any failure"
   block:
+    # Snapshot informado: o Ansible resolve a origem num dispositivo antes de qualquer
+    # validação de caminho, porque é ele quem passa a preencher `data_sync_source`.
+    - name: "[data_sync] Resolve the source from a cloud snapshot"
+      ansible.builtin.include_tasks: cloud_source.yml
+      when: data_sync_source_snapshot | default('') | length > 0
+      tags: [data_sync, cloud]
+
+    - name: "[data_sync] Require a source"
+      ansible.builtin.assert:
+        that:
+          - data_sync_source | default('') | length > 0
+        fail_msg: >-
+          data_sync needs a source: either data_sync_source or data_sync_source_snapshot.
+        quiet: true
+      tags: [data_sync, guard]
+
+    - name: "[data_sync] Collect mount facts"
+      ansible.builtin.setup:
+        gather_subset:
+          - "!all"
+          - "hardware"
+      become: "{{ data_sync_become | bool }}"
+      tags: [data_sync]
+
+    # Escrever em bloco sob um filesystem montado corrompe o que estiver aberto nele.
+    #
+    # Comparar só o caminho exato não basta: com destino /dev/sdb e /dev/sdb1 montado, a
+    # igualdade não casa e a escrita passaria por cima de um filesystem vivo. A checagem
+    # cobre o dispositivo E qualquer filho dele.
+    # Comparar texto não basta: `/dev/disk/by-id/…` e `/dev/nvme1n1` são o mesmo dispositivo
+    # com nomes diferentes, e uma partição montada dele passaria batido pela igualdade. Os
+    # dois lados são resolvidos ao caminho real antes da comparação.
+    - name: "[data_sync] Resolve the destination to its real device path"
+      ansible.builtin.shell: |
+        set -eu
+        dest={{ data_sync_destination | quote }}
+        if [ ! -e "$dest" ]; then
+          # Ainda não existe: nada pode estar montado nele, e o guard abaixo compara
+          # vazio contra vazio. O engine cria o arquivo na primeira cópia.
+          exit 0
+        fi
+        readlink -f "$dest"
+      become: "{{ data_sync_become | bool }}"
+      register: data_sync_dest_real
+      changed_when: false
+      tags: [data_sync, guard]
+
+    - name: "[data_sync] Refuse an existing destination that does not resolve"
+      ansible.builtin.assert:
+        that:
+          - data_sync_dest_real.rc | default(1) == 0
+        fail_msg: >-
+          data_sync_destination '{{ data_sync_destination }}' exists but readlink -f failed
+          (rc={{ data_sync_dest_real.rc | default("<failed>") }}). The mount guard compares
+          real paths; an unresolved destination would disarm it, so the stage refuses
+          instead of writing with the guard blind.
+        quiet: true
+      tags: [data_sync, guard]
+
+    - name: "[data_sync] Resolve every mounted device to its real path"
+      ansible.builtin.shell:
+        cmd: >-
+          set -eu;
+          for d in {{ ansible_mounts | map(attribute='device') | map('quote') | join(' ') }}; do
+            readlink -f "$d" || printf '%s\n' "$d";
+          done
+      become: "{{ data_sync_become | bool }}"
+      register: data_sync_mounts_real
+      changed_when: false
+      when: ansible_mounts | length > 0
+      tags: [data_sync, guard]
+
+    - name: "[data_sync] List every mount that lives on the destination device"
+      ansible.builtin.set_fact:
+        data_sync_blocking_mounts: >-
+          {{
+            (_dest_real | length > 0) | ternary(
+              (data_sync_mounts_real.stdout_lines | default([]))
+              | select('match', '^' ~ (_dest_real | regex_escape) ~ '(p?[0-9]+)?$')
+              | list,
+              []
+            )
+          }}
+      vars:
+        _dest_real: "{{ data_sync_dest_real.stdout | default('') | trim }}"
+      tags: [data_sync, guard]
+
+    - name: "[data_sync] Refuse to write to a mounted device or partition"
+      ansible.builtin.assert:
+        that:
+          - data_sync_blocking_mounts | length == 0
+        fail_msg: >-
+          {{ data_sync_destination }} has mounted filesystems: {{ data_sync_blocking_mounts | join(', ') }}.
+          The engine writes at block level; doing that under a live filesystem corrupts
+          whatever is open on it.
+        quiet: true
+      tags: [data_sync, guard]
+
+    - name: "[data_sync] Ensure the journal directory exists and survives the run"
+      ansible.builtin.file:
+        path: "{{ data_sync_journal_dir }}"
+        state: directory
+        owner: "{{ 'root' if data_sync_become | bool else omit }}"
+        group: "{{ 'root' if data_sync_become | bool else omit }}"
+        mode: "0700"
+      become: "{{ data_sync_become | bool }}"
+      tags: [data_sync]
+
+    - name: "[data_sync] Stage the replication engine on the candidate"
+      ansible.builtin.copy:
+        src: "{{ data_sync_binary_src }}"
+        dest: "{{ data_sync_binary_dest }}"
+        mode: "0700"
+        owner: "{{ 'root' if data_sync_become | bool else omit }}"
+        group: "{{ 'root' if data_sync_become | bool else omit }}"
+      become: "{{ data_sync_become | bool }}"
+      tags: [data_sync]
+
+    - name: "[data_sync] Build the argument list once"
+      ansible.builtin.set_fact:
+        data_sync_args: >-
+          {{
+            [
+              '--source', data_sync_source,
+              '--destination', data_sync_destination,
+              '--execution-id', samurai_execution_id,
+              '--organization-id', organization_id | string,
+              '--journal-dir', data_sync_journal_dir,
+              '--mode', data_sync_mode | replace('_', '-'),
+              '--chunk-size', data_sync_chunk_size | string,
+              '--in-flight', data_sync_in_flight | string,
+              '--epoch-bytes', data_sync_epoch_bytes | string,
+              '--epoch-max-age-ms', data_sync_epoch_max_age_ms | string
+            ]
+            + (['--tls-ca', data_sync_tls_ca] if data_sync_tls_ca | length > 0 else [])
+            + (['--tls-server-name', data_sync_tls_server_name] if data_sync_tls_server_name | length > 0 else [])
+            + (['--tls-cert', data_sync_tls_cert, '--tls-key', data_sync_tls_key] if data_sync_tls_cert | length > 0 else [])
+          }}
+      tags: [data_sync]
+
+    - name: "[data_sync] Preflight — sizes, alignment and capabilities, without writing"
+      ansible.builtin.command:
+        argv: "{{ [data_sync_binary_dest, 'preflight'] + data_sync_args }}"
+      become: "{{ data_sync_become | bool }}"
+      register: data_sync_preflight
+      changed_when: false
+      tags: [data_sync]
+
     - name: "[data_sync] Replicate"
       ansible.builtin.command:
         argv: "{{ [data_sync_binary_dest, 'copy'] + data_sync_args }}"
@@ -215,7 +230,8 @@
       tags: [data_sync]
 
     # Ordem inversa à criação: o volume efêmero sai antes de o estágio terminar — também
-    # quando a replicação falha. Ele carrega cópia de dado de cliente em repouso.
+    # quando algo falha. Ele carrega cópia de dado de cliente em repouso, e deixá-lo
+    # para trás seria o oposto de efêmero.
     - name: "[data_sync] Destroy the ephemeral cloud volume"
       ansible.builtin.include_tasks: cloud_cleanup.yml
       when: data_sync_cloud_volume_id | default('') | length > 0

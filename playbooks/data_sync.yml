@@ -23,6 +23,7 @@
           - new_hostname | default('') | length > 0
           - new_hostname is string
           - new_hostname | regex_search('[:,;&!*?\[\]~()@\s]') is none
+          - new_hostname | lower not in ['localhost', '127.0.0.1', '::1', 'all', 'ungrouped']
         fail_msg: >-
           new_hostname must be a single literal host name. Got '{{ new_hostname | default("<undefined>") }}'.
           Inventory patterns (`:`, `,`, `;`, `&`, `!`, wildcards), tag selectors (`~`),
