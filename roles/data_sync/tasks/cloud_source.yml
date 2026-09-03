@@ -111,7 +111,7 @@
 # NVMe. Esperar por um caminho que nunca vai aparecer queima o tempo limite, e
 # um vínculo antigo com aquele nome aponta para OUTRO disco — o motor leria o
 # disco errado.
-- name: "[data_sync] Wait until a device carrying this volume id shows up"
+- name: "[data_sync] Wait until a device carrying this volume id shows up"  # noqa: risky-shell-pipe
   ansible.builtin.shell: |
     set -eu
     want=$(printf '%s' "{{ data_sync_cloud_volume_id }}" | tr -d '-' | tr '[:upper:]' '[:lower:]')
@@ -129,19 +129,34 @@
       return 1
     }
 
+    # Quantos discos deste host expõem serial. Se ALGUM expõe, a plataforma é
+    # capaz de identificar por serial e o caminho do anexo não é resposta —
+    # aceitá-lo aqui copiaria o disco errado quando um vínculo antigo com aquele
+    # nome ainda existisse.
+    # lsblk que falha não prova nada: neste caso a função responde "há serial",
+    # porque não poder provar plataforma legada tem de RECUSAR o caminho legado.
+    any_serial() {
+      seriais=$(lsblk --nodeps --noheadings --output SERIAL 2>/dev/null) || return 0
+      printf '%s' "$seriais" | tr -d ' \n' | grep -q '.'
+    }
+
+    # 1) ESGOTA a espera pelo serial. O device Nitro aparece depois do anexo, e
+    #    desistir cedo é o que empurrava para o caminho legado.
     while [ "$(date +%s)" -lt "$deadline" ]; do
       found=$(resolve || true)
       if [ -n "${found:-}" ]; then
         printf '%s\n' "$found"
         exit 0
       fi
-      # Sem serial (geração Xen), o caminho do anexo é o que existe de fato.
-      if [ -b "{{ data_sync_cloud_attach_device }}" ]; then
-        printf '%s\n' "{{ data_sync_cloud_attach_device }}"
-        exit 0
-      fi
       sleep 5
     done
+
+    # 2) Só agora, e só se este host NÃO expuser serial em disco nenhum — o que
+    #    prova plataforma legada, não Nitro — o caminho do anexo vale.
+    if ! any_serial && [ -b "{{ data_sync_cloud_attach_device }}" ]; then
+      printf '%s\n' "{{ data_sync_cloud_attach_device }}"
+      exit 0
+    fi
     exit 4
   args:
     executable: /bin/sh
@@ -158,9 +173,11 @@
       - data_sync_device_resolution.stdout | trim | length > 0
     fail_msg: >-
       volume {{ data_sync_cloud_volume_id }} was attached but no block device on this
-      host carries its id in the NVMe serial, and {{ data_sync_cloud_attach_device }}
-      does not exist either. Replicating from a device chosen by name would risk
-      reading the wrong disk, so the stage refuses.
+      host carries its id in the NVMe serial. The attachment name was not accepted
+      as a fallback because this host DOES expose serials on its disks, so it can
+      identify by serial — a device chosen by name could be an older attachment
+      pointing at a different disk. The stage refuses rather than replicate from
+      the wrong source.
     quiet: true
   tags: [data_sync, cloud, guard]
 

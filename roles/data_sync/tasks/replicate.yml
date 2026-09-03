@@ -94,7 +94,7 @@
     #
     # Arquivo regular entra pela mesma porta: se estiver por trás de um loop device
     # montado, escrever no arquivo corrompe o filesystem que vive em cima dele.
-    - name: "[data_sync] Walk the real block device tree under the destination"
+    - name: "[data_sync] Walk the real block device tree under the destination"  # noqa: risky-shell-pipe
       ansible.builtin.shell: |
         set -eu
         dest={{ data_sync_destination | quote }}
@@ -112,13 +112,16 @@
           targets=$(losetup -j "$real" 2>/dev/null | cut -d: -f1 || true)
         fi
 
+        # A saída é capturada ANTES de ser lida. Encadear o `lsblk` direto num
+        # `while` esconde a falha dele: a leitura sai vazia e o guard entende
+        # "nada montado" — a resposta que autoriza escrever sobre dado vivo.
         for t in $targets; do
-          lsblk --noheadings --raw --output NAME,TYPE,MOUNTPOINT "$t" 2>/dev/null |
-            while read -r name type mnt rest; do
-              if [ -n "${mnt:-}" ]; then
-                printf '%s[%s] montado em %s\n' "$name" "$type" "$mnt"
-              fi
-            done
+          arvore=$(lsblk --noheadings --raw --output NAME,TYPE,MOUNTPOINT "$t" 2>/dev/null) || exit 5
+          printf '%s\n' "$arvore" | while read -r name type mnt rest; do
+            if [ -n "${mnt:-}" ]; then
+              printf '%s[%s] montado em %s\n' "$name" "$type" "$mnt"
+            fi
+          done
         done
       become: "{{ data_sync_become | bool }}"
       register: data_sync_blocking
@@ -126,15 +129,18 @@
       failed_when: false
       tags: [data_sync, guard]
 
-    # rc=3 é o destino que existe e não resolve. Guard cego não escreve: recusa.
-    - name: "[data_sync] Refuse an existing destination that does not resolve"
+    # Guard cego não escreve. rc=3 é o destino que existe e não resolve; rc=5 é o
+    # `lsblk` que não conseguiu descrever a árvore. Os dois deixam a checagem sem
+    # resposta, e sem resposta a etapa recusa.
+    - name: "[data_sync] Refuse a destination whose device tree could not be read"
       ansible.builtin.assert:
         that:
-          - data_sync_blocking.rc | default(1) != 3
+          - data_sync_blocking.rc | default(1) == 0
         fail_msg: >-
-          data_sync_destination '{{ data_sync_destination }}' exists but does not resolve
-          (readlink -f failed). The mount guard walks the device tree from the resolved
-          path; an unresolved destination would leave it blind, so the stage refuses
+          data_sync_destination '{{ data_sync_destination }}' could not be inspected
+          (exit {{ data_sync_blocking.rc | default('desconhecido') }}). The mount guard
+          walks the device tree from the resolved path; without that tree it cannot tell
+          an empty disk from one with live filesystems on it, so the stage refuses
           instead of writing.
         quiet: true
       tags: [data_sync, guard]
@@ -240,18 +246,24 @@
         - data_sync_verify_run.stdout | default('') | length > 0
       tags: [data_sync]
 
-    # O estágio NÃO decide continuidade — quem decide é o gate. Mas uma
-    # divergência medida aqui é falha da própria cópia, e seguir para o bootstrap
-    # montaria um filesystem que já se sabe diferente da origem.
-    - name: "[data_sync] Refuse to continue when the destination does not match the source"
+    # O estágio MEDE e publica; quem julga continuidade é o gate, do lado do
+    # control plane. Aqui só se recusa seguir quando a MEDIÇÃO não aconteceu ou
+    # não é comparável — montar o filesystem sem medida nenhuma esconderia o
+    # problema em vez de reportá-lo.
+    - name: "[data_sync] Refuse to continue when the two sides were not measured comparably"
       ansible.builtin.assert:
         that:
-          - data_sync_verify.content | default('') == 'equal'
+          - data_sync_verify is defined
+          - data_sync_verify.comparable | default(false) | bool
+          - (data_sync_verify.source_digest | default('')) | length > 0
+          - (data_sync_verify.destination_digest | default('')) | length > 0
         fail_msg: >-
-          the destination does not hold what the source held
-          ({{ data_sync_verify.content | default('not measured') }}):
-          source {{ data_sync_verify.source_digest | default('?') }},
-          destination {{ data_sync_verify.destination_digest | default('?') }}.
+          the two sides were not measured over the same range, so there is nothing
+          to compare: source range
+          {{ data_sync_verify.source_verified_bytes | default('?') }},
+          destination range
+          {{ data_sync_verify.destination_verified_bytes | default('?') }}.
+          The gate decides continuity from the published digests, not from here.
         quiet: true
       when: data_sync_verify_enabled | bool
       tags: [data_sync, guard]
@@ -315,9 +327,9 @@
     - name: "[data_sync] Say out loud what survived the cleanup"
       ansible.builtin.debug:
         msg: >-
-          RESÍDUO: {{ (['binário em ' ~ data_sync_binary_dest]
+          RESÍDUO: {{ ((['binário em ' ~ data_sync_binary_dest]
           if (data_sync_binary_cleanup.failed | default(false)) else [])
-          + (data_sync_cloud_residue | default([])) | join('; ') }}
+          + (data_sync_cloud_residue | default([]))) | join('; ') }}
           — {{ data_sync_cloud_residue_reason | default('sem motivo registrado') }}
       when: >-
         (data_sync_binary_cleanup.failed | default(false))

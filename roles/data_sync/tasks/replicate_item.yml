@@ -51,6 +51,9 @@
           source_digest_algorithm: "{{ (data_sync_verify | default({})).algorithm | default('') }}"
           destination_digest: "{{ (data_sync_verify | default({})).destination_digest | default('') }}"
           destination_digest_algorithm: "{{ (data_sync_verify | default({})).algorithm | default('') }}"
+          source_verified_bytes: "{{ (data_sync_verify | default({})).source_verified_bytes | default(0) }}"
+          destination_verified_bytes: "{{ (data_sync_verify | default({})).destination_verified_bytes | default(0) }}"
+          destination_device_size: "{{ (data_sync_verify | default({})).destination_device_size | default(0) }}"
           destination_device: "{{ data_sync_destination }}"
           completed_at: "{{ ansible_date_time.iso8601 | default('') }}"
   tags: [data_sync]
