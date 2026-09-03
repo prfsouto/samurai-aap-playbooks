@@ -61,3 +61,13 @@ data_sync_require_managed_tag: true
 # Chave KMS da plataforma para o volume efêmero — dado de cliente em repouso não vai
 # para a chave default da conta. Falha fechado se vier vazia junto com snapshot.
 data_sync_cloud_kms_key_id: ""
+
+# Verificação por releitura dos dois lados. Ligada por padrão: sem ela o estágio
+# entrega bytes copiados, não evidência de que o destino contém o que a origem
+# continha — e o gate de continuidade não teria o que julgar.
+data_sync_verify_enabled: true
+
+# Itens do plano, um por volume. Cada um traz sua própria identidade de execução,
+# porque ela nomeia o journal do motor: reusar entre volumes ou entre etapas faz
+# uma retomada pegar o registro de outra cópia.
+data_sync_items: []

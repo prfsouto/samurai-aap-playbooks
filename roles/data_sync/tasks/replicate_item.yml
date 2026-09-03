@@ -1,0 +1,56 @@
+---
+# Um volume do plano. Recebe o item, aponta as variáveis do estágio para ele e
+# reusa o corpo de replicação — o motor segue fazendo um par por execução.
+
+- name: "[data_sync] Require the item to carry its own execution identity"
+  ansible.builtin.assert:
+    that:
+      - data_sync_item.replication_execution_id | default('') | length > 0
+      - data_sync_item.source_volume_stable_id | default('') | length > 0
+      - data_sync_item.destination | default('') | length > 0
+    fail_msg: >-
+      each data_sync item needs replication_execution_id, source_volume_stable_id and
+      destination. The execution id names the engine's journal: reusing one across
+      volumes or stages makes a resume pick up another copy's record.
+    quiet: true
+  tags: [data_sync, guard]
+
+- name: "[data_sync] Point the stage at this item"
+  ansible.builtin.set_fact:
+    samurai_execution_id: "{{ data_sync_item.replication_execution_id }}"
+    data_sync_source: "{{ data_sync_item.source | default('') }}"
+    data_sync_source_snapshot: "{{ data_sync_item.source_snapshot | default('') }}"
+    data_sync_destination: "{{ data_sync_item.destination }}"
+    data_sync_cloud_volume_id: ""
+    data_sync_cloud_residue: []
+    data_sync_cloud_residue_reason: ""
+    data_sync_item_stage: "{{ data_sync_item.stage | default('seed') }}"
+    data_sync_item_volume_id: "{{ data_sync_item.source_volume_stable_id }}"
+  tags: [data_sync]
+
+- name: "[data_sync] Replicate this volume"
+  ansible.builtin.include_tasks: replicate.yml
+  tags: [data_sync]
+
+# Evidência POR ITEM, publicada assim que o volume termina. Publicar só no fim do
+# laço perderia tudo que já concluiu se o executor morresse no meio — e a
+# reconciliação não saberia por onde retomar.
+- name: "[data_sync] Publish this volume's own result"
+  ansible.builtin.set_stats:
+    aggregate: true
+    data:
+      data_sync_volume_results:
+        - replication_execution_id: "{{ samurai_execution_id }}"
+          source_volume_stable_id: "{{ data_sync_item_volume_id }}"
+          stage: "{{ data_sync_item_stage }}"
+          succeeded: "{{ (data_sync_result is defined) and (data_sync_result.bytes_copied is defined) }}"
+          bytes_copied: "{{ data_sync_result.bytes_copied | default(0) }}"
+          bytes_skipped_sparse: "{{ data_sync_result.bytes_skipped_sparse | default(0) }}"
+          manifest_root_blake3: "{{ data_sync_result.manifest_root_blake3 | default('') }}"
+          source_digest: "{{ data_sync_verify.source_digest | default('') }}"
+          source_digest_algorithm: "{{ data_sync_verify.algorithm | default('') }}"
+          destination_digest: "{{ data_sync_verify.destination_digest | default('') }}"
+          destination_digest_algorithm: "{{ data_sync_verify.algorithm | default('') }}"
+          destination_device: "{{ data_sync_destination }}"
+          completed_at: "{{ ansible_date_time.iso8601 | default('') }}"
+  tags: [data_sync]

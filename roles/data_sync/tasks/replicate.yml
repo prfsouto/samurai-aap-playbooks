@@ -217,6 +217,45 @@
         data_sync_result: "{{ data_sync_run.stdout | from_json }}"
       tags: [data_sync]
 
+    # A cópia diz o que ESCREVEU. A verificação relê os dois lados e diz o que
+    # cada dispositivo CONTÉM — são passagens diferentes sobre mídias
+    # diferentes, e é essa diferença que pega um erro de escrita. Quem compara
+    # os dois resumos é o control plane; aqui só se mede.
+    - name: "[data_sync] Read both sides back and publish each digest"
+      ansible.builtin.command:
+        argv: "{{ [data_sync_binary_dest, 'verify'] + data_sync_args }}"
+      become: "{{ data_sync_become | bool }}"
+      register: data_sync_verify_run
+      changed_when: false
+      async: "{{ data_sync_timeout_seconds }}"
+      poll: 15
+      when: data_sync_verify_enabled | bool
+      tags: [data_sync]
+
+    - name: "[data_sync] Parse the verification result"
+      ansible.builtin.set_fact:
+        data_sync_verify: "{{ data_sync_verify_run.stdout | from_json }}"
+      when:
+        - data_sync_verify_enabled | bool
+        - data_sync_verify_run.stdout | default('') | length > 0
+      tags: [data_sync]
+
+    # O estágio NÃO decide continuidade — quem decide é o gate. Mas uma
+    # divergência medida aqui é falha da própria cópia, e seguir para o bootstrap
+    # montaria um filesystem que já se sabe diferente da origem.
+    - name: "[data_sync] Refuse to continue when the destination does not match the source"
+      ansible.builtin.assert:
+        that:
+          - data_sync_verify.content | default('') == 'equal'
+        fail_msg: >-
+          the destination does not hold what the source held
+          ({{ data_sync_verify.content | default('not measured') }}):
+          source {{ data_sync_verify.source_digest | default('?') }},
+          destination {{ data_sync_verify.destination_digest | default('?') }}.
+        quiet: true
+      when: data_sync_verify_enabled | bool
+      tags: [data_sync, guard]
+
   always:
     # As duas limpezas são INDEPENDENTES de propósito. Num `always` sequencial, a falha da
     # primeira aborta a lista e a segunda nunca roda — e a segunda é justamente a que

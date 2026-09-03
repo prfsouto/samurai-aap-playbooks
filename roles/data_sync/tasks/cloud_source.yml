@@ -105,16 +105,70 @@
   register: data_sync_cloud_attach
   tags: [data_sync, cloud]
 
-- name: "[data_sync] Wait for the device to appear on the candidate"
-  ansible.builtin.wait_for:
-    path: "{{ data_sync_cloud_attach_device }}"
-    state: present
-    timeout: "{{ data_sync_cloud_attach_timeout }}"
+# O nome pedido no anexo NÃO é o caminho dentro da máquina. Em instância Nitro o
+# kernel enumera /dev/nvme<N>n1 e ignora o device_name do mapeamento; o
+# identificador estável que existe DENTRO da instância é o volume id no serial
+# NVMe. Esperar por um caminho que nunca vai aparecer queima o tempo limite, e
+# um vínculo antigo com aquele nome aponta para OUTRO disco — o motor leria o
+# disco errado.
+- name: "[data_sync] Wait until a device carrying this volume id shows up"
+  ansible.builtin.shell: |
+    set -eu
+    want=$(printf '%s' "{{ data_sync_cloud_volume_id }}" | tr -d '-' | tr '[:upper:]' '[:lower:]')
+    deadline=$(( $(date +%s) + {{ data_sync_cloud_attach_timeout | int }} ))
+
+    resolve() {
+      lsblk --nodeps --noheadings --output NAME,SERIAL 2>/dev/null | while read -r name serial rest; do
+        [ -n "${serial:-}" ] || continue
+        s=$(printf '%s' "$serial" | tr -d '-' | tr '[:upper:]' '[:lower:]')
+        if [ "$s" = "$want" ]; then
+          printf '/dev/%s\n' "$name"
+          return 0
+        fi
+      done
+      return 1
+    }
+
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+      found=$(resolve || true)
+      if [ -n "${found:-}" ]; then
+        printf '%s\n' "$found"
+        exit 0
+      fi
+      # Sem serial (geração Xen), o caminho do anexo é o que existe de fato.
+      if [ -b "{{ data_sync_cloud_attach_device }}" ]; then
+        printf '%s\n' "{{ data_sync_cloud_attach_device }}"
+        exit 0
+      fi
+      sleep 5
+    done
+    exit 4
+  args:
+    executable: /bin/sh
   become: "{{ data_sync_become | bool }}"
+  register: data_sync_device_resolution
+  changed_when: false
+  failed_when: false
   tags: [data_sync, cloud]
 
-- name: "[data_sync] Point the engine at the attached device"
+- name: "[data_sync] Refuse to replicate from a device we could not identify"
+  ansible.builtin.assert:
+    that:
+      - data_sync_device_resolution.rc == 0
+      - data_sync_device_resolution.stdout | trim | length > 0
+    fail_msg: >-
+      volume {{ data_sync_cloud_volume_id }} was attached but no block device on this
+      host carries its id in the NVMe serial, and {{ data_sync_cloud_attach_device }}
+      does not exist either. Replicating from a device chosen by name would risk
+      reading the wrong disk, so the stage refuses.
+    quiet: true
+  tags: [data_sync, cloud, guard]
+
+- name: "[data_sync] Point the engine at the device that carries this volume id"
   ansible.builtin.set_fact:
-    data_sync_source: "{{ data_sync_cloud_attach_device }}"
+    data_sync_source: "{{ data_sync_device_resolution.stdout | trim }}"
     data_sync_cloud_volume_id: "{{ data_sync_cloud_volume.volume_id }}"
+    data_sync_source_device_resolved_by: >-
+      {{ 'nvme_serial' if (data_sync_device_resolution.stdout | trim) != data_sync_cloud_attach_device
+         else 'attachment_name' }}
   tags: [data_sync, cloud]
