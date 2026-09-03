@@ -36,15 +36,33 @@
     region: "{{ data_sync_cloud_region }}"
   delegate_to: localhost
   register: data_sync_volume_check
+  failed_when: false
   tags: [data_sync, cloud, cleanup]
 
+# Não conseguir CONFIRMAR a remoção não é o mesmo que ter removido. Se a própria consulta
+# falhou (rede, credencial, throttling), o volume entra como resíduo: o estado desconhecido
+# de um volume com dado de cliente em repouso tem de pesar para o lado seguro. Antes, a
+# consulta falhando derrubava a task e o resíduo não chegava nem a ser declarado.
 - name: "[data_sync] Record any residue that could not be removed"
   ansible.builtin.set_fact:
     data_sync_cloud_residue: >-
       {{
         [data_sync_cloud_volume_id]
-        if (data_sync_volume_check.volumes | default([]) | length) > 0
+        if (
+          data_sync_volume_check.failed | default(false)
+          or (data_sync_volume_check.volumes | default([]) | length) > 0
+        )
         else []
+      }}
+    data_sync_cloud_residue_reason: >-
+      {{
+        'confirmação indisponível — estado do volume desconhecido'
+        if data_sync_volume_check.failed | default(false)
+        else (
+          'volume ainda existe após a remoção'
+          if (data_sync_volume_check.volumes | default([]) | length) > 0
+          else ''
+        )
       }}
   tags: [data_sync, cloud, cleanup]
 
@@ -53,7 +71,8 @@
     that:
       - data_sync_cloud_residue | length == 0
     fail_msg: >-
-      ephemeral volume {{ data_sync_cloud_volume_id }} still exists after cleanup. It holds
+      ephemeral volume {{ data_sync_cloud_volume_id }} survived cleanup
+      ({{ data_sync_cloud_residue_reason | default('motivo não registrado') }}). It holds
       a copy of customer data at rest and must be removed before this stage can be
       considered complete.
     quiet: true

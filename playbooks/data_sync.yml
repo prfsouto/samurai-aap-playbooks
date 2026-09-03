@@ -31,6 +31,27 @@
           level, and a pattern that resolves to the execution node would write to the
           wrong disk.
 
+    # Recusar caractere de padrão não basta: um nome de GRUPO é literal e limpo. Com
+    # `new_hostname: webservers`, o segundo play casaria com todos os membros do grupo e o
+    # estágio faria escrita em nível de bloco em cada um deles. O alvo tem de ser UM host.
+    #
+    # `groups` traz todo grupo do inventário (incluindo `all`/`ungrouped`); `hostvars`
+    # traz todo host. Exigir "está em hostvars E não está em groups" resolve o caso do
+    # grupo, o do nome inexistente (que faria o play virar no-op silencioso) e o
+    # patológico de host e grupo com o mesmo nome.
+    - name: "[data_sync] Require the target to be an individual host, never a group"
+      ansible.builtin.assert:
+        that:
+          - new_hostname not in groups
+          - new_hostname in hostvars
+        fail_msg: >-
+          new_hostname '{{ new_hostname }}' is not an individual host in this inventory.
+          {% if new_hostname in groups %}It is a GROUP with
+          {{ groups[new_hostname] | default([]) | length }} member(s):
+          data_sync would write at block level on every one of them.
+          {% else %}No such host exists — the stage would silently match nothing instead of
+          replicating onto the candidate.{% endif %}
+
 # O padrão é um grupo que não existe em inventário nenhum, não `localhost`: sem
 # `new_hostname` o play não casa com host algum e nada acontece. `hosts:` é resolvido no
 # parse, então deixar a variável nua aqui impediria até `--syntax-check` de rodar.

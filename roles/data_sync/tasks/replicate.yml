@@ -83,75 +83,72 @@
 
     # Escrever em bloco sob um filesystem montado corrompe o que estiver aberto nele.
     #
-    # Comparar só o caminho exato não basta: com destino /dev/sdb e /dev/sdb1 montado, a
-    # igualdade não casa e a escrita passaria por cima de um filesystem vivo. A checagem
-    # cobre o dispositivo E qualquer filho dele.
-    # Comparar texto não basta: `/dev/disk/by-id/…` e `/dev/nvme1n1` são o mesmo dispositivo
-    # com nomes diferentes, e uma partição montada dele passaria batido pela igualdade. Os
-    # dois lados são resolvidos ao caminho real antes da comparação.
-    - name: "[data_sync] Resolve the destination to its real device path"
+    # Comparar NOMES não cobre o problema. Casar `/dev/sdb` com `/dev/sdb1` por regex de
+    # sufixo pega partição e mais nada: com LVM, o que está montado é `/dev/mapper/vg-lv`
+    # (um `dm-N`); com LUKS, `/dev/mapper/cofre`; com mdraid, `/dev/md0`. Nenhum desses
+    # nomes se parece com o do destino, e a escrita passaria por cima de dado vivo.
+    #
+    # O que decide é a ÁRVORE REAL: o `lsblk` lista o dispositivo e todos os que se apoiam
+    # nele — partição, volume lógico, mapeamento cifrado, membro de RAID — com os pontos
+    # de montagem. Qualquer nó montado nessa árvore bloqueia.
+    #
+    # Arquivo regular entra pela mesma porta: se estiver por trás de um loop device
+    # montado, escrever no arquivo corrompe o filesystem que vive em cima dele.
+    - name: "[data_sync] Walk the real block device tree under the destination"
       ansible.builtin.shell: |
         set -eu
         dest={{ data_sync_destination | quote }}
-        if [ ! -e "$dest" ]; then
-          # Ainda não existe: nada pode estar montado nele, e o guard abaixo compara
-          # vazio contra vazio. O engine cria o arquivo na primeira cópia.
-          exit 0
+
+        # Ainda não existe: nada pode se apoiar nele. O engine cria na primeira cópia.
+        [ -e "$dest" ] || exit 0
+
+        real=$(readlink -f "$dest") || exit 3
+
+        targets=""
+        if [ -b "$real" ]; then
+          targets="$real"
+        elif [ -f "$real" ]; then
+          # `losetup -j` devolve os loop devices lastreados por este arquivo.
+          targets=$(losetup -j "$real" 2>/dev/null | cut -d: -f1 || true)
         fi
-        readlink -f "$dest"
+
+        for t in $targets; do
+          lsblk --noheadings --raw --output NAME,TYPE,MOUNTPOINT "$t" 2>/dev/null |
+            while read -r name type mnt rest; do
+              if [ -n "${mnt:-}" ]; then
+                printf '%s[%s] montado em %s\n' "$name" "$type" "$mnt"
+              fi
+            done
+        done
       become: "{{ data_sync_become | bool }}"
-      register: data_sync_dest_real
+      register: data_sync_blocking
       changed_when: false
+      failed_when: false
       tags: [data_sync, guard]
 
+    # rc=3 é o destino que existe e não resolve. Guard cego não escreve: recusa.
     - name: "[data_sync] Refuse an existing destination that does not resolve"
       ansible.builtin.assert:
         that:
-          - data_sync_dest_real.rc | default(1) == 0
+          - data_sync_blocking.rc | default(1) != 3
         fail_msg: >-
-          data_sync_destination '{{ data_sync_destination }}' exists but readlink -f failed
-          (rc={{ data_sync_dest_real.rc | default("<failed>") }}). The mount guard compares
-          real paths; an unresolved destination would disarm it, so the stage refuses
-          instead of writing with the guard blind.
+          data_sync_destination '{{ data_sync_destination }}' exists but does not resolve
+          (readlink -f failed). The mount guard walks the device tree from the resolved
+          path; an unresolved destination would leave it blind, so the stage refuses
+          instead of writing.
         quiet: true
       tags: [data_sync, guard]
 
-    - name: "[data_sync] Resolve every mounted device to its real path"
-      ansible.builtin.shell:
-        cmd: >-
-          set -eu;
-          for d in {{ ansible_mounts | map(attribute='device') | map('quote') | join(' ') }}; do
-            readlink -f "$d" || printf '%s\n' "$d";
-          done
-      become: "{{ data_sync_become | bool }}"
-      register: data_sync_mounts_real
-      changed_when: false
-      when: ansible_mounts | length > 0
-      tags: [data_sync, guard]
-
-    - name: "[data_sync] List every mount that lives on the destination device"
-      ansible.builtin.set_fact:
-        data_sync_blocking_mounts: >-
-          {{
-            (_dest_real | length > 0) | ternary(
-              (data_sync_mounts_real.stdout_lines | default([]))
-              | select('match', '^' ~ (_dest_real | regex_escape) ~ '(p?[0-9]+)?$')
-              | list,
-              []
-            )
-          }}
-      vars:
-        _dest_real: "{{ data_sync_dest_real.stdout | default('') | trim }}"
-      tags: [data_sync, guard]
-
-    - name: "[data_sync] Refuse to write to a mounted device or partition"
+    - name: "[data_sync] Refuse to write under anything mounted on that tree"
       ansible.builtin.assert:
         that:
-          - data_sync_blocking_mounts | length == 0
+          - data_sync_blocking.stdout_lines | default([]) | length == 0
         fail_msg: >-
-          {{ data_sync_destination }} has mounted filesystems: {{ data_sync_blocking_mounts | join(', ') }}.
-          The engine writes at block level; doing that under a live filesystem corrupts
-          whatever is open on it.
+          {{ data_sync_destination }} has live filesystems on its device tree:
+          {{ data_sync_blocking.stdout_lines | default([]) | join('; ') }}.
+          The engine writes at block level; doing that under a mounted filesystem —
+          including one reached through LVM, dm-crypt, mdraid or a loop device —
+          corrupts whatever is open on it.
         quiet: true
       tags: [data_sync, guard]
 
@@ -221,21 +218,72 @@
       tags: [data_sync]
 
   always:
+    # As duas limpezas são INDEPENDENTES de propósito. Num `always` sequencial, a falha da
+    # primeira aborta a lista e a segunda nunca roda — e a segunda é justamente a que
+    # destrói um volume com cópia de dado de cliente em repouso. Um binário que não pôde
+    # ser apagado não pode decidir que o volume fica.
     - name: "[data_sync] Remove the staged binary"
       ansible.builtin.file:
         path: "{{ data_sync_binary_dest }}"
         state: absent
       become: "{{ data_sync_become | bool }}"
       when: data_sync_remove_binary | bool
+      register: data_sync_binary_cleanup
+      failed_when: false
       tags: [data_sync]
 
     # Ordem inversa à criação: o volume efêmero sai antes de o estágio terminar — também
     # quando algo falha. Ele carrega cópia de dado de cliente em repouso, e deixá-lo
     # para trás seria o oposto de efêmero.
+    #
+    # O `rescue` existe para que uma falha AQUI ainda passe pela declaração de resíduo
+    # abaixo: sobra não declarada é pior que sobra conhecida.
     - name: "[data_sync] Destroy the ephemeral cloud volume"
-      ansible.builtin.include_tasks: cloud_cleanup.yml
-      when: data_sync_cloud_volume_id | default('') | length > 0
+      block:
+        - name: "[data_sync] Run the cloud cleanup"
+          ansible.builtin.include_tasks: cloud_cleanup.yml
+          when: data_sync_cloud_volume_id | default('') | length > 0
+      rescue:
+        - name: "[data_sync] Cloud cleanup failed — keep the residue visible"
+          ansible.builtin.set_fact:
+            data_sync_cloud_residue: "{{ [data_sync_cloud_volume_id] }}"
+            data_sync_cloud_residue_reason: "limpeza da nuvem falhou antes de confirmar a remoção"
+            data_sync_cleanup_failed: true
       tags: [data_sync, cloud]
+
+    # Declaração incondicional: roda no sucesso e no fracasso, e é o único lugar em que o
+    # operador descobre o que ficou para trás. Publicada por `set_stats` para o workflow
+    # poder agir (RFC-004 §0.1.1, classe efêmera).
+    - name: "[data_sync] Declare every residue the cleanup left behind"
+      ansible.builtin.set_stats:
+        data:
+          data_sync_residues: >-
+            {{
+              (
+                ['binário em ' ~ data_sync_binary_dest]
+                if (data_sync_binary_cleanup.failed | default(false))
+                else []
+              )
+              + (
+                (data_sync_cloud_residue | default([]))
+                | map('regex_replace', '^', 'volume efêmero ')
+                | list
+              )
+            }}
+          data_sync_residue_reason: "{{ data_sync_cloud_residue_reason | default('') }}"
+      tags: [data_sync]
+
+    - name: "[data_sync] Say out loud what survived the cleanup"
+      ansible.builtin.debug:
+        msg: >-
+          RESÍDUO: {{ (['binário em ' ~ data_sync_binary_dest]
+          if (data_sync_binary_cleanup.failed | default(false)) else [])
+          + (data_sync_cloud_residue | default([])) | join('; ') }}
+          — {{ data_sync_cloud_residue_reason | default('sem motivo registrado') }}
+      when: >-
+        (data_sync_binary_cleanup.failed | default(false))
+        or (data_sync_cloud_residue | default([]) | length > 0)
+      tags: [data_sync]
 
 # Mesmo contrato de saída dos demais estágios do workflow (RFC-004 §16.3): quem lê os
 # artefatos do run não precisa aprender um canal novo.
@@ -248,6 +296,6 @@
       sparse_method: "{{ data_sync_result.sparse_method }}"
       epochs_total: "{{ data_sync_result.epochs_total }}"
       epochs_resumed: "{{ data_sync_result.epochs_resumed }}"
-      manifest_sha256: "{{ data_sync_result.manifest_sha256 }}"
+      manifest_root_blake3: "{{ data_sync_result.manifest_root_blake3 }}"
       data_sync_completed_at: "{{ ansible_date_time.iso8601 | default('') }}"
   tags: [data_sync]
