@@ -22,14 +22,13 @@
           - new_hostname is defined
           - new_hostname | default('') | length > 0
           - new_hostname is string
-          - new_hostname | regex_search('[:,;&!*?\[\]\s]') is none
-          - new_hostname | lower not in ['localhost', '127.0.0.1', '::1', 'all', 'ungrouped']
+          - new_hostname | regex_search('[:,;&!*?\[\]~()@\s]') is none
         fail_msg: >-
           new_hostname must be a single literal host name. Got '{{ new_hostname | default("<undefined>") }}'.
-          Inventory patterns (`:`, `,`, `;`, `&`, `!`, wildcards) and local aliases are
-          refused: data_sync writes at block level, and a pattern that resolves to the
-          execution node would write to the wrong disk.
-        quiet: true
+          Inventory patterns (`:`, `,`, `;`, `&`, `!`, wildcards), tag selectors (`~`),
+          regex selectors (`@`) and local aliases are refused: data_sync writes at block
+          level, and a pattern that resolves to the execution node would write to the
+          wrong disk.
 
 # O padrão é um grupo que não existe em inventário nenhum, não `localhost`: sem
 # `new_hostname` o play não casa com host algum e nada acontece. `hosts:` é resolvido no

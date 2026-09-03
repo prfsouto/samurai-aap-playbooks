@@ -16,6 +16,7 @@
     snapshot_ids:
       - "{{ data_sync_source_snapshot }}"
     region: "{{ data_sync_cloud_region }}"
+  delegate_to: localhost
   register: data_sync_snapshot_info
   tags: [data_sync, cloud]
 
@@ -55,6 +56,17 @@
   when: data_sync_require_managed_tag | bool
   tags: [data_sync, cloud, guard]
 
+- name: "[data_sync] Require the platform KMS key for the ephemeral volume"
+  ansible.builtin.assert:
+    that:
+      - data_sync_cloud_kms_key_id | default('') | trim | length > 0
+    fail_msg: >-
+      data_sync_cloud_kms_key_id is empty. The ephemeral volume holds a copy of customer
+      data at rest and must be encrypted under the platform key — the account default is
+      the same posture the platform already rejects for evidence and state artifacts.
+    quiet: true
+  tags: [data_sync, cloud, guard]
+
 - name: "[data_sync] Create an ephemeral volume from the snapshot"
   amazon.aws.ec2_vol:
     snapshot: "{{ data_sync_source_snapshot }}"
@@ -62,6 +74,7 @@
     region: "{{ data_sync_cloud_region }}"
     volume_type: "{{ data_sync_cloud_volume_type }}"
     encrypted: true
+    kms_key_id: "{{ data_sync_cloud_kms_key_id | trim }}"
     tags:
       Name: "samurai-data-sync-{{ samurai_execution_id }}"
       managed_by: samurai-shield
@@ -69,6 +82,7 @@
       "{{ data_sync_org_tag }}": "{{ organization_id | string }}"
       ephemeral: "true"
     state: present
+  delegate_to: localhost
   register: data_sync_cloud_volume
   tags: [data_sync, cloud]
 
@@ -79,6 +93,7 @@
     device_name: "{{ data_sync_cloud_attach_device }}"
     region: "{{ data_sync_cloud_region }}"
     state: present
+  delegate_to: localhost
   register: data_sync_cloud_attach
   tags: [data_sync, cloud]
 

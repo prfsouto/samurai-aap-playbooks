@@ -76,11 +76,29 @@
 # com nomes diferentes, e uma partição montada dele passaria batido pela igualdade. Os dois
 # lados são resolvidos ao caminho real antes da comparação.
 - name: "[data_sync] Resolve the destination to its real device path"
-  ansible.builtin.command:
-    argv: ["readlink", "-f", "{{ data_sync_destination }}"]
+  ansible.builtin.shell: |
+    set -eu
+    dest="{{ data_sync_destination }}"
+    if [ ! -e "$dest" ]; then
+      # Ainda não existe: nada pode estar montado nele, e o guard abaixo compara
+      # vazio contra vazio. O engine cria o arquivo na primeira cópia.
+      exit 0
+    fi
+    readlink -f "$dest"
   register: data_sync_dest_real
   changed_when: false
-  failed_when: false
+  tags: [data_sync, guard]
+
+- name: "[data_sync] Refuse an existing destination that does not resolve"
+  ansible.builtin.assert:
+    that:
+      - data_sync_dest_real.rc | default(1) == 0
+    fail_msg: >-
+      data_sync_destination '{{ data_sync_destination }}' exists but readlink -f failed
+      (rc={{ data_sync_dest_real.rc | default("<failed>") }}). The mount guard compares
+      real paths; an unresolved destination would disarm it, so the stage refuses
+      instead of writing with the guard blind.
+    quiet: true
   tags: [data_sync, guard]
 
 - name: "[data_sync] Resolve every mounted device to its real path"
@@ -93,18 +111,20 @@
   register: data_sync_mounts_real
   changed_when: false
   when: ansible_mounts | length > 0
-  tags: [data_sync, guard]
 
 - name: "[data_sync] List every mount that lives on the destination device"
   ansible.builtin.set_fact:
     data_sync_blocking_mounts: >-
       {{
-        (data_sync_mounts_real.stdout_lines | default([]))
-        | select('match', '^' ~ (_dest_real | regex_escape) ~ '(p?[0-9]+)?$')
-        | list
+        (_dest_real | length > 0) | ternary(
+          (data_sync_mounts_real.stdout_lines | default([]))
+          | select('match', '^' ~ (_dest_real | regex_escape) ~ '(p?[0-9]+)?$')
+          | list,
+          []
+        )
       }}
   vars:
-    _dest_real: "{{ data_sync_dest_real.stdout | default(data_sync_destination) | trim }}"
+    _dest_real: "{{ data_sync_dest_real.stdout | default('') | trim }}"
   tags: [data_sync, guard]
 
 - name: "[data_sync] Refuse to write to a mounted device or partition"
@@ -168,35 +188,38 @@
   changed_when: false
   tags: [data_sync]
 
-- name: "[data_sync] Replicate"
-  ansible.builtin.command:
-    argv: "{{ [data_sync_binary_dest, 'copy'] + data_sync_args }}"
-  become: "{{ data_sync_become | bool }}"
-  register: data_sync_run
-  changed_when: data_sync_run.rc == 0
-  async: "{{ data_sync_timeout_seconds }}"
-  poll: 15
-  tags: [data_sync]
+- name: "[data_sync] Replicate, cleaning up even when the engine fails"
+  block:
+    - name: "[data_sync] Replicate"
+      ansible.builtin.command:
+        argv: "{{ [data_sync_binary_dest, 'copy'] + data_sync_args }}"
+      become: "{{ data_sync_become | bool }}"
+      register: data_sync_run
+      changed_when: data_sync_run.rc == 0
+      async: "{{ data_sync_timeout_seconds }}"
+      poll: 15
+      tags: [data_sync]
 
-- name: "[data_sync] Parse the engine result"
-  ansible.builtin.set_fact:
-    data_sync_result: "{{ data_sync_run.stdout | from_json }}"
-  tags: [data_sync]
+    - name: "[data_sync] Parse the engine result"
+      ansible.builtin.set_fact:
+        data_sync_result: "{{ data_sync_run.stdout | from_json }}"
+      tags: [data_sync]
 
-- name: "[data_sync] Remove the staged binary"
-  ansible.builtin.file:
-    path: "{{ data_sync_binary_dest }}"
-    state: absent
-  become: "{{ data_sync_become | bool }}"
-  when: data_sync_remove_binary | bool
-  tags: [data_sync]
+  always:
+    - name: "[data_sync] Remove the staged binary"
+      ansible.builtin.file:
+        path: "{{ data_sync_binary_dest }}"
+        state: absent
+      become: "{{ data_sync_become | bool }}"
+      when: data_sync_remove_binary | bool
+      tags: [data_sync]
 
-# Ordem inversa à criação: o volume efêmero sai antes de o estágio terminar. Ele carrega
-# uma cópia de dado de cliente em repouso, e deixá-lo para trás seria o oposto de efêmero.
-- name: "[data_sync] Destroy the ephemeral cloud volume"
-  ansible.builtin.include_tasks: cloud_cleanup.yml
-  when: data_sync_cloud_volume_id | default('') | length > 0
-  tags: [data_sync, cloud]
+    # Ordem inversa à criação: o volume efêmero sai antes de o estágio terminar — também
+    # quando a replicação falha. Ele carrega cópia de dado de cliente em repouso.
+    - name: "[data_sync] Destroy the ephemeral cloud volume"
+      ansible.builtin.include_tasks: cloud_cleanup.yml
+      when: data_sync_cloud_volume_id | default('') | length > 0
+      tags: [data_sync, cloud]
 
 # Mesmo contrato de saída dos demais estágios do workflow (RFC-004 §16.3): quem lê os
 # artefatos do run não precisa aprender um canal novo.

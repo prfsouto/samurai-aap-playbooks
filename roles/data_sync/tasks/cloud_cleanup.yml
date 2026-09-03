@@ -14,6 +14,7 @@
     instance: none
     region: "{{ data_sync_cloud_region }}"
     state: present
+  delegate_to: localhost
   register: data_sync_detach
   failed_when: false
   tags: [data_sync, cloud, cleanup]
@@ -23,6 +24,7 @@
     id: "{{ data_sync_cloud_volume_id }}"
     region: "{{ data_sync_cloud_region }}"
     state: absent
+  delegate_to: localhost
   register: data_sync_delete
   failed_when: false
   tags: [data_sync, cloud, cleanup]
@@ -32,8 +34,8 @@
     filters:
       volume-id: "{{ data_sync_cloud_volume_id }}"
     region: "{{ data_sync_cloud_region }}"
+  delegate_to: localhost
   register: data_sync_volume_check
-  failed_when: false
   tags: [data_sync, cloud, cleanup]
 
 - name: "[data_sync] Record any residue that could not be removed"
