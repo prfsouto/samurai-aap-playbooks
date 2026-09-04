@@ -11,6 +11,18 @@
 # escolher entre dois destinos é escolher no escuro.
 # ============================================================================
 
+- name: "[aws_replacement] Refuse an incomplete destination slot"
+  ansible.builtin.assert:
+    that:
+      - destination_item.destination_slot_id | default('') | length > 0
+      - (destination_item.destination_size_gb | int) * 1024 * 1024 * 1024 >= (destination_item.size_bytes | int)
+      - destination_item.destination_volume_type | default('') | length > 0
+    fail_msg: >-
+      every persistent source requires a named destination slot whose size is at
+      least the source size and whose volume type was frozen in the Blueprint
+    quiet: true
+  tags: [aws_replacement, data_sync, guard]
+
 - name: "[aws_replacement] Look for a destination already created for this item"
   ansible.builtin.command:
     argv:
@@ -23,6 +35,7 @@
       - "Name=tag:samurai_plan_id,Values={{ data_sync_plan_id }}"
       - "Name=tag:samurai_plan_revision,Values={{ data_sync_plan_revision | string }}"
       - "Name=tag:samurai_source_volume_stable_id,Values={{ destination_item.source_volume_stable_id }}"
+      - "Name=tag:samurai_destination_slot_id,Values={{ destination_item.destination_slot_id }}"
       - --query
       - "Volumes[].{VolumeId:VolumeId,Size:Size,KmsKeyId:KmsKeyId,Az:AvailabilityZone,Attachments:Attachments}"
       - --output
@@ -55,12 +68,12 @@
       - "{{ aws_replacement_region }}"
       - --availability-zone
       - "{{ aws_replacement_describe_proof.Placement.AvailabilityZone | default(aws_replacement_availability_zone) }}"
-      # Tamanho da ORIGEM, arredondado para cima. Destino maior é permitido; o
-      # filesystem atravessa com a geometria da origem e ninguém o expande.
+      # A vaga congelada decide a geometria. O filesystem atravessa com a
+      # geometria da origem; espaço excedente permanece sem crescimento implícito.
       - --size
-      - "{{ ((destination_item.size_bytes | int) / (1024 * 1024 * 1024)) | round(0, 'ceil') | int }}"
+      - "{{ destination_item.destination_size_gb | int }}"
       - --volume-type
-      - "{{ data_sync_destination_volume_type | default('gp3') }}"
+      - "{{ destination_item.destination_volume_type }}"
       - --encrypted
       - --kms-key-id
       - "{{ data_sync_destination_kms_key_id }}"
@@ -73,7 +86,8 @@
         {Key=samurai_plan_id,Value={{ data_sync_plan_id }}},
         {Key=samurai_plan_revision,Value={{ data_sync_plan_revision | string }}},
         {Key=samurai_plan_digest,Value={{ samurai_data_replication_plan_digest }}},
-        {Key=samurai_source_volume_stable_id,Value={{ destination_item.source_volume_stable_id }}}
+        {Key=samurai_source_volume_stable_id,Value={{ destination_item.source_volume_stable_id }}},
+        {Key=samurai_destination_slot_id,Value={{ destination_item.destination_slot_id }}}
         ]
       - --query
       - "{VolumeId:VolumeId,Size:Size,KmsKeyId:KmsKeyId,Az:AvailabilityZone}"
@@ -133,6 +147,7 @@
       {{ (aws_replacement_destination_bindings | default([])) + [{
         'replication_execution_id': destination_item.replication_execution_id,
         'source_volume_stable_id': destination_item.source_volume_stable_id,
+        'destination_slot_id': destination_item.destination_slot_id,
         'destination_volume_stable_id': aws_replacement_destination.VolumeId,
         'candidate_instance_id': aws_replacement_instance_id,
         'size_bytes': (aws_replacement_destination.Size | int) * 1024 * 1024 * 1024,
