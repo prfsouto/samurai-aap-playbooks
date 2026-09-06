@@ -48,6 +48,17 @@
       preserve_source='{{ aws_replacement_preserve_source }}').
   tags: [aws_replacement]
 
+- name: "[aws_replacement] Validate security group list"
+  ansible.builtin.assert:
+    that:
+      - aws_replacement_security_group_ids is sequence
+      - aws_replacement_security_group_ids is not string
+      - aws_replacement_security_group_ids is not mapping
+      - (aws_replacement_security_group_ids | select('string') | list | length) == (aws_replacement_security_group_ids | length)
+    fail_msg: "security_group_ids must be a list of security group IDs"
+    quiet: true
+  tags: [aws_replacement]
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STUB provider — offline/CI harness, no cloud call at all.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -173,8 +184,8 @@
               '},{Key=SamuraiRole,Value=replacement},{Key=SamuraiManaged,Value=true}]',
               '--query', 'Instances[0].InstanceId', '--output', 'text']
              + (['--subnet-id', aws_replacement_subnet_id] if (aws_replacement_subnet_id | length > 0) else [])
-             + (['--security-group-ids', aws_replacement_security_group_id] if (aws_replacement_security_group_id | length > 0) else [])
-             + (['--associate-public-ip-address'] if aws_replacement_associate_public_ip else [])
+             + (['--security-group-ids'] + aws_replacement_security_group_ids if (aws_replacement_security_group_ids | length > 0) else [])
+             + (['--associate-public-ip-address'] if aws_replacement_associate_public_ip else (['--no-associate-public-ip-address'] if aws_replacement.public_ip is defined else []))
              + ['--user-data', aws_replacement_user_data] }}
       register: aws_replacement_run_instances
       changed_when: true
