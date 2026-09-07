@@ -310,6 +310,7 @@
     # operador descobre o que ficou para trás. Publicada por `set_stats` para o workflow
     # poder agir (RFC-004 §0.1.1, classe efêmera).
     - name: "[data_sync] Declare every residue the cleanup left behind"
+      register: campaign_residue_publication
       ansible.builtin.set_stats:
         data:
           data_sync_residues: >-
@@ -326,6 +327,17 @@
               )
             }}
           data_sync_residue_reason: "{{ data_sync_cloud_residue_reason | default('') }}"
+      tags: [data_sync]
+
+    - name: "[data_sync] Preserve observed residues for this campaign member"
+      ansible.builtin.set_fact:
+        campaign_data_sync_residues: >-
+          {{ (campaign_data_sync_residues | default([])
+              + campaign_residue_publication.ansible_stats.data.data_sync_residues) | unique | list }}
+        campaign_data_sync_used_cloud_source: >-
+          {{ (campaign_data_sync_used_cloud_source | default(false) | bool)
+             or (data_sync_source_snapshot | default('') | length > 0) }}
+      when: samurai_engine_callback_auth | default(false) | bool
       tags: [data_sync]
 
     - name: "[data_sync] Say out loud what survived the cleanup"
