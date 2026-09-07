@@ -6,43 +6,14 @@
     - name: "Observe required destination volumes"
       when: data_sync_destination_intents | default(data_sync_items | default([])) | length > 0
       block:
-        - name: "Require the frozen candidate identity and destination bindings"
+        - name: "Require destination bindings before observation"
           ansible.builtin.assert:
             that:
-              - replacement is defined and replacement is mapping
-              - replacement.organization_id | string == organization_id | string
-              - replacement.instance_id | default('') | length > 0
-              - replacement.source_instance_id == samurai_source_instance_id
-              - replacement.instance_id != samurai_source_instance_id
-              - replacement.hostname == hostname
-              - replacement.hostname | regex_search('[:,;&!*?\[\]~()@\s]') is none
-              - replacement.hostname | lower not in ['localhost', '127.0.0.1', '::1', 'all', 'ungrouped']
-              - replacement.hostname not in groups
-              - replacement.hostname != old_hostname
               - data_sync_destination_bindings | default([]) | length > 0
-              - aws_replacement.ssh_username | default('') | length > 0
             quiet: true
 
-        - name: "Select the observed candidate address"
-          ansible.builtin.set_fact:
-            data_continuity_candidate_address: >-
-              {{ replacement.public_ip | default(replacement.private_ip | default(''), true)
-                 | samurai_candidate_address([old_ip_address | default(''),
-                   replacement.source_state_before.PrivateIp | default('')]) }}
-
-        - name: "Add only the candidate to this job inventory"
-          ansible.builtin.add_host:
-            name: "{{ replacement.hostname }}"
-            ansible_host: "{{ data_continuity_candidate_address }}"
-            ansible_user: "{{ aws_replacement.ssh_username }}"
-            ansible_connection: ssh
-
-        - name: "Wait for candidate access"
-          ansible.builtin.wait_for_connection:
-            connect_timeout: 10
-            sleep: 5
-            timeout: 600
-          delegate_to: "{{ replacement.hostname }}"
+        - name: "Prepare the individual candidate for this job"
+          ansible.builtin.include_tasks: tasks/data_continuity_prepare_candidate.yml
 
         - name: "Read candidate block devices without writing to them"
           ansible.builtin.command:
@@ -55,6 +26,8 @@
         - name: "Publish provider bindings with measured device identity"
           ansible.builtin.set_stats:
             data:
+              new_hostname: "{{ replacement.hostname }}"
+              new_ip: "{{ data_continuity_candidate_address }}"
               data_sync_destination_bindings: >-
                 {{ data_sync_destination_bindings | samurai_observe_destinations(
                    data_continuity_candidate_devices.stdout | from_json, replacement.instance_id) }}

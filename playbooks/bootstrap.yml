@@ -1,4 +1,6 @@
 ---
+- ansible.builtin.import_playbook: data_continuity_prepare_stage.yml
+
 # Single-stage playbook used by the AAP workflow node "bootstrap".
 # Targets the newly provisioned host (resolved via add_host or AAP inventory sync).
 - name: "SamurAI :: bootstrap new server"
