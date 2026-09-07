@@ -108,7 +108,7 @@
   tags: [bootstrap, data_sync]
 
 - name: "[bootstrap] Mount the existing filesystem, read-write, without recreating it"
-  ansible.builtin.mount:
+  ansible.posix.mount:
     path: "{{ data_sync_mount_point }}"
     src: "{{ data_sync_destination }}"
     fstype: "{{ data_volume_fs_type }}"

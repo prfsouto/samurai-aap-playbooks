@@ -76,6 +76,7 @@
   tags: [bootstrap, security]
 
 - name: "[bootstrap] Register host in AAP/Tower inventory"
+  when: not (samurai_engine_callback_auth | default(false) | bool)
   awx.awx.host:
     name: "{{ new_hostname }}"
     inventory: "{{ aap_inventory_name | default('samurai_managed') }}"
