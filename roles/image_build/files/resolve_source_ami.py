@@ -37,7 +37,7 @@ def select_source(images, owner):
     return {"resolved_source_ami": image_id, "root_device_name": root}
 
 
-def resolve_source(*, region, owner, name_filter):
+def resolve_source(*, region, owner, name_filter, aws_cli="aws"):
     if not re.fullmatch(r"[0-9]{12}", owner) or not region or not name_filter:
         raise ValueError("Governed region, publisher account and image filter are required")
     filters = [
@@ -47,7 +47,7 @@ def resolve_source(*, region, owner, name_filter):
         {"Name": "state", "Values": ["available"]},
     ]
     result = subprocess.run(
-        ["aws", "ec2", "describe-images", "--region", region, "--owners", owner,
+        [aws_cli, "ec2", "describe-images", "--region", region, "--owners", owner,
          "--filters", json.dumps(filters), "--output", "json"],
         check=True, capture_output=True, text=True, timeout=120,
     )
@@ -59,8 +59,9 @@ def main():
     parser.add_argument("--region", required=True)
     parser.add_argument("--owner", required=True)
     parser.add_argument("--name-filter", required=True)
+    parser.add_argument("--aws-cli", default="aws")
     args = parser.parse_args()
-    print(json.dumps(resolve_source(region=args.region, owner=args.owner, name_filter=args.name_filter)))
+    print(json.dumps(resolve_source(region=args.region, owner=args.owner, name_filter=args.name_filter, aws_cli=args.aws_cli)))
 
 
 if __name__ == "__main__":

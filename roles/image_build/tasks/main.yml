@@ -324,6 +324,8 @@
         argv:
           - python3
           - "{{ role_path }}/files/resolve_source_ami.py"
+          - --aws-cli
+          - "{{ image_build_aws_cli_binary }}"
           - --region
           - "{{ image_build_packer_vars.aws_region | default(lookup('env', 'AWS_REGION'), true) | default(lookup('env', 'AWS_DEFAULT_REGION'), true) }}"
           - --owner
