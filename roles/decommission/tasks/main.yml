@@ -41,7 +41,6 @@
     snapshot_tags:
       managed_by: "samurai-shield"
       samurai_execution_id: "{{ samurai_execution_id | default('') }}"
-  failed_when: false
   tags: [decommission, snapshot]
 
 - name: "[decommission] Stop and terminate old instance"
@@ -53,7 +52,6 @@
       - "{{ old_server.instance_id }}"
     state: terminated
     wait: true
-  failed_when: false
   tags: [decommission, terminate]
 
 - name: "[decommission] Remove old host from AAP inventory"
@@ -62,7 +60,6 @@
     inventory: "{{ aap_inventory_name | default('samurai_managed') }}"
     state: absent
   delegate_to: localhost
-  failed_when: false
   tags: [decommission, inventory]
 
 - name: "[decommission] Publish decommission completion"

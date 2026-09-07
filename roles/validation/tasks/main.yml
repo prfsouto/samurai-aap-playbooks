@@ -9,6 +9,7 @@
   ansible.builtin.set_fact:
     validation_checks: []
     validation_passed: false
+    _root_free_pct: 0
   tags: [validation]
 
 - name: "[validation] SSH port reachable"
@@ -63,18 +64,24 @@
   when: validation_required_services | length > 0
   tags: [validation]
 
+- name: "[validation] Locate the observed root filesystem"
+  ansible.builtin.set_fact:
+    _validation_root_mount: "{{ ansible_mounts | default([]) | selectattr('mount', 'defined') | selectattr('mount', 'equalto', '/') | list | first | default({}) }}"
+  tags: [validation]
+
 - name: "[validation] Disk free above threshold"
   ansible.builtin.set_fact:
     _root_free_pct: >-
-      {{ ((ansible_mounts | selectattr('mount', 'equalto', '/') | list | first).size_available
-         / (ansible_mounts | selectattr('mount', 'equalto', '/') | list | first).size_total * 100) | round(0, 'floor') }}
-  when: ansible_mounts is defined
+      {{ (_validation_root_mount.size_available / _validation_root_mount.size_total * 100) | round(0, 'floor') }}
+  when:
+    - _validation_root_mount.size_total | default(none) is number
+    - _validation_root_mount.size_available | default(none) is number
+    - _validation_root_mount.size_total > 0
   tags: [validation]
 
 - name: "[validation] Record disk check"
   ansible.builtin.set_fact:
     validation_checks: "{{ validation_checks + [{'name': 'disk_free_pct', 'value': _root_free_pct | default(0), 'status': ((_root_free_pct | default(0) | int) >= (validation_min_disk_free_pct | int)) | ternary('passed', 'failed')}] }}"
-  when: _root_free_pct is defined
   tags: [validation]
 
 - name: "[validation] Compute overall result"
