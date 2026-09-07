@@ -1,0 +1,79 @@
+---
+# Abre a carga inicial da continuidade de dados: roda entre o provisionamento e
+# a cópia, e só leva ao control plane o pedido — não toca máquina nenhuma.
+- name: "SamurAI :: data_continuity :: abre a carga inicial"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: "[open_seed] Nada a abrir quando o rebuild não tem volume de dados"
+      ansible.builtin.set_stats:
+        data:
+          data_continuity_open_seed_skipped: true
+          data_continuity_open_seed_reason: "sem execução de campanha nesta rotação"
+      when: samurai_campaign_server_execution_id | default('') | string | length == 0
+      tags: [data_continuity]
+
+    - name: "[open_seed] Refuse a rotação sem a instância de origem"
+      ansible.builtin.assert:
+        that:
+          - samurai_source_instance_id | default('') | length > 0
+        fail_msg: >-
+          the coordinated snapshot is taken from the SOURCE instance, and this
+          rotation did not carry samurai_source_instance_id. Taking it from the
+          candidate would photograph an empty disk and call it a copy.
+        quiet: true
+      when: samurai_campaign_server_execution_id | default('') | string | length > 0
+      tags: [data_continuity, guard]
+
+    - name: "[open_seed] Entrega os vínculos e pede a abertura ao control plane"
+      ansible.builtin.uri:
+        url: >-
+          {{ samurai_engine_base_url | trim | regex_replace('/$', '') }}/campaign-executions/{{
+          samurai_campaign_server_execution_id }}/data-continuity/open-seed
+        method: POST
+        headers:
+          Authorization: "Bearer {{ samurai_engine_api_token }}"
+          X-Organization-Id: "{{ organization_id | string }}"
+        body_format: json
+        body:
+          source_instance_id: "{{ samurai_source_instance_id }}"
+        status_code: [200]
+        timeout: 120
+      register: data_continuity_open_seed
+      no_log: true
+      when: samurai_campaign_server_execution_id | default('') | string | length > 0
+      tags: [data_continuity]
+
+    # A recusa vem com 200 e `opened: false`: ela é resposta, não erro de
+    # servidor. Falhar AQUI é o que impede a cópia de começar sem identidade —
+    # o mesmo motivo reaparece depois no post-flight, e as duas leituras têm de
+    # concordar.
+    - name: "[open_seed] Recusa do control plane encerra a rotação"
+      ansible.builtin.assert:
+        that:
+          - (data_continuity_open_seed.json | default({})).opened | default(false) | bool
+        fail_msg: >-
+          the control plane refused to open the seed stage:
+          {{ (data_continuity_open_seed.json | default({})).reason | default('no reason given') }}.
+          Copying without an execution identity leaves the result belonging to
+          nothing, and the post-flight would refuse it anyway.
+        quiet: true
+      when:
+        - samurai_campaign_server_execution_id | default('') | string | length > 0
+        - not (data_continuity_open_seed.skipped | default(false))
+      tags: [data_continuity, guard]
+
+    - name: "[open_seed] Publica o que o estágio de cópia precisa saber"
+      ansible.builtin.set_stats:
+        data:
+          data_continuity_open_seed_done: true
+          data_continuity_plan_id: "{{ (data_continuity_open_seed.json).plan_id }}"
+          data_continuity_plan_revision: "{{ (data_continuity_open_seed.json).plan_revision }}"
+          data_continuity_snapshot_set_id: "{{ (data_continuity_open_seed.json).snapshot_set_id }}"
+          data_continuity_generation: "{{ (data_continuity_open_seed.json).generation }}"
+          data_continuity_volumes: "{{ (data_continuity_open_seed.json).volumes }}"
+          data_sync_items: "{{ (data_continuity_open_seed.json).data_sync_items }}"
+      when:
+        - samurai_campaign_server_execution_id | default('') | string | length > 0
+        - not (data_continuity_open_seed.skipped | default(false))
+      tags: [data_continuity]

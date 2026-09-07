@@ -1,0 +1,103 @@
+---
+# ============================================================================
+# Role: validation
+# Purpose: ensure the new host is healthy before any cutover decision.
+# All checks short-circuit on first hard failure → workflow stops there.
+# ============================================================================
+
+- name: "[validation] Initialize check accumulator"
+  ansible.builtin.set_fact:
+    validation_checks: []
+    validation_passed: false
+  tags: [validation]
+
+- name: "[validation] SSH port reachable"
+  ansible.builtin.wait_for:
+    host: "{{ new_ip }}"
+    port: 22
+    timeout: 30
+    state: started
+  delegate_to: localhost
+  register: ssh_check
+  failed_when: false
+  tags: [validation]
+
+- name: "[validation] Record SSH result"
+  ansible.builtin.set_fact:
+    validation_checks: "{{ validation_checks + [{'name': 'ssh_reachable', 'status': (ssh_check is succeeded) | ternary('passed', 'failed')}] }}"
+  tags: [validation]
+
+- name: "[validation] Required TCP ports open"
+  ansible.builtin.wait_for:
+    host: "{{ new_ip }}"
+    port: "{{ item }}"
+    timeout: 10
+    state: started
+  delegate_to: localhost
+  loop: "{{ validation_required_ports }}"
+  register: port_checks
+  failed_when: false
+  tags: [validation]
+
+- name: "[validation] Record port results"
+  ansible.builtin.set_fact:
+    validation_checks: "{{ validation_checks + [{'name': 'port_' ~ item.item, 'status': (item is succeeded) | ternary('passed', 'failed')}] }}"
+  loop: "{{ port_checks.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  tags: [validation]
+
+- name: "[validation] Required services running"
+  ansible.builtin.service_facts:
+  when: validation_required_services | length > 0
+  tags: [validation]
+
+- name: "[validation] Verify each required service"
+  ansible.builtin.set_fact:
+    validation_checks: >-
+      {{ validation_checks + [{
+        'name': 'service_' ~ item,
+        'status': ((ansible_facts.services[item ~ '.service'] | default({})).state == 'running') | ternary('passed', 'failed')
+      }] }}
+  loop: "{{ validation_required_services }}"
+  when: validation_required_services | length > 0
+  tags: [validation]
+
+- name: "[validation] Disk free above threshold"
+  ansible.builtin.set_fact:
+    _root_free_pct: >-
+      {{ ((ansible_mounts | selectattr('mount', 'equalto', '/') | list | first).size_available
+         / (ansible_mounts | selectattr('mount', 'equalto', '/') | list | first).size_total * 100) | round(0, 'floor') }}
+  when: ansible_mounts is defined
+  tags: [validation]
+
+- name: "[validation] Record disk check"
+  ansible.builtin.set_fact:
+    validation_checks: "{{ validation_checks + [{'name': 'disk_free_pct', 'value': _root_free_pct | default(0), 'status': ((_root_free_pct | default(0) | int) >= (validation_min_disk_free_pct | int)) | ternary('passed', 'failed')}] }}"
+  when: _root_free_pct is defined
+  tags: [validation]
+
+- name: "[validation] Compute overall result"
+  ansible.builtin.set_fact:
+    validation_passed: "{{ validation_checks | rejectattr('status', 'equalto', 'passed') | list | length == 0 }}"
+  tags: [validation]
+
+- name: "[validation] Print check summary"
+  ansible.builtin.debug:
+    var: validation_checks
+  tags: [validation]
+
+- name: "[validation] Publish validation result"
+  ansible.builtin.set_stats:
+    data:
+      validation_passed: "{{ validation_passed }}"
+      validation_checks: "{{ validation_checks }}"
+    aggregate: false
+    per_host: false
+  tags: [validation]
+
+- name: "[validation] Fail workflow on hard failure"
+  ansible.builtin.fail:
+    msg: "Validation failed: {{ validation_checks | rejectattr('status', 'equalto', 'passed') | list }}"
+  when: not validation_passed
+  tags: [validation]

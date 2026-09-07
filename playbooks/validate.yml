@@ -1,0 +1,8 @@
+---
+# Single-stage playbook used by the AAP workflow node "validation".
+- name: "SamurAI :: validate new server"
+  hosts: "{{ new_hostname | default('localhost') }}"
+  gather_facts: true
+  tasks:
+    - ansible.builtin.import_role:
+        name: validation

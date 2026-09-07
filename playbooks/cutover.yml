@@ -1,0 +1,8 @@
+---
+# Single-stage playbook used by the AAP workflow node "cutover".
+- name: "SamurAI :: cutover traffic to new server"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - ansible.builtin.import_role:
+        name: cutover

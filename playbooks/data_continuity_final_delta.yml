@@ -1,0 +1,76 @@
+---
+# Suspende a escrita na origem e abre o delta final. Só leva o pedido ao control
+# plane — quem decide e quem guarda a concessão é ele.
+- name: "SamurAI :: data_continuity :: abre o delta final"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: "[final_delta] Nada a fechar quando o rebuild não tem volume de dados"
+      ansible.builtin.set_stats:
+        data:
+          data_continuity_final_delta_skipped: true
+          data_continuity_final_delta_reason: "sem execução de campanha nesta rotação"
+      when: samurai_campaign_server_execution_id | default('') | string | length == 0
+      tags: [data_continuity]
+
+    - name: "[final_delta] Refuse a rotação sem a instância de origem"
+      ansible.builtin.assert:
+        that:
+          - samurai_source_instance_id | default('') | length > 0
+        fail_msg: >-
+          the final delta is taken from the SOURCE instance, and this rotation did
+          not carry samurai_source_instance_id.
+        quiet: true
+      when: samurai_campaign_server_execution_id | default('') | string | length > 0
+      tags: [data_continuity, guard]
+
+    - name: "[final_delta] Pede ao control plane que suspenda e fotografe"
+      ansible.builtin.uri:
+        url: >-
+          {{ samurai_engine_base_url | trim | regex_replace('/$', '') }}/campaign-executions/{{
+          samurai_campaign_server_execution_id }}/data-continuity/open-final-delta
+        method: POST
+        headers:
+          Authorization: "Bearer {{ samurai_engine_api_token }}"
+          X-Organization-Id: "{{ organization_id | string }}"
+        body_format: json
+        body:
+          source_instance_id: "{{ samurai_source_instance_id }}"
+          lease_seconds: "{{ samurai_quiesce_lease_seconds | default(900) | int }}"
+        status_code: [200]
+        timeout: 300
+      register: data_continuity_final_delta
+      no_log: true
+      when: samurai_campaign_server_execution_id | default('') | string | length > 0
+      tags: [data_continuity]
+
+    # A recusa vem com 200 e `opened: false`. Falhar aqui deixa a origem servindo
+    # e o candidato de lado — copiar um delta tirado de uma origem que ainda
+    # escrevia produziria uma cópia que nasce velha e passa por completa.
+    - name: "[final_delta] Recusa do control plane encerra a rotação"
+      ansible.builtin.assert:
+        that:
+          - (data_continuity_final_delta.json | default({})).opened | default(false) | bool
+        fail_msg: >-
+          the control plane refused to open the final delta:
+          {{ (data_continuity_final_delta.json | default({})).reason | default('no reason given') }}
+        quiet: true
+      when:
+        - samurai_campaign_server_execution_id | default('') | string | length > 0
+        - not (data_continuity_final_delta.skipped | default(false))
+      tags: [data_continuity, guard]
+
+    - name: "[final_delta] Publica a geração nova para o estágio de cópia"
+      ansible.builtin.set_stats:
+        data:
+          data_continuity_final_delta_done: true
+          data_continuity_plan_id: "{{ (data_continuity_final_delta.json).plan_id }}"
+          data_continuity_snapshot_set_id: "{{ (data_continuity_final_delta.json).snapshot_set_id }}"
+          data_continuity_generation: "{{ (data_continuity_final_delta.json).generation }}"
+          data_continuity_volumes: "{{ (data_continuity_final_delta.json).volumes }}"
+          data_sync_items: "{{ (data_continuity_final_delta.json).data_sync_items }}"
+          data_continuity_quiesced: "{{ (data_continuity_final_delta.json).quiesced }}"
+      when:
+        - samurai_campaign_server_execution_id | default('') | string | length > 0
+        - not (data_continuity_final_delta.skipped | default(false))
+      tags: [data_continuity]

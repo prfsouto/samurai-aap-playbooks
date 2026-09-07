@@ -1,0 +1,133 @@
+---
+# Um volume por vez. Quando o estágio replicou vários, cada um chega aqui pelo seu
+# item — a identidade do filesystem é publicada por volume, e não sobrescrita pelo
+# vizinho.
+# O item TRAZ os próprios campos. Cair no fato da iteração anterior faria o
+# volume seguinte ser validado, montado e publicado com o destino do volume
+# anterior — dois volumes apontando para o mesmo disco, e a evidência mentindo
+# sobre qual deles atravessou.
+- name: "[bootstrap] Refuse a guard item that does not carry its own volume"
+  ansible.builtin.assert:
+    that:
+      - (data_sync_guard_item | default({})).destination | default('') | length > 0
+      - (data_sync_guard_item | default({})).source_volume_stable_id | default('') | length > 0
+    fail_msg: >-
+      each data_sync guard item needs its own destination and
+      source_volume_stable_id. Falling back to the previous iteration's fact
+      would validate and mount the next volume against the previous disk.
+    quiet: true
+  tags: [bootstrap, data_sync, guard]
+
+- name: "[bootstrap] Point the guard at this volume"
+  ansible.builtin.set_fact:
+    data_sync_destination: "{{ data_sync_guard_item.destination }}"
+    data_sync_mount_point: "{{ data_sync_guard_item.mount_point | default('') }}"
+    data_sync_guard_volume_id: "{{ data_sync_guard_item.source_volume_stable_id }}"
+  tags: [bootstrap, data_sync]
+
+# ============================================================================
+# Invariante: com data_sync_done, o bootstrap DETECTA, VALIDA e MONTA o volume de
+# dados — nunca cria, formata ou inicializa.
+#
+# Sem esta trava, um `mkfs` acrescentado ao bootstrap formataria por cima do volume
+# recém-replicado, e ninguém perceberia até alguém procurar o dado.
+# ============================================================================
+
+- name: "[bootstrap] Read the filesystem signature of the replicated volume"
+  ansible.builtin.command:
+    argv: ["blkid", "-p", "-o", "export", "{{ data_sync_destination }}"]
+  become: true
+  register: data_volume_signature
+  changed_when: false
+  failed_when: false
+  tags: [bootstrap, data_sync]
+
+# `blkid -p -o export` emite várias chaves terminadas em TYPE= — PTTYPE= (tabela de
+# partição) e PART_ENTRY_TYPE= entre elas. Sem exigir início de linha, o match pega a
+# chave errada e o mount tenta um fstype que não existe.
+# `default` antes de `first`: sem linha TYPE=, `regex_search` devolve None e `first`
+# levanta erro de template antes de qualquer fallback — o estágio morreria com uma
+# mensagem sobre filtro, não sobre o volume sem filesystem.
+- name: "[bootstrap] Extract the filesystem type, and only it"
+  ansible.builtin.set_fact:
+    data_volume_fs_type: >-
+      {{ (data_volume_signature.stdout | regex_search('(?m)^TYPE=(\S+)$', '\1') | default([], true) | first | default('', true)) }}
+  when: data_volume_signature.rc == 0
+  tags: [bootstrap, data_sync]
+
+- name: "[bootstrap] Refuse to continue without a filesystem on the replicated volume"
+  ansible.builtin.assert:
+    that:
+      - data_volume_signature.rc == 0
+      - data_volume_fs_type | default('') | length > 0
+    fail_msg: >-
+      {{ data_sync_destination }} has no filesystem signature after data_sync. Either the
+      replication did not land where it was supposed to, or the source volume was empty.
+      The bootstrap does NOT format here: creating a filesystem now would erase whatever
+      was replicated. Investigate the data_sync result before retrying.
+    quiet: true
+  tags: [bootstrap, data_sync]
+
+# Só a identidade do filesystem entra na comparação. `blkid -p` também devolve campos
+# derivados do superbloco — FSSIZE, FSLASTBLOCK — que mudam legitimamente ao montar, e
+# compará-los inteiros produziria falso positivo de "alguém formatou".
+- name: "[bootstrap] Record the identity that must survive the bootstrap"
+  ansible.builtin.set_fact:
+    data_volume_fs_identity: >-
+      {{ data_volume_signature.stdout
+         | regex_findall('(?m)^(?:TYPE|UUID|LABEL|BLOCK_SIZE)=.*$')
+         | sort | join('|') }}
+  tags: [bootstrap, data_sync]
+
+- name: "[bootstrap] Mount the existing filesystem, read-write, without recreating it"
+  ansible.builtin.mount:
+    path: "{{ data_sync_mount_point }}"
+    src: "{{ data_sync_destination }}"
+    fstype: "{{ data_volume_fs_type }}"
+    state: mounted
+    opts: "{{ data_sync_mount_opts | default('defaults') }}"
+  become: true
+  when: data_sync_mount_point | default('') | length > 0
+  tags: [bootstrap, data_sync]
+
+# Prova do invariante (T21 do plano): a assinatura tem de ser a mesma depois da montagem.
+- name: "[bootstrap] Re-read the signature after mounting"
+  ansible.builtin.command:
+    argv: ["blkid", "-p", "-o", "export", "{{ data_sync_destination }}"]
+  become: true
+  register: data_volume_signature_after
+  changed_when: false
+  tags: [bootstrap, data_sync]
+
+- name: "[bootstrap] Extract the identity again, the same way"
+  ansible.builtin.set_fact:
+    data_volume_fs_identity_after: >-
+      {{ data_volume_signature_after.stdout
+         | regex_findall('(?m)^(?:TYPE|UUID|LABEL|BLOCK_SIZE)=.*$')
+         | sort | join('|') }}
+  tags: [bootstrap, data_sync]
+
+- name: "[bootstrap] Assert the bootstrap did not reformat the volume"
+  ansible.builtin.assert:
+    that:
+      - data_volume_fs_identity_after == data_volume_fs_identity
+    fail_msg: >-
+      The filesystem identity of {{ data_sync_destination }} changed during bootstrap
+      ({{ data_volume_fs_identity }} → {{ data_volume_fs_identity_after }}). Something
+      formatted or re-initialised a volume that had just been replicated.
+    quiet: true
+  tags: [bootstrap, data_sync]
+
+# A identidade morria dentro do play. O gate de continuidade julga do lado do
+# control plane e precisa dela como evidência de que o filesystem sobreviveu à
+# montagem — separada da evidência de CONTEÚDO, que vem do resumo relido.
+- name: "[bootstrap] Publish this volume's filesystem identity for the gate"
+  ansible.builtin.set_stats:
+    aggregate: true
+    data:
+      data_sync_destination_identities:
+        - source_volume_stable_id: "{{ data_sync_guard_volume_id | default('') }}"
+          destination_device: "{{ data_sync_destination }}"
+          filesystem_identity: "{{ data_volume_fs_identity_after }}"
+          mounted_at: "{{ data_sync_mount_point | default('') }}"
+  tags: [bootstrap, data_sync]
