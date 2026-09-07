@@ -1,0 +1,39 @@
+---
+- name: "Require a supported copy stage"
+  ansible.builtin.assert:
+    that:
+      - campaign_copy_operation in ['open-seed', 'open-final-delta']
+    quiet: true
+
+- name: "Prepare private copy-stage authentication"
+  ansible.builtin.include_tasks: data_continuity_callback_auth.yml
+  vars:
+    data_continuity_callback_operation: "{{ campaign_copy_operation }}"
+
+- name: "Request the governed copy stage"
+  ansible.builtin.uri:
+    url: "{{ samurai_engine_base_url | regex_replace('/$', '') }}/campaign-executions/{{ samurai_campaign_server_execution_id }}/data-continuity/{{ campaign_copy_operation }}"
+    method: POST
+    headers: "{{ data_continuity_callback_headers }}"
+    body_format: json
+    body: >-
+      {{ {'source_instance_id': samurai_source_instance_id}
+         | combine({'lease_seconds': samurai_quiesce_lease_seconds | default(900) | int}
+                   if campaign_copy_operation == 'open-final-delta' else {}) }}
+    status_code: [200]
+    timeout: 300
+  register: campaign_open_stage
+  no_log: true
+
+- name: "Require the actual execution items for this stage"
+  ansible.builtin.assert:
+    that:
+      - campaign_open_stage.json.opened | default(false) | bool
+      - campaign_open_stage.json.data_sync_items | default([]) | length > 0
+      - campaign_open_stage.json.data_sync_items | map(attribute='stage') | unique | list == [ 'seed' if campaign_copy_operation == 'open-seed' else 'final' ]
+    fail_msg: "The Engine did not authorize the requested copy stage with execution evidence"
+    quiet: true
+
+- name: "Use only the execution items returned by the Engine"
+  ansible.builtin.set_fact:
+    data_sync_items: "{{ campaign_open_stage.json.data_sync_items }}"

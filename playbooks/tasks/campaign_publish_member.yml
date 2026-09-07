@@ -1,0 +1,17 @@
+---
+- name: "Publish this member's observed preparation evidence"
+  ansible.builtin.set_stats:
+    per_host: false
+    aggregate: false
+    data:
+      "samurai_campaign_execution_{{ samurai_campaign_server_execution_id }}":
+        organization_id: "{{ organization_id }}"
+        campaign_server_execution_id: "{{ samurai_campaign_server_execution_id }}"
+        attempt_id: "{{ samurai_execution_id }}"
+        replacement: "{{ replacement | default({}) }}"
+        new_hostname: "{{ new_hostname }}"
+        new_ip: "{{ data_continuity_candidate_address | default('') }}"
+        data_sync_destination_bindings: "{{ data_sync_destination_bindings | default([]) }}"
+        data_sync_volume_results: "{{ campaign_data_sync_volume_results | default([]) }}"
+        validation_passed: "{{ validation_passed | default(false) }}"
+        preparation_completed: "{{ campaign_preparation_completed | default(false) }}"

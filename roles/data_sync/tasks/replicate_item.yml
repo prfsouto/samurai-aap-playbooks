@@ -101,6 +101,7 @@
 # laço perderia tudo que já concluiu se o executor morresse no meio — e a
 # reconciliação não saberia por onde retomar.
 - name: "[data_sync] Publish this volume's own result"
+  register: campaign_volume_publication
   ansible.builtin.set_stats:
     aggregate: true
     data:
@@ -129,4 +130,12 @@
           destination_device_size: "{{ (data_sync_verify | default({})).destination_device_size | default(0) }}"
           destination_device: "{{ data_sync_destination }}"
           completed_at: "{{ ansible_date_time.iso8601 | default('') }}"
+  tags: [data_sync]
+
+- name: "[data_sync] Retain observed results for the current campaign member"
+  ansible.builtin.set_fact:
+    campaign_data_sync_volume_results: >-
+      {{ campaign_data_sync_volume_results | default([])
+         + campaign_volume_publication.ansible_stats.data.data_sync_volume_results }}
+  when: samurai_engine_callback_auth | default(false) | bool
   tags: [data_sync]

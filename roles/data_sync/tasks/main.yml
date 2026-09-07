@@ -63,6 +63,7 @@
   tags: [data_sync]
 
 - name: "[data_sync] Publish the aggregate result of the stage"
+  register: campaign_data_sync_publication
   ansible.builtin.set_stats:
     data:
       data_sync_done: true

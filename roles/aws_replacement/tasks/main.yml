@@ -320,6 +320,7 @@
 # Publish the envelope the control plane consumes (finalize_replacement).
 # ─────────────────────────────────────────────────────────────────────────────
 - name: "[aws_replacement] Publish the replacement envelope to set_stats"
+  register: campaign_provision_publication
   ansible.builtin.set_stats:
     data:
       replacement:
