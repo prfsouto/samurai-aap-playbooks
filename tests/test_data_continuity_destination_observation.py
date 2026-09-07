@@ -74,3 +74,17 @@ def test_candidate_address_cannot_reach_source_metadata_or_controller(address):
 
 def test_private_candidate_address_is_valid_when_distinct_from_source():
     assert _STORAGE.candidate_address("10.0.0.2", ["10.0.0.1", ""]) == "10.0.0.2"
+
+
+def test_bootstrap_resolves_the_current_device_even_after_device_renumbering():
+    _, observed = inputs()
+    observed["blockdevices"][0].update(name="/dev/nvme8n1", mountpoints=["/data"])
+    observed["blockdevices"].append({"name": "/dev/nvme2n1", "serial": "vol-other", "type": "disk"})
+    assert _STORAGE.destination_device("vol-destination", observed) == "/dev/nvme8n1"
+
+
+def test_bootstrap_refuses_duplicate_provider_serials():
+    _, observed = inputs()
+    observed["blockdevices"] *= 2
+    with pytest.raises(_STORAGE.StorageObservationError, match="exactly one"):
+        _STORAGE.destination_device("vol-destination", observed)

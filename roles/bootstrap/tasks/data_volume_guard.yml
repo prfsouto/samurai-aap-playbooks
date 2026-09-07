@@ -1,4 +1,32 @@
 ---
+- name: "[bootstrap] Require stable destination identity for campaign data"
+  ansible.builtin.assert:
+    that:
+      - data_sync_guard_item.destination_volume_stable_id | default('') | length > 0
+      - data_sync_guard_item.destination_volume_stable_id != data_sync_guard_item.source_volume_stable_id
+    quiet: true
+  when: samurai_campaign_server_execution_id | default('') | string | length > 0
+
+- name: "[bootstrap] Read current devices before resolving the replicated volume"
+  ansible.builtin.command:
+    argv: [lsblk, --json, --bytes, --paths, --output, 'NAME,SERIAL,SIZE,TYPE,FSTYPE,MOUNTPOINTS']
+  become: true
+  changed_when: false
+  register: data_sync_bootstrap_devices
+  when: data_sync_guard_item.destination_volume_stable_id | default('') | length > 0
+
+- name: "[bootstrap] Resolve this destination by its stable identity"
+  ansible.builtin.set_fact:
+    data_sync_guard_destination: >-
+      {{ data_sync_guard_item.destination_volume_stable_id
+         | samurai_destination_device(data_sync_bootstrap_devices.stdout | from_json) }}
+  when: data_sync_guard_item.destination_volume_stable_id | default('') | length > 0
+
+- name: "[bootstrap] Preserve the explicit destination of non-campaign callers"
+  ansible.builtin.set_fact:
+    data_sync_guard_destination: "{{ (data_sync_guard_item | default({})).destination | default('') }}"
+  when: data_sync_guard_item.destination_volume_stable_id | default('') | length == 0
+
 # Um volume por vez. Quando o estágio replicou vários, cada um chega aqui pelo seu
 # item — a identidade do filesystem é publicada por volume, e não sobrescrita pelo
 # vizinho.
@@ -9,7 +37,7 @@
 - name: "[bootstrap] Refuse a guard item that does not carry its own volume"
   ansible.builtin.assert:
     that:
-      - (data_sync_guard_item | default({})).destination | default('') | length > 0
+      - data_sync_guard_destination | default('') | length > 0
       - (data_sync_guard_item | default({})).source_volume_stable_id | default('') | length > 0
     fail_msg: >-
       each data_sync guard item needs its own destination and
@@ -20,7 +48,7 @@
 
 - name: "[bootstrap] Point the guard at this volume"
   ansible.builtin.set_fact:
-    data_sync_destination: "{{ data_sync_guard_item.destination }}"
+    data_sync_destination: "{{ data_sync_guard_destination }}"
     data_sync_mount_point: "{{ data_sync_guard_item.mount_point | default('') }}"
     data_sync_guard_volume_id: "{{ data_sync_guard_item.source_volume_stable_id }}"
   tags: [bootstrap, data_sync]

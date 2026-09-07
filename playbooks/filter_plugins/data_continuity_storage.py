@@ -25,6 +25,26 @@ def _require_unmounted(device):
         _require_unmounted(child)
 
 
+def _find_destination_disk(provider_volume_id, observation):
+    expected = _identity(provider_volume_id)
+    devices = observation.get("blockdevices") if isinstance(observation, dict) else None
+    if not isinstance(devices, list):
+        raise StorageObservationError("Block device observation is incomplete")
+    matches = [device for device in devices if isinstance(device, dict)
+               and isinstance(device.get("serial"), str)
+               and device["serial"].replace("-", "").lower() == expected]
+    if len(matches) != 1:
+        raise StorageObservationError("Provider destination must resolve to exactly one device")
+    device = matches[0]
+    if device.get("type") != "disk" or not str(device.get("name") or "").startswith("/dev/"):
+        raise StorageObservationError("Destination is not an observed disk device")
+    return device
+
+
+def destination_device(provider_volume_id, observation):
+    return _find_destination_disk(provider_volume_id, observation)["name"]
+
+
 def observe_destinations(bindings, observation, candidate_instance_id):
     if not isinstance(candidate_instance_id, str) or not candidate_instance_id:
         raise StorageObservationError("Candidate instance identity is missing")
@@ -41,14 +61,7 @@ def observe_destinations(bindings, observation, candidate_instance_id):
         destination = _identity(binding.get("destination_volume_stable_id"))
         if source == destination or source in seen_sources or destination in seen_destinations:
             raise StorageObservationError("Source and destination volume identities must be unique and distinct")
-        matches = [device for device in devices if isinstance(device, dict)
-                   and isinstance(device.get("serial"), str)
-                   and device["serial"].replace("-", "").lower() == destination]
-        if len(matches) != 1:
-            raise StorageObservationError("Provider destination must resolve to exactly one device")
-        device = matches[0]
-        if device.get("type") != "disk" or not str(device.get("name") or "").startswith("/dev/"):
-            raise StorageObservationError("Destination is not an observed disk device")
+        device = _find_destination_disk(binding["destination_volume_stable_id"], observation)
         _require_unmounted(device)
         observed_size, required_size = device.get("size"), binding.get("size_bytes")
         if type(observed_size) is not int or type(required_size) is not int or required_size <= 0 or observed_size < required_size:
@@ -77,4 +90,5 @@ def candidate_address(address, source_addresses):
 class FilterModule:
     def filters(self):
         return {"samurai_observe_destinations": observe_destinations,
+                "samurai_destination_device": destination_device,
                 "samurai_candidate_address": candidate_address}
