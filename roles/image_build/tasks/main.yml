@@ -313,6 +313,34 @@
           {{ image_build_packer_version.stdout | default('') | trim }}.
       tags: [image_build, build]
 
+    - name: "[image_build] Read the approved template source requirements"
+      ansible.builtin.slurp:
+        src: "{{ image_build_resolved_template_path }}"
+      register: image_build_source_template
+      tags: [image_build, build]
+
+    - name: "[image_build] Resolve the governed source AMI and root device"
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ role_path }}/files/resolve_source_ami.py"
+          - --region
+          - "{{ image_build_packer_vars.aws_region | default(lookup('env', 'AWS_REGION'), true) | default(lookup('env', 'AWS_DEFAULT_REGION'), true) }}"
+          - --owner
+          - "{{ image_build_packer_vars.ami_owner_id | default('') }}"
+          - --name-filter
+          - "{{ image_build_packer_vars.base_image_filter | default('') }}"
+      register: image_build_source_identity
+      changed_when: false
+      when: (image_build_source_template.content | b64decode) is search('variable\\s+"resolved_source_ami"')
+      tags: [image_build, build]
+
+    - name: "[image_build] Pin the resolved AMI and its root together"
+      ansible.builtin.set_fact:
+        image_build_packer_vars: "{{ image_build_packer_vars | combine(image_build_source_identity.stdout | from_json) }}"
+      when: not (image_build_source_identity.skipped | default(false))
+      tags: [image_build, build]
+
     - name: "[image_build] Build the -var argument list from image_build.packer_vars"
       ansible.builtin.set_fact:
         image_build_var_args: "{{ image_build_var_args | default([]) + ['-var', item.key ~ '=' ~ item.value] }}"
