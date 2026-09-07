@@ -19,7 +19,7 @@
     state: started
   delegate_to: localhost
   register: ssh_check
-  failed_when: false
+  ignore_errors: true
   tags: [validation]
 
 - name: "[validation] Record SSH result"
@@ -36,7 +36,7 @@
   delegate_to: localhost
   loop: "{{ validation_required_ports }}"
   register: port_checks
-  failed_when: false
+  ignore_errors: true
   tags: [validation]
 
 - name: "[validation] Record port results"
