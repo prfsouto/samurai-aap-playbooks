@@ -5,6 +5,13 @@
   hosts: localhost
   gather_facts: false
   tasks:
+    - name: "Prepare authentication for the final delta request"
+      ansible.builtin.include_tasks: tasks/data_continuity_callback_auth.yml
+      vars:
+        data_continuity_callback_operation: open-final-delta
+      when: samurai_campaign_server_execution_id | default('') | string | length > 0
+      tags: [data_continuity]
+
     - name: "[final_delta] Nada a fechar quando o rebuild não tem volume de dados"
       ansible.builtin.set_stats:
         data:
@@ -30,9 +37,7 @@
           {{ samurai_engine_base_url | trim | regex_replace('/$', '') }}/campaign-executions/{{
           samurai_campaign_server_execution_id }}/data-continuity/open-final-delta
         method: POST
-        headers:
-          Authorization: "Bearer {{ samurai_engine_api_token }}"
-          X-Organization-Id: "{{ organization_id | string }}"
+        headers: "{{ data_continuity_callback_headers }}"
         body_format: json
         body:
           source_instance_id: "{{ samurai_source_instance_id }}"

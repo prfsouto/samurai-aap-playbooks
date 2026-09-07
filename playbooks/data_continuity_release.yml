@@ -6,6 +6,13 @@
   hosts: localhost
   gather_facts: false
   tasks:
+    - name: "Prepare authentication for the release request"
+      ansible.builtin.include_tasks: tasks/data_continuity_callback_auth.yml
+      vars:
+        data_continuity_callback_operation: release-quiesce
+      when: samurai_campaign_server_execution_id | default('') | string | length > 0
+      tags: [data_continuity]
+
     - name: "[release] Nada a liberar quando o rebuild não tem volume de dados"
       ansible.builtin.set_stats:
         data:
@@ -19,9 +26,7 @@
           {{ samurai_engine_base_url | trim | regex_replace('/$', '') }}/campaign-executions/{{
           samurai_campaign_server_execution_id }}/data-continuity/release-quiesce
         method: POST
-        headers:
-          Authorization: "Bearer {{ samurai_engine_api_token }}"
-          X-Organization-Id: "{{ organization_id | string }}"
+        headers: "{{ data_continuity_callback_headers }}"
         body_format: json
         body: {}
         status_code: [200]

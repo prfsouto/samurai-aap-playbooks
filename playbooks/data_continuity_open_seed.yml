@@ -25,15 +25,20 @@
       when: samurai_campaign_server_execution_id | default('') | string | length > 0
       tags: [data_continuity, guard]
 
+    - name: "Prepare authentication for the seed request"
+      ansible.builtin.include_tasks: tasks/data_continuity_callback_auth.yml
+      vars:
+        data_continuity_callback_operation: open-seed
+      when: samurai_campaign_server_execution_id | default('') | string | length > 0
+      tags: [data_continuity]
+
     - name: "[open_seed] Entrega os vínculos e pede a abertura ao control plane"
       ansible.builtin.uri:
         url: >-
           {{ samurai_engine_base_url | trim | regex_replace('/$', '') }}/campaign-executions/{{
           samurai_campaign_server_execution_id }}/data-continuity/open-seed
         method: POST
-        headers:
-          Authorization: "Bearer {{ samurai_engine_api_token }}"
-          X-Organization-Id: "{{ organization_id | string }}"
+        headers: "{{ data_continuity_callback_headers }}"
         body_format: json
         body:
           source_instance_id: "{{ samurai_source_instance_id }}"
