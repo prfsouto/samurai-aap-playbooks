@@ -82,6 +82,7 @@
     data_sync_destination_serial: "{{ data_sync_destination_resolution.stdout.split()[1] | default('') }}"
     data_sync_destination_volume_id: "{{ data_sync_item_destination_volume }}"
     data_sync_cloud_volume_id: ""
+    data_sync_volume_check: {}
     data_sync_cloud_residue: []
     data_sync_cloud_residue_reason: ""
     data_sync_item_stage: "{{ data_sync_item.stage | default('seed') }}"

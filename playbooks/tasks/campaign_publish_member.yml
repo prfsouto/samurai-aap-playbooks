@@ -8,7 +8,9 @@
         {{ campaign_member_observation | combine(
              {'data_sync_residues': campaign_data_sync_residues,
               'data_sync_used_cloud_source': campaign_data_sync_used_cloud_source}
-             if campaign_data_sync_residues is defined else {}) }}
+             if campaign_data_sync_residues is defined else {}) | combine(
+             {'data_sync_tracked_resources': campaign_data_sync_tracked_resources}
+             if campaign_data_sync_tracked_resources is defined else {}) }}
   vars:
     campaign_member_observation:
         organization_id: "{{ organization_id }}"

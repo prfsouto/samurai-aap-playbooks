@@ -329,6 +329,40 @@
           data_sync_residue_reason: "{{ data_sync_cloud_residue_reason | default('') }}"
       tags: [data_sync]
 
+    - name: "[data_sync] Observe the staged binary after cleanup"
+      ansible.builtin.stat:
+        path: "{{ data_sync_binary_dest }}"
+        get_checksum: false
+        get_mime: false
+      become: "{{ data_sync_become | bool }}"
+      register: campaign_binary_observation
+      failed_when: false
+      when: samurai_engine_callback_auth | default(false) | bool
+      tags: [data_sync]
+
+    - name: "[data_sync] Record temporary resources for this member"
+      ansible.builtin.set_fact:
+        campaign_data_sync_tracked_resources: >-
+          {{ campaign_data_sync_tracked_resources | default([]) + [
+               {'kind': 'staged_binary',
+                'identifier': new_hostname ~ ':' ~ data_sync_binary_dest,
+                'expected_disposition': 'must_be_deleted_before_commit',
+                'actual_state': ('present' if campaign_binary_observation.stat.exists else 'absent')
+                  if campaign_binary_observation.stat.exists | default(none) | type_debug == 'bool' else 'unknown'}
+             ] + ([
+               {'kind': 'ephemeral_source_volume', 'identifier': data_sync_cloud_volume_id,
+                'expected_disposition': 'must_be_deleted_before_commit',
+                'actual_state': ('present' if data_sync_volume_check.volumes | length > 0 else 'absent')
+                  if data_sync_volume_check.volumes | default(none) | type_debug == 'list' else 'unknown'},
+               {'kind': 'transient_attachment', 'identifier': data_sync_cloud_volume_id ~ ':' ~ new_hostname,
+                'expected_disposition': 'must_be_deleted_before_commit',
+                'actual_state': 'absent'
+                  if (data_sync_volume_check.volumes | default(none) | type_debug == 'list'
+                      and data_sync_volume_check.volumes | length == 0) else 'unknown'}
+             ] if data_sync_cloud_volume_id | default('') | length > 0 else []) }}
+      when: samurai_engine_callback_auth | default(false) | bool
+      tags: [data_sync]
+
     - name: "[data_sync] Preserve observed residues for this campaign member"
       ansible.builtin.set_fact:
         campaign_data_sync_residues: >-
