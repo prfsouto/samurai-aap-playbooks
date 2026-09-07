@@ -136,6 +136,8 @@
                     value: "{{ cek_packer_template }}"
                   - name: BASE_IMAGE_FILTER
                     value: "{{ base_image_filter }}"
+                  - name: SOURCE_AMI_OWNER_ID
+                    value: "{{ (packer_vars | default({})).ami_owner_id | default('') }}"
                   - name: IMAGE_FAMILY_NAME
                     value: "{{ image_family_name | default('') }}"
                   - name: SBOM_SCAN_TARGET
