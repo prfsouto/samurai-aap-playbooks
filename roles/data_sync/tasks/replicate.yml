@@ -34,9 +34,9 @@
 - name: "[data_sync] Require the execution id from the control plane"
   ansible.builtin.assert:
     that:
-      - samurai_execution_id is defined
-      - samurai_execution_id | default('') | length > 0
-      - samurai_execution_id | regex_search('^[A-Za-z0-9._-]+$') is not none
+      - data_sync_execution_id is defined
+      - data_sync_execution_id | default('') | length > 0
+      - data_sync_execution_id | regex_search('^[A-Za-z0-9._-]+$') is not none
     quiet: true
   tags: [data_sync, guard]
 
@@ -185,7 +185,7 @@
             [
               '--source', data_sync_source,
               '--destination', data_sync_destination,
-              '--execution-id', samurai_execution_id,
+              '--execution-id', data_sync_execution_id,
               '--organization-id', organization_id | string,
               '--journal-dir', data_sync_journal_dir,
               '--mode', data_sync_mode | replace('_', '-'),

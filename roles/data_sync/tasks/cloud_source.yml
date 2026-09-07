@@ -76,9 +76,9 @@
     encrypted: true
     kms_key_id: "{{ data_sync_cloud_kms_key_id | trim }}"
     tags:
-      Name: "samurai-data-sync-{{ samurai_execution_id }}"
+      Name: "samurai-data-sync-{{ data_sync_execution_id }}"
       managed_by: samurai-shield
-      samurai_execution_id: "{{ samurai_execution_id }}"
+      samurai_execution_id: "{{ data_sync_execution_id }}"
       "{{ data_sync_org_tag }}": "{{ organization_id | string }}"
       ephemeral: "true"
     state: present
