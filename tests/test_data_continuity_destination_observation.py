@@ -88,3 +88,32 @@ def test_bootstrap_refuses_duplicate_provider_serials():
     observed["blockdevices"] *= 2
     with pytest.raises(_STORAGE.StorageObservationError, match="exactly one"):
         _STORAGE.destination_device("vol-destination", observed)
+
+
+def test_final_delta_unmounts_only_the_expected_mounted_volume():
+    _, observed = inputs()
+    assert _STORAGE.destination_needs_unmount("vol-destination", observed, "/data") is False
+    observed["blockdevices"][0]["mountpoints"] = ["/data"]
+    assert _STORAGE.destination_needs_unmount("vol-destination", observed, "/data") is True
+
+
+@pytest.mark.parametrize("mount", ["/", "/boot", "/data/../etc", "relative", "/data/"])
+def test_final_delta_refuses_system_or_ambiguous_mount_intents(mount):
+    _, observed = inputs()
+    with pytest.raises(_STORAGE.StorageObservationError):
+        _STORAGE.destination_needs_unmount("vol-destination", observed, mount)
+
+
+@pytest.mark.parametrize("mounts", [["/other"], ["/data", "/alias"], ["/data", "/data"], None])
+def test_final_delta_refuses_unknown_or_unplanned_mounts(mounts):
+    _, observed = inputs()
+    observed["blockdevices"][0]["mountpoints"] = mounts
+    with pytest.raises(_STORAGE.StorageObservationError):
+        _STORAGE.destination_needs_unmount("vol-destination", observed, "/data")
+
+
+def test_final_delta_refuses_mounted_child_devices():
+    _, observed = inputs()
+    observed["blockdevices"][0]["children"] = [{"mountpoints": ["/data"]}]
+    with pytest.raises(_STORAGE.StorageObservationError):
+        _STORAGE.destination_needs_unmount("vol-destination", observed, "/data")

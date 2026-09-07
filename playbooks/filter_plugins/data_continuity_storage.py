@@ -1,5 +1,6 @@
 """Match provider volume identities to read-only lsblk observations."""
 from ipaddress import ip_address
+from pathlib import PurePosixPath
 
 
 class StorageObservationError(ValueError):
@@ -43,6 +44,29 @@ def _find_destination_disk(provider_volume_id, observation):
 
 def destination_device(provider_volume_id, observation):
     return _find_destination_disk(provider_volume_id, observation)["name"]
+
+
+def destination_needs_unmount(provider_volume_id, observation, mount_point):
+    if not isinstance(mount_point, str) or not mount_point.startswith("/"):
+        raise StorageObservationError("A persistent mount point is required")
+    path = PurePosixPath(mount_point)
+    if ".." in path.parts or str(path) != mount_point or mount_point in {"/", "/boot", "/boot/efi", "/dev", "/proc", "/sys", "/run"}:
+        raise StorageObservationError("System or ambiguous mount points cannot be unmounted")
+    device = _find_destination_disk(provider_volume_id, observation)
+    mounts = device.get("mountpoints")
+    if not isinstance(mounts, list):
+        raise StorageObservationError("Destination mount state is unknown")
+    active = [mount for mount in mounts if mount is not None and mount != ""]
+    if active and active != [mount_point]:
+        raise StorageObservationError("Destination has unexpected or multiple mounts")
+    children = device.get("children", [])
+    if not isinstance(children, list):
+        raise StorageObservationError("Destination topology is incomplete")
+    for child in children:
+        if not isinstance(child, dict):
+            raise StorageObservationError("Destination child device is invalid")
+        _require_unmounted(child)
+    return bool(active)
 
 
 def observe_destinations(bindings, observation, candidate_instance_id):
@@ -91,4 +115,5 @@ class FilterModule:
     def filters(self):
         return {"samurai_observe_destinations": observe_destinations,
                 "samurai_destination_device": destination_device,
+                "samurai_destination_needs_unmount": destination_needs_unmount,
                 "samurai_candidate_address": candidate_address}

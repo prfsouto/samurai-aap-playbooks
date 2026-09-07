@@ -1,0 +1,38 @@
+---
+- name: "SamurAI :: require final mount prerequisites"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: "Require completed final delta before mounting its results"
+      ansible.builtin.assert:
+        that:
+          - samurai_campaign_server_execution_id | default(0) | int > 0
+          - new_hostname is defined
+          - replacement is defined and replacement is mapping
+          - data_sync_done | default(false) | bool
+          - data_sync_items | default([]) | length > 0
+          - data_sync_items | map(attribute='stage') | unique | list == ['final']
+        quiet: true
+
+- ansible.builtin.import_playbook: data_continuity_prepare_stage.yml
+
+- name: "SamurAI :: mount verified final data on the candidate"
+  hosts: "{{ new_hostname | default('samurai_data_sync_no_target') }}"
+  gather_facts: false
+  tasks:
+
+    - name: "Mount each replicated filesystem without creating it"
+      ansible.builtin.include_role:
+        name: bootstrap
+        tasks_from: data_volume_guard
+      loop: "{{ data_sync_items }}"
+      loop_control:
+        loop_var: data_sync_guard_item
+        label: "{{ data_sync_guard_item.source_volume_stable_id }}"
+
+    - name: "Publish final mount completion"
+      ansible.builtin.set_stats:
+        data:
+          data_sync_final_mounted: true
+        aggregate: false
+        per_host: false

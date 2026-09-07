@@ -88,6 +88,11 @@
     data_sync_item_volume_id: "{{ data_sync_item.source_volume_stable_id }}"
   tags: [data_sync]
 
+- name: "[data_sync] Prepare the destination for final delta"
+  ansible.builtin.include_tasks: final_delta_destination.yml
+  when: data_sync_item_stage == 'final'
+  tags: [data_sync, guard]
+
 - name: "[data_sync] Replicate this volume"
   ansible.builtin.include_tasks: replicate.yml
   tags: [data_sync]
