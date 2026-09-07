@@ -1,0 +1,47 @@
+---
+- name: "Require the private campaign credential file"
+  ansible.builtin.assert:
+    that:
+      - lookup('ansible.builtin.env', 'SAMURAI_CAMPAIGN_CALLBACKS_FILE') | length > 0
+    quiet: true
+
+- name: "Read candidate access for this campaign"
+  ansible.builtin.set_fact:
+    campaign_private_access: >-
+      {{ lookup('ansible.builtin.file', lookup('ansible.builtin.env', 'SAMURAI_CAMPAIGN_CALLBACKS_FILE')) | from_json }}
+  no_log: true
+
+- name: "Verify the candidate key belongs to the current attempt"
+  ansible.builtin.assert:
+    that:
+      - campaign_private_access.organization_id | string == organization_id | string
+      - campaign_private_access.executions[samurai_campaign_server_execution_id | string].attempt_id == samurai_execution_id
+      - campaign_private_access.executions[samurai_campaign_server_execution_id | string].candidate_access.login_user == aws_replacement.ssh_username
+      - campaign_private_access.executions[samurai_campaign_server_execution_id | string].candidate_access.private_key | length > 0
+    quiet: true
+  no_log: true
+
+- name: "Materialize the candidate key for this job"
+  block:
+    - name: "Allocate a temporary candidate key file"
+      ansible.builtin.tempfile:
+        state: file
+        prefix: "samurai-candidate-{{ samurai_campaign_server_execution_id }}-"
+      register: campaign_candidate_key
+
+    - name: "Write the private candidate key with restricted permissions"
+      ansible.builtin.copy:
+        content: "{{ campaign_private_access.executions[samurai_campaign_server_execution_id | string].candidate_access.private_key }}"
+        dest: "{{ campaign_candidate_key.path }}"
+        mode: "0600"
+      no_log: true
+
+    - name: "Select this job's candidate key"
+      ansible.builtin.set_fact:
+        data_continuity_candidate_key_file: "{{ campaign_candidate_key.path }}"
+  rescue:
+    - name: "Remove an incomplete candidate key file"
+      ansible.builtin.include_tasks: campaign_candidate_key_cleanup.yml
+    - name: "Refuse candidate access after key materialization failure"
+      ansible.builtin.fail:
+        msg: "The candidate key could not be prepared for this job"

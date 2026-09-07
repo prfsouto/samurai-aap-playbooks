@@ -1,0 +1,15 @@
+---
+- name: "Remove this job's temporary candidate key"
+  ansible.builtin.file:
+    path: "{{ campaign_candidate_key.path }}"
+    state: absent
+  when:
+    - campaign_candidate_key is defined
+    - campaign_candidate_key.path | default('') | length > 0
+
+- name: "Clear this job's candidate access facts"
+  ansible.builtin.set_fact:
+    data_continuity_candidate_key_file: null
+    campaign_private_access: {}
+    data_continuity_private_callbacks: {}
+  no_log: true
