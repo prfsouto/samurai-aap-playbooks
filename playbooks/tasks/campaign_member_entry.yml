@@ -1,5 +1,10 @@
 ---
 - name: "Require exactly one reserved candidate in this slice"
+  vars:
+    campaign_reserved_attempt_matches: >-
+      {{ samurai_campaign_attempts | dict2items
+         | selectattr('key', 'in', [samurai_campaign_member.samurai_campaign_server_execution_id | string,
+                                  samurai_campaign_member.samurai_campaign_server_execution_id | int]) | list }}
   ansible.builtin.assert:
     that:
       - ansible_play_hosts_all | length == 1
@@ -10,7 +15,9 @@
       - inventory_hostname | lower not in ['localhost', '127.0.0.1', 'all', 'ungrouped']
       - samurai_campaign_member.organization_id | string == organization_id | string
       - samurai_campaign_member.samurai_campaign_server_execution_id | int > 0
-      - samurai_campaign_attempts[samurai_campaign_member.samurai_campaign_server_execution_id | string] == samurai_campaign_member.samurai_execution_id
+      - campaign_reserved_attempt_matches | length == 1
+      - campaign_reserved_attempt_matches[0].key is string or campaign_reserved_attempt_matches[0].key is integer
+      - campaign_reserved_attempt_matches[0].value == samurai_campaign_member.samurai_execution_id
       - samurai_campaign_member.samurai_commit_barrier_passed is sameas false
       - samurai_commit_barrier_passed is sameas false
       - samurai_engine_callback_auth is sameas true

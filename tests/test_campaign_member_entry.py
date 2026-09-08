@@ -9,8 +9,16 @@ import yaml
 HELPER = Path(__file__).resolve().parents[1] / "playbooks/tasks/campaign_member_entry.yml"
 
 
-@pytest.mark.parametrize("fault", [None, "two_hosts", "wrong_attempt", "source_as_target", "foreign_org"])
-def test_slice_entry_loads_only_its_reserved_candidate(tmp_path, fault):
+class ControllerDumper(yaml.SafeDumper):
+    def represent_data(self, value):
+        if isinstance(value, str):
+            return self.represent_scalar('!unsafe', value)
+        return super().represent_data(value)
+
+
+@pytest.mark.parametrize("extra_format", ["json", "controller_yaml"])
+@pytest.mark.parametrize("fault", [None, "two_hosts", "wrong_attempt", "source_as_target", "foreign_org", "decimal_key"])
+def test_slice_entry_loads_only_its_reserved_candidate(tmp_path, fault, extra_format):
     ansible = shutil.which("ansible-playbook")
     if not ansible:
         pytest.skip("Ansible runtime is not installed")
@@ -37,6 +45,10 @@ def test_slice_entry_loads_only_its_reserved_candidate(tmp_path, fault):
     playbook.write_text(yaml.safe_dump(play))
     extra = {"organization_id": 1, "samurai_campaign_attempts": {"21": "attempt-21", "22": "attempt-22"},
              "samurai_commit_barrier_passed": False, "samurai_engine_callback_auth": True}
-    result = subprocess.run([ansible, "-i", str(inventory), str(playbook), "-e", json.dumps(extra)],
+    if fault == "decimal_key":
+        extra["samurai_campaign_attempts"] = {"21.0": "attempt-21"}
+    variables = tmp_path / "extra.yml"
+    variables.write_text(json.dumps(extra) if extra_format == "json" else yaml.dump(extra, Dumper=ControllerDumper))
+    result = subprocess.run([ansible, "-i", str(inventory), str(playbook), "-e", "@" + str(variables)],
                             capture_output=True, text=True, timeout=30)
     assert (result.returncode == 0) is (fault is None), result.stdout + result.stderr
