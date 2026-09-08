@@ -129,6 +129,10 @@
   tags: [decommission, terminate]
 
 - name: "[decommission] Remove old host from AAP inventory"
+  environment:
+    CONTROLLER_OPTIONAL_API_URLPATTERN_PREFIX: >-
+      {{ lookup('ansible.builtin.env', 'CONTROLLER_OPTIONAL_API_URLPATTERN_PREFIX')
+         | default('/api/controller/' if samurai_campaign_id is defined else '/api/', true) }}
   awx.awx.host:
     name: "{{ old_server.hostname }}"
     inventory: "{{ aap_inventory_name | default('samurai_managed') }}"
