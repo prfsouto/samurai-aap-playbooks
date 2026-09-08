@@ -1,4 +1,14 @@
 ---
+- name: "[bootstrap] Validate the monitoring repository definition"
+  ansible.builtin.assert:
+    that:
+      - bootstrap_monitoring_repository is mapping
+      - bootstrap_monitoring_repository.baseurl | default('') | length > 0
+      - bootstrap_monitoring_repository.gpgkey | default('') | length > 0
+      - bootstrap_monitoring_repository.fingerprint | default('') | length > 0
+    fail_msg: "Monitoring repository requires baseurl, gpgkey and fingerprint; use an empty mapping only for preconfigured repositories."
+    quiet: true
+
 - name: "[bootstrap] Trust the monitoring repository signing key"
   ansible.builtin.rpm_key:
     key: "{{ bootstrap_monitoring_repository.gpgkey }}"
