@@ -98,3 +98,19 @@ def test_inventory_only_cleanup_does_not_require_aws_observation(snapshot, destr
                  'Require an unambiguous provider observation',
                  'Record whether cloud cleanup is still needed']:
         assert all(env.compile_expression(c)(**values) for c in task(name)['when']) is expected
+
+
+@pytest.mark.parametrize('region', [None, '', '   '])
+def test_governed_cloud_cleanup_refuses_missing_region(region):
+    with pytest.raises((AssertionError, UndefinedError)):
+        assert_checks(task('Require the governed cloud region'), {'region': region})
+
+
+def test_governed_cloud_cleanup_accepts_explicit_region():
+    assert_checks(task('Require the governed cloud region'), {'region': 'us-east-2'})
+
+
+def test_legacy_cleanup_without_campaign_context_keeps_environment_region_contract():
+    condition = task('Require the governed cloud region')['when'][0]
+    assert ENV.compile_expression(condition)() is False
+    assert ENV.compile_expression(condition)(samurai_campaign_id=7) is True
