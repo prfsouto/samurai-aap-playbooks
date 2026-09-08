@@ -16,6 +16,7 @@
       - samurai_campaign_member.organization_id | string == organization_id | string
       - samurai_campaign_member.samurai_campaign_server_execution_id | int > 0
       - campaign_reserved_attempt_matches | length == 1
+      - campaign_reserved_attempt_matches[0].key is string or campaign_reserved_attempt_matches[0].key is integer
       - campaign_reserved_attempt_matches[0].value == samurai_campaign_member.samurai_execution_id
       - samurai_campaign_member.samurai_commit_barrier_passed is sameas false
       - samurai_commit_barrier_passed is sameas false

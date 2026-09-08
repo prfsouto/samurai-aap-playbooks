@@ -17,7 +17,7 @@ class ControllerDumper(yaml.SafeDumper):
 
 
 @pytest.mark.parametrize("extra_format", ["json", "controller_yaml"])
-@pytest.mark.parametrize("fault", [None, "two_hosts", "wrong_attempt", "source_as_target", "foreign_org"])
+@pytest.mark.parametrize("fault", [None, "two_hosts", "wrong_attempt", "source_as_target", "foreign_org", "decimal_key"])
 def test_slice_entry_loads_only_its_reserved_candidate(tmp_path, fault, extra_format):
     ansible = shutil.which("ansible-playbook")
     if not ansible:
@@ -45,6 +45,8 @@ def test_slice_entry_loads_only_its_reserved_candidate(tmp_path, fault, extra_fo
     playbook.write_text(yaml.safe_dump(play))
     extra = {"organization_id": 1, "samurai_campaign_attempts": {"21": "attempt-21", "22": "attempt-22"},
              "samurai_commit_barrier_passed": False, "samurai_engine_callback_auth": True}
+    if fault == "decimal_key":
+        extra["samurai_campaign_attempts"] = {"21.0": "attempt-21"}
     variables = tmp_path / "extra.yml"
     variables.write_text(json.dumps(extra) if extra_format == "json" else yaml.dump(extra, Dumper=ControllerDumper))
     result = subprocess.run([ansible, "-i", str(inventory), str(playbook), "-e", "@" + str(variables)],
