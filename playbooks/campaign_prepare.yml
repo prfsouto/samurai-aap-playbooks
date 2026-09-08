@@ -63,6 +63,14 @@
         - name: "Publish provisioning and destination observations"
           ansible.builtin.include_tasks: tasks/campaign_publish_member.yml
 
+        - name: "Bind data copy to the observed candidate"
+          ansible.builtin.set_fact:
+            instance_id: "{{ replacement.instance_id }}"
+            data_sync_cloud_region: "{{ replacement.region }}"
+            data_sync_cloud_zone: "{{ replacement.describe_instances.Placement.AvailabilityZone }}"
+            data_sync_org_tag: samurai_organization_id
+          when: data_sync_destination_intents | default([]) | length > 0
+
         - name: "Open and perform seed"
           when: data_sync_destination_intents | default([]) | length > 0
           block:
