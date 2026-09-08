@@ -85,3 +85,16 @@ def test_missing_or_ambiguous_identity_refuses_snapshot(fault):
 @pytest.mark.parametrize('observed', [[], [{'instance_id': 'i-0123456789abcdef0', 'state': {'name': 'terminated'}}]])
 def test_already_absent_or_terminated_instance_does_not_snapshot_again(observed):
     assert resolve(observed) is None
+
+
+@pytest.mark.parametrize('snapshot,destroy,expected', [(False, False, False), (True, False, True), (False, True, True)])
+def test_inventory_only_cleanup_does_not_require_aws_observation(snapshot, destroy, expected):
+    env = NativeEnvironment(undefined=StrictUndefined)
+    # Inputs here are booleans, matching the caller's JSON contract.
+    env.filters['bool'] = bool
+    values = {'old_server': {'instance_id': 'i-0123456789abcdef0'},
+              'decommission_keep_snapshot': snapshot, 'decommission_destroy_instance': destroy}
+    for name in ['Observe the exact instance before cloud cleanup',
+                 'Require an unambiguous provider observation',
+                 'Record whether cloud cleanup is still needed']:
+        assert all(env.compile_expression(c)(**values) for c in task(name)['when']) is expected

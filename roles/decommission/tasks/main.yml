@@ -32,7 +32,9 @@
   tags: [decommission]
 
 - name: "[decommission] Observe the exact instance before cloud cleanup"
-  when: old_server.instance_id | default('') | length > 0
+  when:
+    - old_server.instance_id | default('') | length > 0
+    - (decommission_keep_snapshot | bool) or (decommission_destroy_instance | bool)
   amazon.aws.ec2_instance_info:
     region: "{{ region | default(omit, true) }}"
     filters:
@@ -41,7 +43,9 @@
   tags: [decommission, snapshot, terminate]
 
 - name: "[decommission] Require an unambiguous provider observation"
-  when: old_server.instance_id | default('') | length > 0
+  when:
+    - old_server.instance_id | default('') | length > 0
+    - (decommission_keep_snapshot | bool) or (decommission_destroy_instance | bool)
   ansible.builtin.assert:
     that:
       - decommission_instances.instances | length <= 1
@@ -55,7 +59,9 @@
   tags: [decommission, snapshot, terminate]
 
 - name: "[decommission] Record whether cloud cleanup is still needed"
-  when: old_server.instance_id | default('') | length > 0
+  when:
+    - old_server.instance_id | default('') | length > 0
+    - (decommission_keep_snapshot | bool) or (decommission_destroy_instance | bool)
   ansible.builtin.set_fact:
     decommission_target_active: >-
       {{ decommission_instances.instances | length == 1 and
