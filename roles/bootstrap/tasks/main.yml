@@ -58,12 +58,6 @@
 - name: "[bootstrap] Install monitoring agent"
   when: bootstrap_install_monitoring | bool
   block:
-    - name: "[bootstrap] Prepare the monitoring repository on Red Hat"
-      ansible.builtin.include_tasks: monitoring_repository.yml
-      when:
-        - ansible_os_family == 'RedHat'
-        - bootstrap_monitoring_repository | length > 0
-
     - name: "[bootstrap] Ensure monitoring agent package is present"
       ansible.builtin.package:
         name: "telegraf"

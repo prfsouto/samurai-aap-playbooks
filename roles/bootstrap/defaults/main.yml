@@ -1,10 +1,6 @@
 ---
 bootstrap_hardening_profile: "{{ samurai_hardening_profile | default('cis_level_1') }}"
-bootstrap_install_monitoring: "{{ samurai_install_monitoring_agent | default(true) }}"
-bootstrap_install_security: "{{ samurai_install_security_agent | default(true) }}"
+bootstrap_install_monitoring: "{{ samurai_install_monitoring_agent | default(false) }}"
+bootstrap_install_security: "{{ samurai_install_security_agent | default(false) }}"
 bootstrap_max_retries: "{{ samurai_bootstrap_retries | default(20) }}"
 bootstrap_retry_delay: "{{ samurai_bootstrap_delay_seconds | default(6) }}"
-bootstrap_monitoring_repository:
-  baseurl: "https://repos.influxdata.com/stable/$basearch/main"
-  gpgkey: "https://repos.influxdata.com/influxdata-archive.key"
-  fingerprint: "24C975CBA61A024EE1B631787C3D57159FC2F927"
