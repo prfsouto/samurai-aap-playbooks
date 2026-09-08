@@ -228,7 +228,7 @@
           - --region
           - "{{ aws_replacement_region }}"
           - --query
-          - "Reservations[].Instances[].{InstanceId:InstanceId,State:State.Name,PrivateIp:PrivateIpAddress,PublicIp:PublicIpAddress,ImageId:ImageId,Type:InstanceType,Tags:Tags}"
+          - "Reservations[].Instances[].{InstanceId:InstanceId,State:State.Name,PrivateIp:PrivateIpAddress,PublicIp:PublicIpAddress,ImageId:ImageId,Type:InstanceType,Tags:Tags,Placement:Placement}"
           - --output
           - json
       register: aws_replacement_confirm

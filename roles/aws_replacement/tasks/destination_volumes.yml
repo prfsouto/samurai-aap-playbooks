@@ -67,7 +67,7 @@
       - --region
       - "{{ aws_replacement_region }}"
       - --availability-zone
-      - "{{ aws_replacement_describe_proof.Placement.AvailabilityZone | default(aws_replacement_availability_zone) }}"
+      - "{{ aws_replacement_describe_proof.Placement.AvailabilityZone }}"
       # A vaga congelada decide a geometria. O filesystem atravessa com a
       # geometria da origem; espaço excedente permanece sem crescimento implícito.
       - --size
