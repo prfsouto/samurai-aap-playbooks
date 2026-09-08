@@ -16,6 +16,11 @@
 # inerte e o ciclo segue igual ao que já rodava. Só um dos dois preenchido é
 # configuração incoerente, e aí falha — o silêncio ali esconderia um volume que
 # deveria ter sido copiado.
+- name: "[data_sync] Initialize the scalar copy execution identity"
+  ansible.builtin.set_fact:
+    data_sync_execution_id: "{{ samurai_execution_id | default('') }}"
+  tags: [data_sync]
+
 - name: "[data_sync] Decide whether there is anything to replicate"
   ansible.builtin.set_fact:
     data_sync_requested: >-
@@ -58,6 +63,7 @@
   tags: [data_sync]
 
 - name: "[data_sync] Publish the aggregate result of the stage"
+  register: campaign_data_sync_publication
   ansible.builtin.set_stats:
     data:
       data_sync_done: true

@@ -1,0 +1,81 @@
+---
+# ============================================================================
+# Role: cutover
+# Purpose: switch traffic from old → new server. Optional / gated.
+# Runs only when cutover.enabled == true AND validation_passed == true.
+# Idempotent — re-running on a host already in service is a no-op.
+# ============================================================================
+
+- name: "[cutover] Skip when disabled"
+  ansible.builtin.meta: end_play
+  when: not (cutover_enabled | bool)
+
+- name: "[cutover] Skip while commit barrier is pending"
+  ansible.builtin.meta: end_play
+  when:
+    - (action | default('') | lower) in ['rebuild', 'rebuild_replace']
+    - not (samurai_commit_barrier_passed | default(false) | bool)
+
+- name: "[cutover] Skip when validation didn't pass"
+  ansible.builtin.fail:
+    msg: "Refusing to cutover: validation_passed={{ validation_passed | default(false) }}"
+  when: not (validation_passed | default(false) | bool)
+
+- name: "[cutover] Display cutover plan"
+  ansible.builtin.debug:
+    msg:
+      strategy: "{{ cutover_strategy }}"
+      old_server: "{{ old_server.hostname | default('') }}"
+      old_ip: "{{ old_server.ip_address | default('') }}"
+      new_server: "{{ new_hostname | default('') }}"
+      new_ip: "{{ new_ip | default('') }}"
+      lb_target_group: "{{ cutover_lb_target_group }}"
+      dns: "{{ cutover_dns_record }}"
+  tags: [cutover]
+
+# ── Step 1. Register new instance in load balancer ───────────────────────────
+- name: "[cutover] Register new instance in target group"
+  when: cutover_lb_target_group | length > 0
+  community.aws.elb_target:
+    target_group_arn: "{{ cutover_lb_target_group }}"
+    target_id: "{{ instance_id }}"
+    state: present
+  tags: [cutover, lb]
+
+# ── Step 2. Drain old instance ──────────────────────────────────────────────
+- name: "[cutover] Drain old instance from target group"
+  when: cutover_lb_target_group | length > 0 and old_server.instance_id | default('') | length > 0
+  community.aws.elb_target:
+    target_group_arn: "{{ cutover_lb_target_group }}"
+    target_id: "{{ old_server.instance_id }}"
+    state: absent
+  tags: [cutover, lb]
+
+- name: "[cutover] Wait for connection drain"
+  ansible.builtin.pause:
+    seconds: "{{ cutover_drain_timeout | int }}"
+  when: cutover_lb_target_group | length > 0
+  tags: [cutover, drain]
+
+# ── Step 3. DNS update ──────────────────────────────────────────────────────
+- name: "[cutover] Update DNS record to point at new instance"
+  when: cutover_dns_zone | length > 0 and cutover_dns_record | length > 0
+  community.aws.route53:
+    state: present
+    zone: "{{ cutover_dns_zone }}"
+    record: "{{ cutover_dns_record }}"
+    type: A
+    ttl: 60
+    value: "{{ new_ip }}"
+    overwrite: true
+  tags: [cutover, dns]
+
+- name: "[cutover] Publish cutover completion"
+  ansible.builtin.set_stats:
+    data:
+      cutover_done: true
+      cutover_strategy_used: "{{ cutover_strategy }}"
+      cutover_completed_at: "{{ ansible_date_time.iso8601 | default('') }}"
+    aggregate: false
+    per_host: false
+  tags: [cutover]

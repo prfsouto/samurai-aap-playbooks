@@ -1,0 +1,35 @@
+---
+- name: "SamurAI :: observe candidate destination volumes before open seed"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: "Observe required destination volumes"
+      when: data_sync_destination_intents | default(data_sync_items | default([])) | length > 0
+      block:
+        - name: "Require destination bindings before observation"
+          ansible.builtin.assert:
+            that:
+              - data_sync_destination_bindings | default([]) | length > 0
+            quiet: true
+
+        - name: "Prepare the individual candidate for this job"
+          ansible.builtin.include_tasks: tasks/data_continuity_prepare_candidate.yml
+
+        - name: "Read candidate block devices without writing to them"
+          ansible.builtin.command:
+            argv: [lsblk, --json, --bytes, --paths, --output, 'NAME,SERIAL,SIZE,TYPE,FSTYPE,MOUNTPOINTS']
+          delegate_to: "{{ replacement.hostname }}"
+          become: false
+          changed_when: false
+          register: data_continuity_candidate_devices
+
+        - name: "Publish provider bindings with measured device identity"
+          ansible.builtin.set_stats:
+            data:
+              new_hostname: "{{ replacement.hostname }}"
+              new_ip: "{{ data_continuity_candidate_address }}"
+              data_sync_destination_bindings: >-
+                {{ data_sync_destination_bindings | samurai_observe_destinations(
+                   data_continuity_candidate_devices.stdout | from_json, replacement.instance_id) }}
+            per_host: false
+            aggregate: false

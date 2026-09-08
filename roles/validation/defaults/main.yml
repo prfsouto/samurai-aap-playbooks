@@ -1,0 +1,6 @@
+---
+validation_required_ports: "{{ samurai_validation_required_ports | default([22]) }}"
+validation_required_services: "{{ samurai_validation_required_services | default([]) }}"
+validation_min_disk_free_pct: "{{ samurai_validation_min_disk_free_pct | default(10) }}"
+validation_max_retries: "{{ samurai_validation_retries | default(12) }}"
+validation_retry_delay: "{{ samurai_validation_delay_seconds | default(5) }}"

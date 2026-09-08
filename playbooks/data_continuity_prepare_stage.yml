@@ -1,0 +1,20 @@
+---
+- name: "SamurAI :: prepare candidate access for a data continuity stage"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: "Prepare the observed AWS candidate for this stage"
+      when:
+        - samurai_campaign_server_execution_id | default(0) | int > 0
+        - data_sync_destination_intents | default(data_sync_items | default([])) | length > 0
+      block:
+        - name: "Require the candidate alias published by observation"
+          ansible.builtin.assert:
+            that:
+              - replacement is defined and replacement is mapping
+              - new_hostname is defined
+              - new_hostname == replacement.hostname
+            quiet: true
+
+        - name: "Bind and check access to the individual candidate"
+          ansible.builtin.include_tasks: tasks/data_continuity_prepare_candidate.yml

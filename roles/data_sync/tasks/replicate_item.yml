@@ -75,18 +75,24 @@
 
 - name: "[data_sync] Point the stage at this item"
   ansible.builtin.set_fact:
-    samurai_execution_id: "{{ data_sync_item.replication_execution_id }}"
+    data_sync_execution_id: "{{ data_sync_item.replication_execution_id }}"
     data_sync_source: "{{ data_sync_item.source | default('') }}"
     data_sync_source_snapshot: "{{ data_sync_item.source_snapshot | default('') }}"
     data_sync_destination: "{{ data_sync_destination_resolution.stdout.split()[0] | trim }}"
     data_sync_destination_serial: "{{ data_sync_destination_resolution.stdout.split()[1] | default('') }}"
     data_sync_destination_volume_id: "{{ data_sync_item_destination_volume }}"
     data_sync_cloud_volume_id: ""
+    data_sync_volume_check: {}
     data_sync_cloud_residue: []
     data_sync_cloud_residue_reason: ""
     data_sync_item_stage: "{{ data_sync_item.stage | default('seed') }}"
     data_sync_item_volume_id: "{{ data_sync_item.source_volume_stable_id }}"
   tags: [data_sync]
+
+- name: "[data_sync] Prepare the destination for final delta"
+  ansible.builtin.include_tasks: final_delta_destination.yml
+  when: data_sync_item_stage == 'final'
+  tags: [data_sync, guard]
 
 - name: "[data_sync] Replicate this volume"
   ansible.builtin.include_tasks: replicate.yml
@@ -96,17 +102,18 @@
 # laço perderia tudo que já concluiu se o executor morresse no meio — e a
 # reconciliação não saberia por onde retomar.
 - name: "[data_sync] Publish this volume's own result"
+  register: campaign_volume_publication
   ansible.builtin.set_stats:
     aggregate: true
     data:
       data_sync_destination_bindings:
-        - replication_execution_id: "{{ samurai_execution_id }}"
+        - replication_execution_id: "{{ data_sync_execution_id }}"
           source_volume_stable_id: "{{ data_sync_item_volume_id }}"
           destination_volume_stable_id: "{{ data_sync_destination_volume_id }}"
           device_path_observed: "{{ data_sync_destination }}"
           os_serial_observed: "{{ data_sync_destination_serial }}"
       data_sync_volume_results:
-        - replication_execution_id: "{{ samurai_execution_id }}"
+        - replication_execution_id: "{{ data_sync_execution_id }}"
           source_volume_stable_id: "{{ data_sync_item_volume_id }}"
           stage: "{{ data_sync_item_stage }}"
           succeeded: "{{ (data_sync_result is defined) and (data_sync_result.bytes_copied is defined) }}"
@@ -124,4 +131,12 @@
           destination_device_size: "{{ (data_sync_verify | default({})).destination_device_size | default(0) }}"
           destination_device: "{{ data_sync_destination }}"
           completed_at: "{{ ansible_date_time.iso8601 | default('') }}"
+  tags: [data_sync]
+
+- name: "[data_sync] Retain observed results for the current campaign member"
+  ansible.builtin.set_fact:
+    campaign_data_sync_volume_results: >-
+      {{ campaign_data_sync_volume_results | default([])
+         + campaign_volume_publication.ansible_stats.data.data_sync_volume_results }}
+  when: samurai_engine_callback_auth | default(false) | bool
   tags: [data_sync]

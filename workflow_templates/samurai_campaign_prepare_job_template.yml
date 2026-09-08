@@ -1,0 +1,22 @@
+---
+job_templates:
+  - name: samurai_campaign_prepare
+    description: Prepare isolated campaign candidates through verified final copy; commit remains governed by the Engine.
+    project: samurai_immutable
+    playbook: playbooks/campaign_prepare.yml
+    execution_environment: samurai_campaign_prepare
+    job_type: run
+    credentials:
+      - samurai_campaign_aws
+    ask_inventory_on_launch: true
+    ask_credential_on_launch: true
+    ask_job_slice_count_on_launch: true
+    ask_variables_on_launch: true
+    job_slice_count: 2
+    use_fact_cache: true
+    allow_simultaneous: true
+    survey_enabled: false
+    limit: ""
+    job_tags: ""
+    skip_tags: ""
+    extra_vars: {}

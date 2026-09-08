@@ -1,0 +1,7 @@
+---
+cutover_enabled: "{{ cutover.enabled | default(samurai_cutover_enabled) | default(false) }}"
+cutover_strategy: "{{ cutover.strategy | default(samurai_cutover_strategy) | default('manual') }}"
+cutover_drain_timeout: "{{ cutover.drain_timeout | default(samurai_cutover_drain_timeout) | default(120) }}"
+cutover_lb_target_group: "{{ cutover.lb_target_group | default('') }}"
+cutover_dns_zone: "{{ cutover.dns_zone | default('') }}"
+cutover_dns_record: "{{ cutover.dns_record | default('') }}"

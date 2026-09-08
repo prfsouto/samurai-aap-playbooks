@@ -1,0 +1,43 @@
+---
+- name: "Require the private credential file and actual Controller job identity"
+  ansible.builtin.assert:
+    that:
+      - lookup('ansible.builtin.env', 'SAMURAI_CAMPAIGN_CALLBACKS_FILE') | length > 0
+      - awx_job_id | default('') | string is match('^[1-9][0-9]*$')
+    fail_msg: "This campaign requires its private callback credentials and Controller job identity"
+    quiet: true
+  when: samurai_engine_callback_auth | default(false) | bool
+  tags: [data_continuity]
+
+- name: "Read the private campaign credentials"
+  ansible.builtin.set_fact:
+    data_continuity_private_callbacks: >-
+      {{ lookup('ansible.builtin.file', lookup('ansible.builtin.env', 'SAMURAI_CAMPAIGN_CALLBACKS_FILE')) | from_json }}
+  no_log: true
+  when: samurai_engine_callback_auth | default(false) | bool
+  tags: [data_continuity]
+
+- name: "Require the credential for this organization and attempt"
+  ansible.builtin.assert:
+    that:
+      - data_continuity_private_callbacks.organization_id | string == organization_id | string
+      - data_continuity_private_callbacks.executions[samurai_campaign_server_execution_id | string].attempt_id == samurai_execution_id
+      - data_continuity_private_callbacks.executions[samurai_campaign_server_execution_id | string].tokens[data_continuity_callback_operation] | length > 0
+    fail_msg: "Private callback credentials do not authorize this campaign attempt"
+    quiet: true
+  no_log: true
+  when: samurai_engine_callback_auth | default(false) | bool
+  tags: [data_continuity]
+
+- name: "Prepare private continuity request headers"
+  ansible.builtin.set_fact:
+    data_continuity_callback_headers: >-
+      {{ {'Authorization': 'Bearer ' +
+          (data_continuity_private_callbacks.executions[samurai_campaign_server_execution_id | string].tokens[data_continuity_callback_operation]
+           if samurai_engine_callback_auth | default(false) | bool
+           else samurai_engine_api_token | default('')),
+          'X-Organization-Id': organization_id | string}
+         | combine({'X-Samurai-Callback-Job-Id': awx_job_id | string}
+                   if samurai_engine_callback_auth | default(false) | bool else {}) }}
+  no_log: true
+  tags: [data_continuity]

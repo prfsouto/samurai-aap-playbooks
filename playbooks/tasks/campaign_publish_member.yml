@@ -1,0 +1,25 @@
+---
+- name: "Publish this member's observed preparation evidence"
+  ansible.builtin.set_stats:
+    per_host: false
+    aggregate: false
+    data:
+      "samurai_campaign_execution_{{ samurai_campaign_server_execution_id }}": >-
+        {{ campaign_member_observation | combine(
+             {'data_sync_residues': campaign_data_sync_residues,
+              'data_sync_used_cloud_source': campaign_data_sync_used_cloud_source}
+             if campaign_data_sync_residues is defined else {}) | combine(
+             {'data_sync_tracked_resources': campaign_data_sync_tracked_resources}
+             if campaign_data_sync_tracked_resources is defined else {}) }}
+  vars:
+    campaign_member_observation:
+        organization_id: "{{ organization_id }}"
+        campaign_server_execution_id: "{{ samurai_campaign_server_execution_id }}"
+        attempt_id: "{{ samurai_execution_id }}"
+        replacement: "{{ replacement | default({}) }}"
+        new_hostname: "{{ new_hostname }}"
+        new_ip: "{{ data_continuity_candidate_address | default('') }}"
+        data_sync_destination_bindings: "{{ data_sync_destination_bindings | default([]) }}"
+        data_sync_volume_results: "{{ campaign_data_sync_volume_results | default([]) }}"
+        validation_passed: "{{ validation_passed | default(false) }}"
+        preparation_completed: "{{ campaign_preparation_completed | default(false) }}"

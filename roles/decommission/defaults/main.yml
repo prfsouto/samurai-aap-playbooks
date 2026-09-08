@@ -1,0 +1,3 @@
+---
+decommission_destroy_instance: "{{ samurai_decommission_destroy_instance | default(true) }}"
+decommission_keep_snapshot: "{{ samurai_decommission_keep_volume_snapshot | default(true) }}"

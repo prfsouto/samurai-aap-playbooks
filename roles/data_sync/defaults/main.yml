@@ -1,4 +1,6 @@
 ---
+data_sync_execution_id: "{{ samurai_execution_id | default('') }}"
+
 # Origem: snapshot do volume antigo, ou export NBD. Nunca o host antigo em si — I1 exige
 # que o servidor que está sendo substituído não seja tocado.
 data_sync_source: ""

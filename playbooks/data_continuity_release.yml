@@ -1,0 +1,64 @@
+---
+# Devolve a escrita à origem. Roda depois da virada e também quando a rotação
+# falha entre o delta e o cutover — origem congelada por falha nossa é o pior
+# desfecho da cadeia.
+- name: "SamurAI :: data_continuity :: devolve a escrita à origem"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: "Prepare authentication for the release request"
+      ansible.builtin.include_tasks: tasks/data_continuity_callback_auth.yml
+      vars:
+        data_continuity_callback_operation: release-quiesce
+      when: samurai_campaign_server_execution_id | default('') | string | length > 0
+      tags: [data_continuity]
+
+    - name: "[release] Nada a liberar quando o rebuild não tem volume de dados"
+      ansible.builtin.set_stats:
+        data:
+          data_continuity_release_skipped: true
+      when: samurai_campaign_server_execution_id | default('') | string | length == 0
+      tags: [data_continuity]
+
+    - name: "[release] Pede ao control plane que libere a concessão"
+      ansible.builtin.uri:
+        url: >-
+          {{ samurai_engine_base_url | trim | regex_replace('/$', '') }}/campaign-executions/{{
+          samurai_campaign_server_execution_id }}/data-continuity/release-quiesce
+        method: POST
+        headers: "{{ data_continuity_callback_headers }}"
+        body_format: json
+        body: {}
+        status_code: [200]
+        timeout: 300
+      register: data_continuity_release
+      no_log: true
+      when: samurai_campaign_server_execution_id | default('') | string | length > 0
+      tags: [data_continuity]
+
+    # Liberação não confirmada é o caso que precisa de gente: a origem pode ter
+    # ficado congelada, e o prazo venceria calado se ninguém falhasse aqui.
+    - name: "[release] Liberação sem confirmação pede intervenção"
+      ansible.builtin.assert:
+        that:
+          - (data_continuity_release.json | default({})).released | default(false) | bool
+        fail_msg: >-
+          the control plane could not confirm writes resumed on the source:
+          {{ (data_continuity_release.json | default({})).reason
+             | default((data_continuity_release.json | default({})).detail)
+             | default('no reason given') }}
+        quiet: true
+      when:
+        - samurai_campaign_server_execution_id | default('') | string | length > 0
+        - not (data_continuity_release.skipped | default(false))
+      tags: [data_continuity, guard]
+
+    - name: "[release] Publica o desfecho da concessão"
+      ansible.builtin.set_stats:
+        data:
+          data_continuity_release_done: true
+          data_continuity_release_detail: "{{ (data_continuity_release.json).detail }}"
+      when:
+        - samurai_campaign_server_execution_id | default('') | string | length > 0
+        - not (data_continuity_release.skipped | default(false))
+      tags: [data_continuity]

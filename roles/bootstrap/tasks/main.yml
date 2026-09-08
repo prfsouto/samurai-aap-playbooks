@@ -1,0 +1,99 @@
+---
+# ============================================================================
+# Role: bootstrap
+# Purpose: prepare a freshly provisioned host (hostname, hardening, agents,
+# inventory registration). Idempotent — safe to re-run.
+# ============================================================================
+
+- name: "[bootstrap] Wait for SSH on new instance"
+  ansible.builtin.wait_for:
+    host: "{{ new_ip }}"
+    port: 22
+    timeout: "{{ samurai_ssh_wait_timeout | default(300) }}"
+    state: started
+  delegate_to: localhost
+  when: new_ip | default('') | length > 0
+  tags: [bootstrap]
+
+# Depois do wait de SSH, e não antes: o guard roda `blkid` e `mount` no host remoto com
+# elevação, então precisa da conexão já estabelecida. Antes do wait, ele falharia por
+# indisponibilidade e esvaziaria justamente a espera que o estágio faz de propósito.
+# UM guard POR VOLUME. O laço do estágio sobrescreve `data_sync_destination` a
+# cada item, então rodar o guard uma vez só examinaria o último — num servidor com
+# /data, /oracle e /logs, dois filesystems ficariam sem prova depois da réplica.
+- name: "[bootstrap] Handle each volume replicated by data_sync"
+  ansible.builtin.include_tasks: data_volume_guard.yml
+  loop: "{{ data_sync_items | default([]) }}"
+  loop_control:
+    loop_var: data_sync_guard_item
+    label: "{{ data_sync_guard_item.source_volume_stable_id | default('?') }}"
+  when:
+    - data_sync_done | default(false) | bool
+    - data_sync_items | default([]) | length > 0
+  tags: [bootstrap, data_sync]
+
+# Caminho de volume único, preservado para o rebuild que não passa por itens.
+- name: "[bootstrap] Handle a single volume replicated by data_sync"
+  ansible.builtin.include_tasks: data_volume_guard.yml
+  when:
+    - data_sync_done | default(false) | bool
+    - data_sync_items | default([]) | length == 0
+    - data_sync_destination | default('') | length > 0
+  tags: [bootstrap, data_sync]
+
+- name: "[bootstrap] Configure hostname (idempotent)"
+  ansible.builtin.hostname:
+    name: "{{ new_hostname }}"
+  become: true
+  when: ansible_hostname is defined and ansible_hostname != new_hostname
+  tags: [bootstrap, hostname]
+
+- name: "[bootstrap] Apply CIS hardening profile"
+  ansible.builtin.debug:
+    msg: "Hardening profile '{{ bootstrap_hardening_profile }}' would be applied here (delegate to dedicated hardening role/collection)."
+  tags: [bootstrap, hardening]
+  # Production: replace with `ansible.builtin.import_role: name: cis_hardening`
+  # using the appropriate certified collection.
+
+- name: "[bootstrap] Install monitoring agent"
+  when: bootstrap_install_monitoring | bool
+  block:
+    - name: "[bootstrap] Ensure monitoring agent package is present"
+      ansible.builtin.package:
+        name: "telegraf"
+        state: present
+      become: true
+      register: mon_install
+      retries: "{{ bootstrap_max_retries }}"
+      delay: "{{ bootstrap_retry_delay }}"
+      until: mon_install is succeeded
+  tags: [bootstrap, monitoring]
+
+- name: "[bootstrap] Install security agent"
+  when: bootstrap_install_security | bool
+  ansible.builtin.debug:
+    msg: "Security agent install (e.g. Falco/Wazuh) — delegate to dedicated role."
+  tags: [bootstrap, security]
+
+- name: "[bootstrap] Register host in AAP/Tower inventory"
+  when: not (samurai_engine_callback_auth | default(false) | bool)
+  awx.awx.host:
+    name: "{{ new_hostname }}"
+    inventory: "{{ aap_inventory_name | default('samurai_managed') }}"
+    state: present
+    variables:
+      ansible_host: "{{ new_ip }}"
+      samurai_execution_id: "{{ samurai_execution_id | default('') }}"
+      provisioned_at: "{{ ansible_date_time.iso8601 | default('') }}"
+  delegate_to: localhost
+  failed_when: false   # AAP collection may not be present in all envs
+  tags: [bootstrap, inventory]
+
+- name: "[bootstrap] Publish bootstrap completion to set_stats"
+  ansible.builtin.set_stats:
+    data:
+      bootstrap_done: true
+      bootstrapped_at: "{{ ansible_date_time.iso8601 | default('') }}"
+    aggregate: false
+    per_host: false
+  tags: [bootstrap]

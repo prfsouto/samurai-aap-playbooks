@@ -1,0 +1,37 @@
+---
+- name: "[data_sync] Require the governed candidate for final delta"
+  ansible.builtin.assert:
+    that:
+      - samurai_campaign_server_execution_id | default(0) | int > 0
+      - inventory_hostname == new_hostname
+      - new_hostname != old_hostname
+      - data_sync_destination_volume_id != data_sync_item_volume_id
+    quiet: true
+
+- name: "[data_sync] Read current destination mounts before final delta"
+  ansible.builtin.command:
+    argv: [lsblk, --json, --bytes, --paths, --output, 'NAME,SERIAL,SIZE,TYPE,FSTYPE,MOUNTPOINTS']
+  become: "{{ data_sync_become | bool }}"
+  changed_when: false
+  register: data_sync_final_devices
+
+- name: "[data_sync] Verify the planned destination mount"
+  ansible.builtin.set_fact:
+    data_sync_final_unmount_required: >-
+      {{ data_sync_destination_volume_id | samurai_destination_needs_unmount(
+         data_sync_final_devices.stdout | from_json, data_sync_item.mount_point | default('')) }}
+    data_sync_final_device: >-
+      {{ data_sync_destination_volume_id | samurai_destination_device(
+         data_sync_final_devices.stdout | from_json) }}
+
+- name: "[data_sync] Refuse a device that changed during stage preparation"
+  ansible.builtin.assert:
+    that:
+      - data_sync_final_device == data_sync_destination
+    quiet: true
+
+- name: "[data_sync] Unmount only the candidate data device without force"
+  ansible.builtin.command:
+    argv: [umount, '--', "{{ data_sync_final_device }}"]
+  become: "{{ data_sync_become | bool }}"
+  when: data_sync_final_unmount_required | bool

@@ -1,0 +1,72 @@
+---
+# ============================================================================
+# Role: decommission
+# Purpose: retire the OLD server after a successful cutover.
+# Pre-conditions:
+#   - validation_passed == true
+#   - cutover_done == true (or cutover disabled but old_server explicitly retired)
+# Idempotent: repeated runs on an already-destroyed instance no-op.
+# ============================================================================
+
+- name: "[decommission] Skip while commit barrier is pending"
+  ansible.builtin.meta: end_play
+  when:
+    - (action | default('') | lower) in ['rebuild', 'rebuild_replace']
+    - not (samurai_commit_barrier_passed | default(false) | bool)
+
+- name: "[decommission] Skip when validation didn't pass"
+  ansible.builtin.meta: end_play
+  when: not (validation_passed | default(false) | bool)
+
+- name: "[decommission] Skip when no old server provided"
+  ansible.builtin.meta: end_play
+  when: old_server.hostname | default('') | length == 0
+
+- name: "[decommission] Display decommission plan"
+  ansible.builtin.debug:
+    msg:
+      old_hostname: "{{ old_server.hostname }}"
+      old_instance_id: "{{ old_server.instance_id | default('') }}"
+      destroy: "{{ decommission_destroy_instance }}"
+      keep_snapshot: "{{ decommission_keep_snapshot }}"
+  tags: [decommission]
+
+- name: "[decommission] Snapshot root volume before destroy"
+  when:
+    - decommission_keep_snapshot | bool
+    - old_server.instance_id | default('') | length > 0
+  amazon.aws.ec2_snapshot:
+    instance_id: "{{ old_server.instance_id }}"
+    description: "samurai-decommission {{ samurai_execution_id | default('') }}"
+    snapshot_tags:
+      managed_by: "samurai-shield"
+      samurai_execution_id: "{{ samurai_execution_id | default('') }}"
+  tags: [decommission, snapshot]
+
+- name: "[decommission] Stop and terminate old instance"
+  when:
+    - decommission_destroy_instance | bool
+    - old_server.instance_id | default('') | length > 0
+  amazon.aws.ec2_instance:
+    instance_ids:
+      - "{{ old_server.instance_id }}"
+    state: terminated
+    wait: true
+  tags: [decommission, terminate]
+
+- name: "[decommission] Remove old host from AAP inventory"
+  awx.awx.host:
+    name: "{{ old_server.hostname }}"
+    inventory: "{{ aap_inventory_name | default('samurai_managed') }}"
+    state: absent
+  delegate_to: localhost
+  tags: [decommission, inventory]
+
+- name: "[decommission] Publish decommission completion"
+  ansible.builtin.set_stats:
+    data:
+      decommission_done: true
+      decommissioned_at: "{{ ansible_date_time.iso8601 | default('') }}"
+    aggregate: false
+    per_host: false
+  tags: [decommission]

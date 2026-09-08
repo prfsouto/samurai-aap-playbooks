@@ -1,0 +1,8 @@
+---
+# Single-stage playbook used by the AAP workflow node "decommission".
+- name: "SamurAI :: decommission old server"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - ansible.builtin.import_role:
+        name: decommission

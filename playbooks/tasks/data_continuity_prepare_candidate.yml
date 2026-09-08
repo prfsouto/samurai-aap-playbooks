@@ -1,0 +1,41 @@
+---
+- name: "Require the frozen candidate identity"
+  ansible.builtin.assert:
+    that:
+      - replacement is defined and replacement is mapping
+      - replacement.organization_id | string == organization_id | string
+      - replacement.instance_id | default('') | length > 0
+      - replacement.source_instance_id == samurai_source_instance_id
+      - replacement.instance_id != samurai_source_instance_id
+      - replacement.hostname is string
+      - replacement.hostname | length > 0
+      - replacement.hostname == hostname
+      - replacement.hostname == (new_hostname | default(replacement.hostname))
+      - replacement.hostname | regex_search('[:,;&!*?\[\]~()@\s]') is none
+      - replacement.hostname | lower not in ['localhost', '127.0.0.1', '::1', 'all', 'ungrouped']
+      - replacement.hostname not in groups
+      - replacement.hostname != old_hostname
+      - aws_replacement.ssh_username | default('') | length > 0
+    quiet: true
+
+- name: "Select the candidate address and reject source or local addresses"
+  ansible.builtin.set_fact:
+    data_continuity_candidate_address: >-
+      {{ replacement.public_ip | default(replacement.private_ip | default(''), true)
+         | samurai_candidate_address([old_ip_address | default(''),
+           replacement.source_state_before.PrivateIp | default('')]) }}
+
+- name: "Add only the candidate to this job inventory"
+  ansible.builtin.add_host:
+    name: "{{ replacement.hostname }}"
+    ansible_host: "{{ data_continuity_candidate_address }}"
+    ansible_user: "{{ aws_replacement.ssh_username }}"
+    ansible_connection: ssh
+    ansible_ssh_private_key_file: "{{ data_continuity_candidate_key_file | default(omit, true) }}"
+
+- name: "Wait for candidate access"
+  ansible.builtin.wait_for_connection:
+    connect_timeout: 10
+    sleep: 5
+    timeout: 600
+  delegate_to: "{{ replacement.hostname }}"

@@ -1,0 +1,26 @@
+---
+- name: "Require exactly one reserved candidate in this slice"
+  ansible.builtin.assert:
+    that:
+      - ansible_play_hosts_all | length == 1
+      - samurai_campaign_member is defined and samurai_campaign_member is mapping
+      - inventory_hostname == samurai_campaign_member.hostname
+      - inventory_hostname != samurai_campaign_member.old_hostname
+      - inventory_hostname | regex_search('^[A-Za-z0-9][A-Za-z0-9._-]*$') is not none
+      - inventory_hostname | lower not in ['localhost', '127.0.0.1', 'all', 'ungrouped']
+      - samurai_campaign_member.organization_id | string == organization_id | string
+      - samurai_campaign_member.samurai_campaign_server_execution_id | int > 0
+      - samurai_campaign_attempts[samurai_campaign_member.samurai_campaign_server_execution_id | string] == samurai_campaign_member.samurai_execution_id
+      - samurai_campaign_member.samurai_commit_barrier_passed is sameas false
+      - samurai_commit_barrier_passed is sameas false
+      - samurai_engine_callback_auth is sameas true
+    fail_msg: "This slice must contain exactly its reserved candidate and current campaign attempt"
+    quiet: true
+
+- name: "Load the frozen public inputs of this candidate"
+  ansible.builtin.set_fact:
+  args: "{{ samurai_campaign_member }}"
+
+- name: "Keep the reserved candidate as the execution target"
+  ansible.builtin.set_fact:
+    new_hostname: "{{ inventory_hostname }}"

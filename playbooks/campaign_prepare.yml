@@ -1,0 +1,120 @@
+---
+- name: "Prepare one real candidate per Controller slice"
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: "Validate and load the reserved campaign member"
+      ansible.builtin.include_tasks: tasks/campaign_member_entry.yml
+
+    - name: "Prepare the candidate and its data"
+      block:
+        - name: "Prepare private candidate access"
+          ansible.builtin.include_tasks:
+            file: tasks/campaign_candidate_key.yml
+            apply:
+              delegate_to: localhost
+
+        - name: "Provision the candidate while preserving the source"
+          ansible.builtin.include_role:
+            name: aws_replacement
+            apply:
+              delegate_to: localhost
+
+        - name: "Retain the observed provider envelope"
+          ansible.builtin.set_fact:
+            replacement: "{{ campaign_provision_publication.ansible_stats.data.replacement }}"
+            data_sync_destination_bindings: "{{ aws_replacement_destination_bindings | default([]) }}"
+            campaign_data_sync_volume_results: []
+
+        - name: "Connect only to this candidate"
+          ansible.builtin.include_tasks:
+            file: tasks/data_continuity_prepare_candidate.yml
+            apply:
+              delegate_to: localhost
+
+        - name: "Refuse data operations without the individual candidate SSH connection"
+          ansible.builtin.assert:
+            that:
+              - ansible_connection == 'ssh'
+              - inventory_hostname == replacement.hostname
+              - inventory_hostname not in groups
+              - ansible_host == data_continuity_candidate_address
+              - replacement.instance_id != samurai_source_instance_id
+            quiet: true
+
+        - name: "Retain the observed candidate address"
+          ansible.builtin.set_fact:
+            new_ip: "{{ data_continuity_candidate_address }}"
+
+        - name: "Collect candidate facts through SSH"
+          ansible.builtin.setup:
+
+        - name: "Observe the candidate devices before copying"
+          ansible.builtin.command:
+            argv: [lsblk, --json, --bytes, --paths, --output, 'NAME,SERIAL,SIZE,TYPE,FSTYPE,MOUNTPOINTS']
+          changed_when: false
+          register: campaign_devices
+
+        - name: "Bind provider identities to observed devices"
+          ansible.builtin.set_fact:
+            data_sync_destination_bindings: >-
+              {{ data_sync_destination_bindings | samurai_observe_destinations(campaign_devices.stdout | from_json, replacement.instance_id) }}
+
+        - name: "Publish provisioning and destination observations"
+          ansible.builtin.include_tasks: tasks/campaign_publish_member.yml
+
+        - name: "Open and perform seed"
+          when: data_sync_destination_intents | default([]) | length > 0
+          block:
+            - ansible.builtin.include_tasks:
+                file: tasks/campaign_copy_stage.yml
+                apply:
+                  delegate_to: localhost
+              vars:
+                campaign_copy_operation: open-seed
+            - ansible.builtin.include_role:
+                name: data_sync
+            - ansible.builtin.set_fact:
+                data_sync_done: "{{ campaign_data_sync_publication.ansible_stats.data.data_sync_done }}"
+
+        - name: "Bootstrap the candidate without formatting replicated volumes"
+          ansible.builtin.include_role:
+            name: bootstrap
+
+        - name: "Validate the candidate"
+          ansible.builtin.include_role:
+            name: validation
+
+        - name: "Publish seed and candidate validation observations"
+          ansible.builtin.include_tasks: tasks/campaign_publish_member.yml
+
+        - name: "Open and perform final delta"
+          when: data_sync_destination_intents | default([]) | length > 0
+          block:
+            - ansible.builtin.include_tasks:
+                file: tasks/campaign_copy_stage.yml
+                apply:
+                  delegate_to: localhost
+              vars:
+                campaign_copy_operation: open-final-delta
+            - ansible.builtin.include_role:
+                name: data_sync
+            - name: "Mount each replicated filesystem after final copy"
+              ansible.builtin.include_role:
+                name: bootstrap
+                tasks_from: data_volume_guard
+              loop: "{{ data_sync_items }}"
+              loop_control:
+                loop_var: data_sync_guard_item
+
+        - name: "Record preparation completion without authorizing cutover"
+          ansible.builtin.set_fact:
+            campaign_preparation_completed: true
+      always:
+        - name: "Remove private candidate access from the execution container"
+          ansible.builtin.include_tasks:
+            file: tasks/campaign_candidate_key_cleanup.yml
+            apply:
+              delegate_to: localhost
+        - name: "Publish the preparation outcome for this member"
+          ansible.builtin.include_tasks: tasks/campaign_publish_member.yml
