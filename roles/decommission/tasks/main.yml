@@ -31,6 +31,20 @@
       keep_snapshot: "{{ decommission_keep_snapshot }}"
   tags: [decommission]
 
+- name: "[decommission] Require the governed cloud region"
+  when:
+    - samurai_campaign_id is defined
+    - old_server.instance_id | default('') | length > 0
+    - (decommission_keep_snapshot | bool) or (decommission_destroy_instance | bool)
+  ansible.builtin.assert:
+    that:
+      - region is defined
+      - region is string
+      - region | trim | length > 0
+    fail_msg: "A governed campaign cleanup requires its explicit cloud region."
+    quiet: true
+  tags: [decommission, snapshot, terminate]
+
 - name: "[decommission] Observe the exact instance before cloud cleanup"
   when:
     - old_server.instance_id | default('') | length > 0
