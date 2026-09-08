@@ -56,6 +56,22 @@
   when: data_sync_require_managed_tag | bool
   tags: [data_sync, cloud, guard]
 
+- name: "[data_sync] Wait for the governed snapshot to complete"
+  amazon.aws.ec2_snapshot_info:
+    snapshot_ids: ["{{ data_sync_source_snapshot }}"]
+    region: "{{ data_sync_cloud_region }}"
+  delegate_to: localhost
+  register: data_sync_snapshot_ready
+  until: >-
+    data_sync_snapshot_ready.snapshots | default([], true) | length != 1 or
+    data_sync_snapshot_ready.snapshots[0].state | default('') != 'pending'
+  failed_when: >-
+    data_sync_snapshot_ready.snapshots | default([], true) | length != 1 or
+    data_sync_snapshot_ready.snapshots[0].state | default('') not in ['pending', 'completed']
+  retries: 40
+  delay: 15
+  tags: [data_sync, cloud, guard]
+
 - name: "[data_sync] Require the platform KMS key for the ephemeral volume"
   ansible.builtin.assert:
     that:

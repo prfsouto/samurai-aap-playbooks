@@ -67,7 +67,7 @@
       - --region
       - "{{ aws_replacement_region }}"
       - --availability-zone
-      - "{{ aws_replacement_describe_proof.Placement.AvailabilityZone | default(aws_replacement_availability_zone) }}"
+      - "{{ aws_replacement_describe_proof.Placement.AvailabilityZone }}"
       # A vaga congelada decide a geometria. O filesystem atravessa com a
       # geometria da origem; espaço excedente permanece sem crescimento implícito.
       - --size
@@ -118,6 +118,21 @@
       truncates customer data; an unencrypted one leaves a copy of it at rest.
     quiet: true
   tags: [aws_replacement, data_sync, guard]
+
+- name: "[aws_replacement] Wait for the destination to be available before attaching"
+  when: (aws_replacement_destination.Attachments | default([]) | length) == 0
+  ansible.builtin.command:
+    argv:
+      - "{{ aws_replacement_aws_cli_binary }}"
+      - ec2
+      - wait
+      - volume-available
+      - --region
+      - "{{ aws_replacement_region }}"
+      - --volume-ids
+      - "{{ aws_replacement_destination.VolumeId }}"
+  changed_when: false
+  tags: [aws_replacement, data_sync]
 
 - name: "[aws_replacement] Attach the destination to the candidate"
   when: (aws_replacement_destination.Attachments | default([]) | length) == 0
