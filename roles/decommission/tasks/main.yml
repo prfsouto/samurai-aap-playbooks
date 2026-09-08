@@ -31,23 +31,83 @@
       keep_snapshot: "{{ decommission_keep_snapshot }}"
   tags: [decommission]
 
-- name: "[decommission] Snapshot root volume before destroy"
+- name: "[decommission] Observe the exact instance before cloud cleanup"
   when:
-    - decommission_keep_snapshot | bool
     - old_server.instance_id | default('') | length > 0
-  amazon.aws.ec2_snapshot:
-    instance_id: "{{ old_server.instance_id }}"
-    description: "samurai-decommission {{ samurai_execution_id | default('') }}"
-    snapshot_tags:
-      managed_by: "samurai-shield"
-      samurai_execution_id: "{{ samurai_execution_id | default('') }}"
+    - (decommission_keep_snapshot | bool) or (decommission_destroy_instance | bool)
+  amazon.aws.ec2_instance_info:
+    region: "{{ region | default(omit, true) }}"
+    filters:
+      instance-id: "{{ old_server.instance_id }}"
+  register: decommission_instances
+  tags: [decommission, snapshot, terminate]
+
+- name: "[decommission] Require an unambiguous provider observation"
+  when:
+    - old_server.instance_id | default('') | length > 0
+    - (decommission_keep_snapshot | bool) or (decommission_destroy_instance | bool)
+  ansible.builtin.assert:
+    that:
+      - decommission_instances.instances | length <= 1
+      - >-
+        decommission_instances.instances | length == 0 or
+        (decommission_instances.instances[0].instance_id == old_server.instance_id and
+         decommission_instances.instances[0].state.name in
+         ['pending', 'running', 'stopping', 'stopped', 'shutting-down', 'terminated'])
+    fail_msg: "The observed instance does not match the cleanup target."
+    quiet: true
+  tags: [decommission, snapshot, terminate]
+
+- name: "[decommission] Record whether cloud cleanup is still needed"
+  when:
+    - old_server.instance_id | default('') | length > 0
+    - (decommission_keep_snapshot | bool) or (decommission_destroy_instance | bool)
+  ansible.builtin.set_fact:
+    decommission_target_active: >-
+      {{ decommission_instances.instances | length == 1 and
+         decommission_instances.instances[0].state.name != 'terminated' }}
+  tags: [decommission, snapshot, terminate]
+
+- name: "[decommission] Preserve the observed root volume before destroy"
+  when:
+    - old_server.instance_id | default('') | length > 0
+    - decommission_target_active | default(false) | bool
+    - decommission_keep_snapshot | bool
+  block:
+    - name: "[decommission] Resolve the root volume stable ID"
+      ansible.builtin.set_fact:
+        decommission_root_volume_ids: >-
+          {{ decommission_instances.instances[0].block_device_mappings
+             | selectattr('device_name', 'equalto', decommission_instances.instances[0].root_device_name)
+             | map(attribute='ebs.volume_id') | list }}
+
+    - name: "[decommission] Require exactly one EBS root volume"
+      ansible.builtin.assert:
+        that:
+          - decommission_root_volume_ids | length == 1
+          - decommission_root_volume_ids[0] is string
+          - decommission_root_volume_ids[0].startswith('vol-')
+        fail_msg: "A unique EBS root volume is required before destroying this instance."
+        quiet: true
+
+    - name: "[decommission] Snapshot root volume before destroy"
+      amazon.aws.ec2_snapshot:
+        region: "{{ region | default(omit, true) }}"
+        volume_id: "{{ decommission_root_volume_ids[0] }}"
+        wait: true
+        description: "samurai-decommission {{ samurai_execution_id | default('') }}"
+        snapshot_tags:
+          managed_by: "samurai-shield"
+          samurai_execution_id: "{{ samurai_execution_id | default('') }}"
   tags: [decommission, snapshot]
 
 - name: "[decommission] Stop and terminate old instance"
   when:
     - decommission_destroy_instance | bool
     - old_server.instance_id | default('') | length > 0
+    - decommission_target_active | default(false) | bool
   amazon.aws.ec2_instance:
+    region: "{{ region | default(omit, true) }}"
     instance_ids:
       - "{{ old_server.instance_id }}"
     state: terminated
