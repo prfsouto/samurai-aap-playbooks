@@ -1,0 +1,24 @@
+---
+- name: Prepare governed abort authentication
+  ansible.builtin.include_tasks: data_continuity_callback_auth.yml
+  vars:
+    data_continuity_callback_operation: release-quiesce
+
+- name: Restore source writes after the observed preparation failure
+  ansible.builtin.uri:
+    url: "{{ samurai_engine_base_url | regex_replace('/$', '') }}/campaign-executions/{{ samurai_campaign_server_execution_id }}/data-continuity/release-quiesce"
+    method: POST
+    headers: "{{ data_continuity_callback_headers }}"
+    body_format: json
+    body: {}
+    status_code: [200]
+    timeout: 300
+  register: campaign_abort_release
+  no_log: true
+
+- name: Require measured source recovery
+  ansible.builtin.assert:
+    that:
+      - campaign_abort_release.json.released | default(false) | bool
+    fail_msg: Source recovery was not confirmed; operator intervention is required
+    quiet: true

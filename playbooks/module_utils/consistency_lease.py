@@ -1,0 +1,230 @@
+"""RHEL filesystem fencing with a durable, generation-scoped host journal."""
+import errno
+import fcntl
+import json
+import os
+import stat
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+class FenceRejected(RuntimeError):
+    pass
+
+
+class FilesystemFence:
+    def __init__(self, *, store, filesystem, boot_id):
+        self.store = store
+        self.filesystem = filesystem
+        self.boot_id = boot_id
+
+    def execute(self, command):
+        scope = command['scope']
+        action = scope['action']
+        mounts = command['parameters']['volumes']
+        self.filesystem.validate(mounts)
+        if action == 'inspect_candidate':
+            if not all(self.filesystem.is_readonly(v['mount_point']) for v in mounts):
+                raise FenceRejected('Candidate data filesystem is writable before commit')
+            return dict(scope=scope, boot_id=self.boot_id, state='CANDIDATE_READ_ONLY', frozen=[],
+                        acquired_at=datetime.now(timezone.utc).isoformat())
+        record = self.store.read()
+        if record and record['scope']['plan_digest'] == scope['plan_digest'] and record.get('volumes') != mounts:
+            raise FenceRejected('Source fence volume manifest changed')
+        if record and record['scope']['organization_id'] != scope['organization_id']:
+            raise FenceRejected('Foreign organization owns the source fence')
+        if record and record['scope']['generation'] > scope['generation']:
+            raise FenceRejected('Stale fence generation')
+        if record and record['scope']['plan_digest'] != scope['plan_digest']:
+            if record['state'] not in ('RELEASED', 'CANDIDATE_WRITABLE'):
+                raise FenceRejected('Another plan owns an unreleased source fence')
+        if action == 'activate_candidate':
+            if record and record['state'] not in ('CANDIDATE_WRITABLE', 'ACTIVATING'):
+                raise FenceRejected('Candidate activation cannot release a source fence')
+            record = dict(scope=scope, boot_id=self.boot_id, state='ACTIVATING', frozen=[],
+                          volumes=mounts, acquired_at=datetime.now(timezone.utc).isoformat())
+            self.store.write(record)
+            for volume in mounts:
+                self.filesystem.make_writable(volume['mount_point'])
+                self.filesystem.confirm_writable(volume['mount_point'])
+            record['state'] = 'CANDIDATE_WRITABLE'
+            self.store.write(record)
+            return self.evidence(record)
+        if action == 'acquire':
+            return self.acquire(command, record, mounts)
+        if not record or record['scope']['generation'] != scope['generation']:
+            raise FenceRejected('No matching fence generation')
+        if record['scope']['plan_digest'] != scope['plan_digest']:
+            raise FenceRejected('Source fence plan mismatch')
+        if record['boot_id'] != self.boot_id:
+            raise FenceRejected('Host reboot invalidated the observed fence')
+        if action == 'release_abort':
+            if record['state'] == 'TRANSFERRED':
+                raise FenceRejected('Committed source must not resume writing')
+            return self.release(record, mounts)
+        if action not in ('inspect', 'transfer') or record['state'] not in ('HELD', 'TRANSFERRED'):
+            raise FenceRejected('Source fence is not held')
+        for volume in mounts:
+            if self.filesystem.freeze(volume['mount_point']):
+                record['state'] = 'UNCERTAIN'
+                self.store.write(record)
+                raise FenceRejected('Source fence was lost; refusing continuity proof')
+        if action == 'transfer':
+            record['state'] = 'TRANSFERRED'
+            self.store.write(record)
+        return self.evidence(record)
+
+    def acquire(self, command, record, mounts):
+        if record and record['state'] in ('HELD', 'TRANSFERRED'):
+            inspection = dict(command, scope=dict(command['scope'], action='inspect'))
+            return self.execute(inspection)
+        if record and record['state'] not in ('RELEASED', 'CANDIDATE_WRITABLE'):
+            raise FenceRejected('Uncertain acquisition requires explicit recovery')
+        record = dict(scope=command['scope'], boot_id=self.boot_id, state='ACQUIRING', frozen=[], volumes=mounts,
+                      acquired_at=datetime.now(timezone.utc).isoformat())
+        self.store.write(record)
+        try:
+            for volume in mounts:
+                mount = volume['mount_point']
+                if not self.filesystem.freeze(mount):
+                    raise FenceRejected('Filesystem already frozen without confirmed ownership')
+                record['frozen'].append(mount)
+                self.store.write(record)
+        except Exception:
+            record['state'] = 'UNCERTAIN'
+            self.store.write(record)
+            for mount in record['frozen']:
+                self.filesystem.thaw(mount)
+                self.filesystem.confirm_writable(mount)
+            raise
+        record['state'] = 'HELD'
+        self.store.write(record)
+        return self.evidence(record)
+
+    def release(self, record, mounts):
+        if record['state'] == 'RELEASED':
+            return self.evidence(record)
+        if record['state'] not in ('HELD', 'RELEASING'):
+            raise FenceRejected('Uncertain acquisition cannot be thawed automatically')
+        record['state'] = 'RELEASING'
+        self.store.write(record)
+        for mount in record['frozen']:
+            self.filesystem.thaw(mount)
+        for volume in mounts:
+            self.filesystem.confirm_writable(volume['mount_point'])
+        record['state'] = 'RELEASED'
+        self.store.write(record)
+        return self.evidence(record)
+
+    @staticmethod
+    def evidence(record):
+        return {key: record[key] for key in ('scope', 'boot_id', 'state', 'frozen', 'acquired_at')}
+
+
+class Journal:
+    def __init__(self, directory='/.samurai-consistency'):
+        self.directory = Path(directory)
+        self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        info = self.directory.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077
+                or info.st_dev != os.stat('/').st_dev):
+            raise FenceRejected('Unsafe fence journal directory')
+        self.path = self.directory / 'source.json'
+
+    def lock(self):
+        fd = os.open(self.directory / 'lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return fd
+
+    def read(self):
+        try:
+            fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return None
+        with os.fdopen(fd) as stream:
+            return json.load(stream)
+
+    def write(self, record):
+        fd, path = tempfile.mkstemp(dir=self.directory)
+        try:
+            with os.fdopen(fd, 'w') as stream:
+                json.dump(record, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(path, self.path)
+            directory_fd = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+
+
+class LinuxFilesystem:
+    def __init__(self, observe, make_writable=None):
+        self.observe = observe
+        self.make_writable = make_writable
+        self.devices = {}
+
+    def validate(self, volumes):
+        if not volumes:
+            raise FenceRejected('No required filesystem to fence')
+        observed = self.observe()
+        seen = set()
+        root_device = os.stat('/').st_dev
+        for volume in volumes:
+            mount = volume['mount_point']
+            if (not isinstance(mount, str) or not mount.startswith('/') or mount == '/'
+                    or mount in seen or '..' in mount.split('/')):
+                raise FenceRejected('Unsafe or repeated source mount')
+            seen.add(mount)
+            if os.stat(mount).st_dev == root_device:
+                raise FenceRejected('Source volume shares the root filesystem holding the fence journal')
+            self.devices[mount] = os.stat(mount).st_dev
+            actual = observed.get(mount)
+            if (not actual or actual['stable_id'] != volume['stable_id']
+                    or actual['filesystem'] not in ('ext4', 'xfs')
+                    or actual['filesystem'] != volume['filesystem']
+                    or actual['uuid'] != volume['uuid']):
+                raise FenceRejected('Observed source filesystem identity does not match')
+
+    def is_readonly(self, mount):
+        return self.observe().get(mount, {}).get('readonly') is True
+
+    def _ioctl(self, mount, request):
+        fd = os.open(mount, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            if os.fstat(fd).st_dev != self.devices.get(mount):
+                raise FenceRejected("Source device changed after observation")
+            fcntl.ioctl(fd, request, 0)
+        finally:
+            os.close(fd)
+
+    def freeze(self, mount):
+        try:
+            self._ioctl(mount, 0xC0045877)
+            return True
+        except OSError as exc:
+            if exc.errno == errno.EBUSY:
+                return False
+            raise
+
+    def thaw(self, mount):
+        try:
+            self._ioctl(mount, 0xC0045878)
+        except OSError as exc:
+            if exc.errno != errno.EINVAL:
+                raise
+
+    @staticmethod
+    def confirm_writable(mount):
+        fd, path = tempfile.mkstemp(prefix='.samurai-write-check-', dir=mount)
+        try:
+            os.write(fd, b'write-authority-check\n')
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+            os.unlink(path)
