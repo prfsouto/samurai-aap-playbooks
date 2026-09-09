@@ -225,3 +225,35 @@ def test_existing_kernel_fence_does_not_report_a_new_mutation(tmp_path, monkeypa
     monkeypatch.setattr(consistency_lease.fcntl, 'ioctl', lambda *args: 0)
     assert filesystem.freeze(mount) is True
     assert filesystem.mutations == 1
+
+
+def test_failed_journal_write_does_not_prevent_compensating_owned_freezes():
+    store, fs, fence = setup()
+    original_write = store.write
+    def full_journal(record):
+        if record['frozen']:
+            raise OSError('journal filesystem full')
+        original_write(record)
+    store.write = full_journal
+    with pytest.raises(OSError, match='full'):
+        fence.execute(command())
+    assert fs.frozen == set()
+    assert fs.thawed == ['/data']
+    assert not fs.boot.protected
+
+
+def test_compensation_attempts_every_owned_mount_after_one_thaw_fails():
+    store, fs, fence = setup()
+    fs.frozen = {'/a', '/b'}
+    attempts = []
+    original_thaw = fs.thaw
+    def partial_thaw(mount):
+        attempts.append(mount)
+        if mount == '/a':
+            raise OSError('device unavailable')
+        original_thaw(mount)
+    fs.thaw = partial_thaw
+    with pytest.raises(FenceRejected, match='every owned'):
+        fence._compensate_owned({'frozen': ['/a', '/b'], 'boot_entries': {}})
+    assert attempts == ['/a', '/b']
+    assert fs.frozen == {'/a'}

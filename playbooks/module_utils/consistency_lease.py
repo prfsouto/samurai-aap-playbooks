@@ -111,15 +111,29 @@ class FilesystemFence:
                 self.store.write(record)
         except Exception:
             record['state'] = 'UNCERTAIN'
-            self.store.write(record)
-            for mount in record['frozen']:
-                self.filesystem.thaw(mount)
-                self.filesystem.confirm_writable(mount)
-            self.filesystem.boot.restore(record['boot_entries'])
+            try:
+                self._compensate_owned(record)
+            finally:
+                self.store.write(record)
             raise
         record['state'] = 'HELD'
         self.store.write(record)
         return self.evidence(record)
+
+    def _compensate_owned(self, record):
+        errors = []
+        for mount in record['frozen']:
+            try:
+                self.filesystem.thaw(mount)
+                self.filesystem.confirm_writable(mount)
+            except Exception as exc:
+                errors.append(exc)
+        try:
+            self.filesystem.boot.restore(record['boot_entries'])
+        except Exception as exc:
+            errors.append(exc)
+        if errors:
+            raise FenceRejected('Source recovery did not confirm every owned filesystem') from errors[0]
 
     def release(self, record, mounts, boot_readonly=False):
         if record['state'] == 'RELEASED':
