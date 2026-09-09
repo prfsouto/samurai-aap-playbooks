@@ -60,6 +60,10 @@ def main():
     module = AnsibleModule(argument_spec=dict(command=dict(type='dict', required=True)), supports_check_mode=False)
     if os.geteuid() != 0:
         module.fail_json(msg='Filesystem fencing requires governed privilege escalation')
+    identity = Path('/sys/devices/virtual/dmi/id/board_asset_tag')
+    expected_instance = module.params['command'].get('scope', {}).get('source_instance_id')
+    if not identity.exists() or identity.read_text().strip() != expected_instance:
+        module.fail_json(msg='Observed AWS instance does not match the frozen command')
     journal = Journal()
     lock = journal.lock()
     filesystem = None
@@ -72,7 +76,7 @@ def main():
             raise FenceRejected('Verified boot fencing requires the systemd host boot path')
         if any(value in Path('/proc/cmdline').read_text().split() for value in ('fstab=no', 'fstab=0', 'fstab=off')):
             raise FenceRejected('The host boot path disables fstab mount generation')
-        for root in ('/etc/systemd/system-generators', '/run/systemd/system-generators'):
+        for root in ('/etc/systemd/system-generators', '/run/systemd/system-generators', '/usr/local/lib/systemd/system-generators'):
             override = Path(root) / 'systemd-fstab-generator'
             if override.exists() or override.is_symlink():
                 raise FenceRejected('A custom fstab generator prevents verified boot fencing')

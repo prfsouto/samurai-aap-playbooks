@@ -97,6 +97,29 @@ def test_durable_intent_precedes_kernel_mutation():
         fence.execute(command())
 
 
+def test_recovery_observes_writable_host_before_reusing_uncertain_intent():
+    store, fs, fence = setup()
+    store.record = {
+        'scope': command()['scope'], 'boot_id': 'boot-a', 'state': 'UNCERTAIN',
+        'frozen': ['/data'], 'volumes': [{'mount_point': '/data'}],
+        'acquired_at': None, 'protection': 'filesystem_freeze',
+    }
+    assert fence.execute(command('inspect_outcome'))['state'] == 'NO_FENCE'
+
+
+def test_recovery_keeps_uncertain_intent_when_host_is_not_writable():
+    store, fs, fence = setup()
+    store.record = {
+        'scope': command()['scope'], 'boot_id': 'boot-a', 'state': 'UNCERTAIN',
+        'frozen': ['/data'], 'volumes': [{'mount_point': '/data'}],
+        'acquired_at': None, 'protection': 'filesystem_freeze',
+    }
+    fs.frozen = {'/data'}
+    fs.confirm_writable = lambda mount: (_ for _ in ()).throw(FenceRejected('still frozen'))
+    with pytest.raises(FenceRejected, match='not held'):
+        fence.execute(command('inspect_outcome'))
+
+
 def test_reboot_never_reuses_prior_fence_proof():
     store, fs, fence = setup()
     fence.execute(command())
@@ -179,6 +202,24 @@ def test_mount_control_characters_are_rejected_before_device_io(mount):
     filesystem = LinuxFilesystem(lambda: {})
     with pytest.raises(FenceRejected, match='Unsafe'):
         filesystem.validate([{'mount_point': mount, 'stable_id': 'vol-synthetic', 'uuid': 'uuid', 'filesystem': 'ext4'}])
+
+
+def test_missing_stable_id_is_a_controlled_refusal():
+    from consistency_lease import LinuxFilesystem
+    filesystem = LinuxFilesystem(lambda: {})
+    with pytest.raises(FenceRejected, match='stable volume identity'):
+        filesystem.validate([{'mount_point': '/data', 'uuid': 'uuid', 'filesystem': 'ext4'}])
+
+
+def test_journal_counts_first_run_state_creation(tmp_path):
+    from consistency_lease import Journal
+    journal = Journal(tmp_path / 'journal')
+    lock = journal.lock()
+    try:
+        assert journal.mutations == 2
+    finally:
+        import os
+        os.close(lock)
 
 
 def test_volume_order_does_not_change_replay_identity():

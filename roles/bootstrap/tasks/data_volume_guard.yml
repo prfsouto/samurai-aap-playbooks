@@ -1,11 +1,22 @@
 ---
+- name: "[bootstrap] Resolve campaign identity once"
+  ansible.builtin.set_fact:
+    data_sync_campaign_execution_id: "{{ samurai_campaign_server_execution_id | default('') | string | trim }}"
+  tags: [bootstrap, data_sync]
+
+- name: "[bootstrap] Reject a malformed campaign identity"
+  ansible.builtin.assert:
+    that:
+      - data_sync_campaign_execution_id | length == 0 or (data_sync_campaign_execution_id is match('^[0-9]+$') and data_sync_campaign_execution_id | int > 0)
+    quiet: true
+  tags: [bootstrap, data_sync]
 - name: "[bootstrap] Require stable destination identity for campaign data"
   ansible.builtin.assert:
     that:
       - data_sync_guard_item.destination_volume_stable_id | default('') | length > 0
       - data_sync_guard_item.destination_volume_stable_id != data_sync_guard_item.source_volume_stable_id
     quiet: true
-  when: samurai_campaign_server_execution_id | default('') | string | length > 0
+  when: data_sync_campaign_execution_id | length > 0
 
 - name: "[bootstrap] Read current devices before resolving the replicated volume"
   ansible.builtin.command:
@@ -115,7 +126,7 @@
     state: mounted
     opts: >-
       {{ (data_sync_mount_opts | default('defaults') | split(',') | reject('equalto', 'rw') | list + ['ro']) | unique | join(',')
-         if samurai_campaign_server_execution_id | default(0) | int > 0
+         if data_sync_campaign_execution_id | length > 0
          else data_sync_mount_opts | default('defaults') }}
   become: true
   when: data_sync_mount_point | default('') | length > 0

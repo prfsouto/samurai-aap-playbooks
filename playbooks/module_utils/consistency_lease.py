@@ -30,6 +30,11 @@ class FilesystemFence:
             return dict(scope=scope, boot_id=self.boot_id, state='CANDIDATE_READ_ONLY', frozen=[],
                         acquired_at=datetime.now(timezone.utc).isoformat())
         record = self.store.read()
+        if action == 'inspect_outcome' and record is None:
+            for volume in mounts:
+                self.filesystem.confirm_writable(volume['mount_point'])
+            return dict(scope=scope, boot_id=self.boot_id, state='NO_FENCE', frozen=[],
+                        acquired_at=None, protection=None)
         if record and record['scope']['plan_digest'] == scope['plan_digest'] and record.get('volumes') != mounts:
             raise FenceRejected('Source fence volume manifest changed')
         if record and record['scope']['organization_id'] != scope['organization_id']:
@@ -52,6 +57,24 @@ class FilesystemFence:
             record['state'] = 'CANDIDATE_WRITABLE'
             self.store.write(record)
             return self.evidence(record)
+        if action == 'inspect_outcome':
+            if record['scope']['generation'] != scope['generation']:
+                raise FenceRejected('Outcome belongs to another fence generation')
+            if record['state'] == 'RELEASED':
+                for volume in mounts:
+                    self.filesystem.confirm_writable(volume['mount_point'])
+                return self.evidence(record)
+            if record['state'] in ('ACQUIRING', 'UNCERTAIN', 'RELEASING'):
+                try:
+                    for volume in mounts:
+                        self.filesystem.confirm_writable(volume['mount_point'])
+                except Exception:
+                    # An unwritable mount can still be owned by this fence.
+                    pass
+                else:
+                    return dict(scope=scope, boot_id=self.boot_id, state='NO_FENCE',
+                                frozen=[], acquired_at=None, protection=None)
+            action = 'inspect'
         if action == 'acquire':
             return self.acquire(command, record, mounts)
         if not record or record['scope']['generation'] != scope['generation']:
@@ -99,20 +122,26 @@ class FilesystemFence:
                       acquired_at=datetime.now(timezone.utc).isoformat(), protection='filesystem_freeze',
                       boot_entries=self.filesystem.boot.capture(mounts))
         self.store.write(record)
+        uncertain_io = False
         try:
             self.filesystem.boot.protect(mounts, record['boot_entries'])
             if not self.filesystem.boot.verify(mounts):
                 raise FenceRejected('Source read-only boot fence was not persisted')
             for volume in mounts:
                 mount = volume['mount_point']
+                uncertain_io = True
                 if not self.filesystem.freeze(mount):
                     raise FenceRejected('Filesystem already frozen without confirmed ownership')
                 record['frozen'].append(mount)
+                uncertain_io = False
                 self.store.write(record)
         except Exception:
             record['state'] = 'UNCERTAIN'
             try:
                 self._compensate_owned(record)
+                if not uncertain_io:
+                    record['state'] = 'RELEASED'
+                    record['frozen'] = []
             finally:
                 self.store.write(record)
             raise
@@ -165,7 +194,10 @@ class Journal:
     def __init__(self, directory='/.samurai-consistency'):
         self.mutations = 0
         self.directory = Path(directory)
+        existed = self.directory.exists()
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if not existed:
+            self.mutations += 1
         info = self.directory.lstat()
         if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077
                 or info.st_dev != os.stat('/').st_dev):
@@ -173,7 +205,10 @@ class Journal:
         self.path = self.directory / 'source.json'
 
     def lock(self):
+        existed = (self.directory / 'lock').exists()
         fd = os.open(self.directory / 'lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        if not existed:
+            self.mutations += 1
         fcntl.flock(fd, fcntl.LOCK_EX)
         return fd
 
@@ -219,24 +254,28 @@ class LinuxFilesystem:
         seen = set()
         root_device = os.stat('/').st_dev
         for volume in volumes:
-            mount = volume['mount_point']
+            mount = volume.get('mount_point') if isinstance(volume, dict) else None
+            stable_id = volume.get('stable_id') if isinstance(volume, dict) else None
             if (not isinstance(mount, str) or not mount.startswith('/') or mount == '/'
                     or any(ord(character) < 32 or ord(character) == 127 for character in mount)
                     or mount in seen or '..' in mount.split('/')):
                 raise FenceRejected('Unsafe or repeated source mount')
             seen.add(mount)
-            if not isinstance(volume.get('uuid'), str) or not volume['uuid']:
+            if not isinstance(stable_id, str) or not stable_id.strip():
+                raise FenceRejected('Required stable volume identity is missing')
+            uuid = volume.get('uuid')
+            if not isinstance(uuid, str) or not uuid:
                 raise FenceRejected('Required filesystem UUID is missing')
             if os.stat(mount).st_dev == root_device:
                 raise FenceRejected('Source volume shares the root filesystem holding the fence journal')
             self.devices[mount] = os.stat(mount).st_dev
             actual = observed.get(mount)
-            if sum(1 for entry in observed.values() if entry.get('stable_id') == volume['stable_id'] and entry.get('uuid') == volume['uuid']) != 1:
+            if sum(1 for entry in observed.values() if entry.get('stable_id') == stable_id and entry.get('uuid') == uuid) != 1:
                 raise FenceRejected('Required filesystem has multiple observed mount aliases')
-            if (not actual or actual['stable_id'] != volume['stable_id']
+            if (not actual or actual['stable_id'] != stable_id
                     or actual['filesystem'] not in ('ext4', 'xfs')
                     or actual['filesystem'] != volume['filesystem']
-                    or actual['uuid'] != volume['uuid']):
+                    or actual['uuid'] != uuid):
                 raise FenceRejected('Observed source filesystem identity does not match')
 
     def is_readonly(self, mount):
