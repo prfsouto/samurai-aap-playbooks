@@ -20,10 +20,35 @@ class Store:
         self.record = copy.deepcopy(record)
 
 
+class Boot:
+    def __init__(self):
+        self.protected = False
+
+    def capture(self, volumes):
+        return {'/data': 'original boot entry'}
+
+    def protect(self, volumes, original):
+        self.protected = True
+
+    def verify(self, volumes):
+        return self.protected
+
+    def restore(self, original):
+        self.protected = False
+
+
 class Filesystem:
     def __init__(self):
         self.frozen = set()
         self.thawed = []
+        self.boot = Boot()
+        self.readonly = False
+
+    def is_readonly(self, mount):
+        return self.readonly
+
+    def make_writable(self, mount):
+        self.readonly = False
 
     def validate(self, volumes):
         pass
@@ -123,3 +148,26 @@ def test_changed_volume_manifest_cannot_release_original_fence():
     with pytest.raises(FenceRejected, match='manifest'):
         fence.execute(request)
     assert fs.thawed == []
+
+
+def test_reboot_retains_fence_only_with_persisted_readonly_boot_and_mount():
+    store, fs, fence = setup()
+    fence.execute(command())
+    fs.frozen.clear()
+    fs.readonly = True
+    restarted = FilesystemFence(store=store, filesystem=fs, boot_id='boot-b')
+    assert restarted.execute(command('inspect'))['state'] == 'HELD'
+    fs.readonly = False
+    with pytest.raises(FenceRejected, match='boot fence was lost'):
+        restarted.execute(command('inspect'))
+
+
+def test_abort_after_readonly_boot_restores_the_only_writer():
+    store, fs, fence = setup()
+    fence.execute(command())
+    fs.frozen.clear()
+    fs.readonly = True
+    restarted = FilesystemFence(store=store, filesystem=fs, boot_id='boot-b')
+    assert restarted.execute(command('release_abort'))['state'] == 'RELEASED'
+    assert not fs.readonly
+    assert not fs.boot.protected

@@ -57,15 +57,28 @@ class FilesystemFence:
             raise FenceRejected('No matching fence generation')
         if record['scope']['plan_digest'] != scope['plan_digest']:
             raise FenceRejected('Source fence plan mismatch')
+        boot_readonly = False
         if record['boot_id'] != self.boot_id:
-            raise FenceRejected('Host reboot invalidated the observed fence')
+            boot_readonly = (self.filesystem.boot.verify(mounts)
+                             and all(self.filesystem.is_readonly(v['mount_point']) for v in mounts))
+            if not boot_readonly:
+                raise FenceRejected('Host reboot invalidated the observed fence')
+            if action != 'release_abort':
+                record['boot_id'] = self.boot_id
+                record['protection'] = 'boot_read_only'
+                self.store.write(record)
         if action == 'release_abort':
             if record['state'] == 'TRANSFERRED':
                 raise FenceRejected('Committed source must not resume writing')
-            return self.release(record, mounts)
+            return self.release(record, mounts, boot_readonly=boot_readonly)
         if action not in ('inspect', 'transfer') or record['state'] not in ('HELD', 'TRANSFERRED'):
             raise FenceRejected('Source fence is not held')
-        for volume in mounts:
+        if not self.filesystem.boot.verify(mounts):
+            raise FenceRejected('Persistent source boot fence was lost')
+        if record.get('protection') == 'boot_read_only':
+            if not self.filesystem.boot.verify(mounts) or not all(self.filesystem.is_readonly(v['mount_point']) for v in mounts):
+                raise FenceRejected('Persistent source boot fence was lost')
+        for volume in (() if boot_readonly or record.get('protection') == 'boot_read_only' else mounts):
             if self.filesystem.freeze(volume['mount_point']):
                 record['state'] = 'UNCERTAIN'
                 self.store.write(record)
@@ -82,9 +95,13 @@ class FilesystemFence:
         if record and record['state'] not in ('RELEASED', 'CANDIDATE_WRITABLE'):
             raise FenceRejected('Uncertain acquisition requires explicit recovery')
         record = dict(scope=command['scope'], boot_id=self.boot_id, state='ACQUIRING', frozen=[], volumes=mounts,
-                      acquired_at=datetime.now(timezone.utc).isoformat())
+                      acquired_at=datetime.now(timezone.utc).isoformat(), protection='filesystem_freeze',
+                      boot_entries=self.filesystem.boot.capture(mounts))
         self.store.write(record)
         try:
+            self.filesystem.boot.protect(mounts, record['boot_entries'])
+            if not self.filesystem.boot.verify(mounts):
+                raise FenceRejected('Source read-only boot fence was not persisted')
             for volume in mounts:
                 mount = volume['mount_point']
                 if not self.filesystem.freeze(mount):
@@ -97,12 +114,13 @@ class FilesystemFence:
             for mount in record['frozen']:
                 self.filesystem.thaw(mount)
                 self.filesystem.confirm_writable(mount)
+            self.filesystem.boot.restore(record['boot_entries'])
             raise
         record['state'] = 'HELD'
         self.store.write(record)
         return self.evidence(record)
 
-    def release(self, record, mounts):
+    def release(self, record, mounts, boot_readonly=False):
         if record['state'] == 'RELEASED':
             return self.evidence(record)
         if record['state'] not in ('HELD', 'RELEASING'):
@@ -110,16 +128,22 @@ class FilesystemFence:
         record['state'] = 'RELEASING'
         self.store.write(record)
         for mount in record['frozen']:
-            self.filesystem.thaw(mount)
+            if boot_readonly or record.get('protection') == 'boot_read_only':
+                self.filesystem.make_writable(mount)
+            else:
+                self.filesystem.thaw(mount)
         for volume in mounts:
             self.filesystem.confirm_writable(volume['mount_point'])
+        self.filesystem.boot.restore(record['boot_entries'])
         record['state'] = 'RELEASED'
         self.store.write(record)
         return self.evidence(record)
 
     @staticmethod
     def evidence(record):
-        return {key: record[key] for key in ('scope', 'boot_id', 'state', 'frozen', 'acquired_at')}
+        result = {key: record[key] for key in ('scope', 'boot_id', 'state', 'frozen', 'acquired_at')}
+        result['protection'] = record.get('protection')
+        return result
 
 
 class Journal:
@@ -164,10 +188,11 @@ class Journal:
 
 
 class LinuxFilesystem:
-    def __init__(self, observe, make_writable=None):
+    def __init__(self, observe, make_writable=None, boot=None):
         self.observe = observe
         self.make_writable = make_writable
         self.devices = {}
+        self.boot = boot
 
     def validate(self, volumes):
         if not volumes:
@@ -221,10 +246,9 @@ class LinuxFilesystem:
 
     @staticmethod
     def confirm_writable(mount):
-        fd, path = tempfile.mkstemp(prefix='.samurai-write-check-', dir=mount)
+        fd = os.open(mount, os.O_WRONLY | os.O_TMPFILE, 0o600)
         try:
             os.write(fd, b'write-authority-check\n')
             os.fsync(fd)
         finally:
             os.close(fd)
-            os.unlink(path)
