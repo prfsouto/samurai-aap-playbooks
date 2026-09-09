@@ -118,6 +118,16 @@
         - name: "Record preparation completion without authorizing cutover"
           ansible.builtin.set_fact:
             campaign_preparation_completed: true
+      rescue:
+        - name: Recover source writing through the governed abort boundary
+          ansible.builtin.include_tasks:
+            file: tasks/campaign_abort_release.yml
+            apply:
+              delegate_to: localhost
+          when: data_sync_destination_intents | default([]) | length > 0
+        - name: Preserve the original preparation failure
+          ansible.builtin.fail:
+            msg: Candidate preparation failed; source recovery was checked separately
       always:
         - name: "Remove private candidate access from the execution container"
           ansible.builtin.include_tasks:

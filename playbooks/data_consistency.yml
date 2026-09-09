@@ -1,0 +1,32 @@
+---
+- name: Resolve the scoped source connection
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Add only the frozen source connection
+      ansible.builtin.add_host:
+        name: samurai_consistency_source
+        ansible_host: "{{ consistency_host }}"
+        ansible_connection: ssh
+
+- name: Governed source filesystem consistency
+  hosts: samurai_consistency_source
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Require the frozen source command
+      ansible.builtin.assert:
+        that:
+          - samurai_consistency_command.scope.organization_id | int > 0
+          - samurai_consistency_command.scope.execution_id | int > 0
+          - samurai_consistency_command.scope.generation | int > 0
+          - samurai_consistency_command.parameters.volumes | length > 0
+    - name: Apply source fencing and observe its result
+      samurai_consistency:
+        command: "{{ samurai_consistency_command }}"
+      register: consistency_result
+    - name: Publish measured source consistency
+      ansible.builtin.set_stats:
+        data:
+          samurai_consistency_observation: "{{ consistency_result.consistency_observation }}"
+        aggregate: false
