@@ -25,15 +25,6 @@
       samurai_consistency:
         command: "{{ samurai_consistency_command }}"
       register: consistency_result
-    - name: Persist candidate write authority only after its committed activation
-      ansible.posix.mount:
-        path: "{{ item.mount_point }}"
-        src: "UUID={{ item.uuid }}"
-        fstype: "{{ item.filesystem }}"
-        opts: defaults,rw
-        state: mounted
-      loop: "{{ samurai_consistency_command.parameters.volumes }}"
-      when: samurai_consistency_command.scope.action == 'activate_candidate'
     - name: Publish measured source consistency
       ansible.builtin.set_stats:
         data:

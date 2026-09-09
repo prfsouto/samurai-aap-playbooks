@@ -40,12 +40,29 @@ def observed_mounts(module):
     return result
 
 
+def resolve_boot_uuid(module, source):
+    if os.path.isdir(source):
+        argv = ['findmnt', '--noheadings', '--output', 'UUID', '--target', source]
+    else:
+        device = source
+        if not source.startswith('/'):
+            rc, device, _ = module.run_command(['findfs', source])
+            if rc:
+                raise FenceRejected('Boot device identity cannot be resolved')
+        argv = ['blkid', '-s', 'UUID', '-o', 'value', '--', device.strip()]
+    rc, value, _ = module.run_command(argv)
+    if rc or not value.strip() or len(value.split()) != 1:
+        raise FenceRejected('Boot filesystem identity cannot be resolved')
+    return value.strip()
+
+
 def main():
     module = AnsibleModule(argument_spec=dict(command=dict(type='dict', required=True)), supports_check_mode=False)
     if os.geteuid() != 0:
         module.fail_json(msg='Filesystem fencing requires governed privilege escalation')
     journal = Journal()
     lock = journal.lock()
+    filesystem = None
     try:
         def make_writable(mount):
             rc, _, _ = module.run_command(['mount', '-o', 'remount,rw', '--', mount])
@@ -68,12 +85,13 @@ def main():
                 if any((Path(root) / name).exists() or (Path(root) / name).is_symlink()
                        for name in (unit, unit + '.d', 'mount.d')):
                     raise FenceRejected('Custom mount boot unit prevents a verified read-only boot fence')
-        fence = FilesystemFence(store=journal, filesystem=LinuxFilesystem(lambda: observed_mounts(module), make_writable, FstabBootFence()),
+        filesystem = LinuxFilesystem(lambda: observed_mounts(module), make_writable, FstabBootFence(resolve_uuid=lambda source: resolve_boot_uuid(module, source)))
+        fence = FilesystemFence(store=journal, filesystem=filesystem,
                                 boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip())
         evidence = fence.execute(module.params['command'])
-        module.exit_json(changed=True, consistency_observation=evidence)
+        module.exit_json(changed=bool(journal.mutations or filesystem.mutations), consistency_observation=evidence)
     except (FenceRejected, BootFenceRejected, OSError, ValueError, KeyError, TypeError) as exc:
-        module.fail_json(msg=str(exc))
+        module.fail_json(changed=bool(journal.mutations or getattr(filesystem, "mutations", 0)), msg=str(exc))
     finally:
         os.close(lock)
 

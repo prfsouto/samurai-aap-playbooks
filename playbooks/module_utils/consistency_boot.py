@@ -13,12 +13,31 @@ class BootFenceRejected(RuntimeError):
 
 
 class FstabBootFence:
-    def __init__(self, path='/etc/fstab'):
+    def __init__(self, path='/etc/fstab', resolve_uuid=None):
         self.path = Path(path)
+        self.resolve_uuid = resolve_uuid
         if self.path.is_symlink():
             raise BootFenceRejected("Symbolic fstab paths are not supported")
 
+    def _check_aliases(self, volumes):
+        for line in self.path.read_text().splitlines():
+            fields = line.split()
+            if line.lstrip().startswith('#') or len(fields) < 4:
+                continue
+            if (not fields[0].startswith('UUID=') and fields[2] not in ('ext4', 'xfs', 'auto')
+                    and not {'bind', 'rbind'} & set(fields[3].split(','))):
+                continue
+            identity = fields[0][5:] if fields[0].startswith('UUID=') else None
+            if identity is None and self.resolve_uuid is not None:
+                identity = self.resolve_uuid(fields[0])
+            if not identity:
+                raise BootFenceRejected('Cannot exclude an alias with unresolved boot identity')
+            for volume in volumes:
+                if identity.casefold() == volume['uuid'].casefold() and fields[1] != escaped(volume['mount_point']):
+                    raise BootFenceRejected('Another boot mount aliases a required filesystem')
+
     def capture(self, volumes):
+        self._check_aliases(volumes)
         lines = self.path.read_text().splitlines()
         saved = {}
         for volume in volumes:
@@ -31,6 +50,7 @@ class FstabBootFence:
         return saved
 
     def protect(self, volumes, original):
+        self._check_aliases(volumes)
         changes = {}
         for volume in volumes:
             mount = escaped(volume['mount_point'])
@@ -44,12 +64,30 @@ class FstabBootFence:
         self._replace(changes)
 
     def verify(self, volumes):
-        current = self.capture(volumes)
+        try:
+            current = self.capture(volumes)
+        except BootFenceRejected:
+            return False
         return all(current[escaped(v['mount_point'])] is not None
                    and current[escaped(v['mount_point'])].split()[0] == 'UUID=' + v['uuid']
                    and 'ro' in current[escaped(v['mount_point'])].split()[3].split(',')
                    and not set(current[escaped(v['mount_point'])].split()[3].split(',')) & {'rw', 'noauto', 'nofail'}
                    for v in volumes)
+
+    def activate(self, volumes):
+        previous = self.capture(volumes)
+        changes = {}
+        for volume in volumes:
+            mount = escaped(volume['mount_point'])
+            line = previous[mount]
+            if line is None:
+                raise BootFenceRejected('Candidate boot mount is missing')
+            fields = line.split()
+            options = [option for option in fields[3].split(',') if option not in ('ro', 'rw')]
+            fields[0] = 'UUID=' + volume['uuid']
+            fields[3] = ','.join(options + ['rw'])
+            changes[mount] = ' '.join(fields)
+        self._replace(changes)
 
     def restore(self, original):
         self._replace(original)

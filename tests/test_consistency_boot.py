@@ -55,3 +55,23 @@ def test_boot_fence_loss_is_detected_even_without_reboot(tmp_path):
     boot.protect(VOLUMES, saved)
     fstab.write_text('UUID=synthetic-uuid /data ext4 defaults,rw 0 2\n')
     assert not boot.verify(VOLUMES)
+
+
+@pytest.mark.parametrize('source', ['UUID=synthetic-uuid', 'LABEL=data', '/dev/disk/by-id/synthetic'])
+def test_rw_alias_of_required_filesystem_is_refused_before_boot_mutation(tmp_path, source):
+    fstab = tmp_path / 'fstab'
+    original = source + ' /alias ext4 defaults,rw 0 2\nUUID=synthetic-uuid /data ext4 defaults,rw 0 2\n'
+    fstab.write_text(original)
+    boot = FstabBootFence(fstab, resolve_uuid=lambda value: 'synthetic-uuid')
+    with pytest.raises(BootFenceRejected, match='aliases'):
+        boot.capture(VOLUMES)
+    assert fstab.read_text() == original
+    assert not boot.verify(VOLUMES)
+
+
+def test_candidate_activation_preserves_security_options(tmp_path):
+    fstab = tmp_path / 'fstab'
+    fstab.write_text('UUID=synthetic-uuid /data ext4 nodev,nosuid,noexec,ro 0 2\n')
+    FstabBootFence(fstab).activate(VOLUMES)
+    options = fstab.read_text().split()[3].split(',')
+    assert set(options) == {'nodev', 'nosuid', 'noexec', 'rw'}

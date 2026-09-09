@@ -22,7 +22,7 @@ class FilesystemFence:
     def execute(self, command):
         scope = command['scope']
         action = scope['action']
-        mounts = command['parameters']['volumes']
+        mounts = sorted(command['parameters']['volumes'], key=lambda v: (v.get('stable_id', ''), v['mount_point']))
         self.filesystem.validate(mounts)
         if action == 'inspect_candidate':
             if not all(self.filesystem.is_readonly(v['mount_point']) for v in mounts):
@@ -48,6 +48,7 @@ class FilesystemFence:
             for volume in mounts:
                 self.filesystem.make_writable(volume['mount_point'])
                 self.filesystem.confirm_writable(volume['mount_point'])
+            self.filesystem.boot.activate(mounts)
             record['state'] = 'CANDIDATE_WRITABLE'
             self.store.write(record)
             return self.evidence(record)
@@ -148,6 +149,7 @@ class FilesystemFence:
 
 class Journal:
     def __init__(self, directory='/.samurai-consistency'):
+        self.mutations = 0
         self.directory = Path(directory)
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         info = self.directory.lstat()
@@ -177,6 +179,7 @@ class Journal:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(path, self.path)
+            self.mutations += 1
             directory_fd = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY)
             try:
                 os.fsync(directory_fd)
@@ -191,6 +194,7 @@ class LinuxFilesystem:
     def __init__(self, observe, make_writable=None, boot=None):
         self.observe = observe
         self.make_writable = make_writable
+        self.mutations = 0
         self.devices = {}
         self.boot = boot
 
@@ -203,13 +207,18 @@ class LinuxFilesystem:
         for volume in volumes:
             mount = volume['mount_point']
             if (not isinstance(mount, str) or not mount.startswith('/') or mount == '/'
+                    or any(ord(character) < 32 or ord(character) == 127 for character in mount)
                     or mount in seen or '..' in mount.split('/')):
                 raise FenceRejected('Unsafe or repeated source mount')
             seen.add(mount)
+            if not isinstance(volume.get('uuid'), str) or not volume['uuid']:
+                raise FenceRejected('Required filesystem UUID is missing')
             if os.stat(mount).st_dev == root_device:
                 raise FenceRejected('Source volume shares the root filesystem holding the fence journal')
             self.devices[mount] = os.stat(mount).st_dev
             actual = observed.get(mount)
+            if sum(1 for entry in observed.values() if entry.get('stable_id') == volume['stable_id'] and entry.get('uuid') == volume['uuid']) != 1:
+                raise FenceRejected('Required filesystem has multiple observed mount aliases')
             if (not actual or actual['stable_id'] != volume['stable_id']
                     or actual['filesystem'] not in ('ext4', 'xfs')
                     or actual['filesystem'] != volume['filesystem']
@@ -225,6 +234,7 @@ class LinuxFilesystem:
             if os.fstat(fd).st_dev != self.devices.get(mount):
                 raise FenceRejected("Source device changed after observation")
             fcntl.ioctl(fd, request, 0)
+            self.mutations += 1
         finally:
             os.close(fd)
 

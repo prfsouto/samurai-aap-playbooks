@@ -171,3 +171,57 @@ def test_abort_after_readonly_boot_restores_the_only_writer():
     assert restarted.execute(command('release_abort'))['state'] == 'RELEASED'
     assert not fs.readonly
     assert not fs.boot.protected
+
+
+@pytest.mark.parametrize('mount', ['/data\n/other', '/data\x00', '/data\talias'])
+def test_mount_control_characters_are_rejected_before_device_io(mount):
+    from consistency_lease import LinuxFilesystem
+    filesystem = LinuxFilesystem(lambda: {})
+    with pytest.raises(FenceRejected, match='Unsafe'):
+        filesystem.validate([{'mount_point': mount, 'stable_id': 'vol-synthetic', 'uuid': 'uuid', 'filesystem': 'ext4'}])
+
+
+def test_volume_order_does_not_change_replay_identity():
+    store, fs, fence = setup()
+    request = command()
+    request['parameters']['volumes'] = [{'mount_point': '/b'}, {'mount_point': '/a'}]
+    fence.execute(request)
+    request['parameters']['volumes'].reverse()
+    assert fence.execute(request)['state'] == 'HELD'
+    assert fs.thawed == []
+
+
+def test_observed_mount_alias_is_refused(monkeypatch):
+    import os
+    import consistency_lease
+    original_stat = os.stat
+    observation = {'/data': {'stable_id': 'vol-synthetic', 'uuid': 'uuid', 'filesystem': 'ext4'},
+                   '/alias': {'stable_id': 'vol-synthetic', 'uuid': 'uuid', 'filesystem': 'ext4'}}
+    def mounted_stat(path, *args, **kwargs):
+        if str(path) in ('/data', '/alias'):
+            fields = list(original_stat('/'))
+            fields[2] += 1
+            return os.stat_result(fields)
+        return original_stat(path, *args, **kwargs)
+    with monkeypatch.context() as patch:
+        patch.setattr(consistency_lease.os, 'stat', mounted_stat)
+        filesystem = consistency_lease.LinuxFilesystem(lambda: observation)
+        with pytest.raises(FenceRejected, match='mount aliases'):
+            filesystem.validate([{'mount_point': '/data', 'stable_id': 'vol-synthetic', 'uuid': 'uuid', 'filesystem': 'ext4'}])
+
+
+def test_existing_kernel_fence_does_not_report_a_new_mutation(tmp_path, monkeypatch):
+    import errno
+    import os
+    import consistency_lease
+    filesystem = consistency_lease.LinuxFilesystem(lambda: {})
+    mount = str(tmp_path)
+    filesystem.devices[mount] = os.stat(mount).st_dev
+    def already_frozen(*args):
+        raise OSError(errno.EBUSY, 'already frozen')
+    monkeypatch.setattr(consistency_lease.fcntl, 'ioctl', already_frozen)
+    assert filesystem.freeze(mount) is False
+    assert filesystem.mutations == 0
+    monkeypatch.setattr(consistency_lease.fcntl, 'ioctl', lambda *args: 0)
+    assert filesystem.freeze(mount) is True
+    assert filesystem.mutations == 1

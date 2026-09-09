@@ -1,4 +1,11 @@
 ---
+- name: Require the failed campaign member identity before recovery
+  ansible.builtin.assert:
+    that:
+      - samurai_campaign_server_execution_id | default(0) | int > 0
+    fail_msg: Source recovery requires the failed campaign execution identity
+    quiet: true
+
 - name: Prepare governed abort authentication
   ansible.builtin.include_tasks: data_continuity_callback_auth.yml
   vars:
@@ -19,6 +26,9 @@
 - name: Require measured source recovery
   ansible.builtin.assert:
     that:
-      - campaign_abort_release.json.released | default(false) | bool
-    fail_msg: Source recovery was not confirmed; operator intervention is required
+      - (campaign_abort_release.json | default({})).released | default(false) | bool
+    fail_msg: >-
+      Source recovery was not confirmed:
+      {{ (campaign_abort_release.json | default({})).reason
+         | default((campaign_abort_release.json | default({})).detail | default('no recovery evidence')) }}
     quiet: true
