@@ -7,15 +7,25 @@ import subprocess
 import sys
 
 
-# AWS CLI error text known to mean the credential itself is the problem, not
-# the query. Kept as a flat tuple — not a general AWS error parser, just
-# enough to route the sanitized message under a code an operator can act on.
+# AWS CLI error text known to mean the CREDENTIAL ITSELF is invalid/expired —
+# never a permission gap (that is _PERMISSION_ERROR_MARKERS below). Sending an
+# operator to replace a credential that is valid but under-permissioned wastes
+# the fix; the two are different next actions, so they are different codes.
 _CREDENTIAL_ERROR_MARKERS = (
     "InvalidClientTokenId",
-    "AccessDenied",
-    "UnauthorizedOperation",
     "ExpiredToken",
     "AuthFailure",
+)
+
+# The credential is VALID; the identity behind it lacks the IAM permission
+# the call needs (ec2:DescribeImages). AWS's own contract names this
+# PermissionInsufficient — kept as a flat tuple, not a general AWS error
+# parser, just enough to route the sanitized message under a code an
+# operator can act on.
+_PERMISSION_ERROR_MARKERS = (
+    "AccessDenied",
+    "AccessDeniedException",
+    "UnauthorizedOperation",
 )
 
 
@@ -33,6 +43,11 @@ class SourceAmiResolutionError(RuntimeError):
 class CredentialRejected(SourceAmiResolutionError):
     code = "CREDENTIAL_REJECTED"
     next_action = "replace_or_revalidate_credential"
+
+
+class PermissionInsufficient(SourceAmiResolutionError):
+    code = "PERMISSION_INSUFFICIENT"
+    next_action = "grant_read_permissions"
 
 
 def _sanitize_stderr(stderr):
@@ -88,11 +103,12 @@ def resolve_source(*, region, owner, name_filter, aws_cli="aws"):
     except subprocess.CalledProcessError as exc:
         raw_stderr = exc.stderr or ""
         reason = _sanitize_stderr(raw_stderr)
-        error_cls = (
-            CredentialRejected
-            if any(marker in raw_stderr for marker in _CREDENTIAL_ERROR_MARKERS)
-            else SourceAmiResolutionError
-        )
+        if any(marker in raw_stderr for marker in _CREDENTIAL_ERROR_MARKERS):
+            error_cls = CredentialRejected
+        elif any(marker in raw_stderr for marker in _PERMISSION_ERROR_MARKERS):
+            error_cls = PermissionInsufficient
+        else:
+            error_cls = SourceAmiResolutionError
         raise error_cls(
             f"aws ec2 describe-images failed (exit {exc.returncode}): {reason}"
         ) from exc
