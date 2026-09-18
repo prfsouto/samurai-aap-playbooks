@@ -4,6 +4,39 @@ from datetime import datetime
 import json
 import re
 import subprocess
+import sys
+
+
+# AWS CLI error text known to mean the credential itself is the problem, not
+# the query. Kept as a flat tuple — not a general AWS error parser, just
+# enough to route the sanitized message under a code an operator can act on.
+_CREDENTIAL_ERROR_MARKERS = (
+    "InvalidClientTokenId",
+    "AccessDenied",
+    "UnauthorizedOperation",
+    "ExpiredToken",
+    "AuthFailure",
+)
+
+
+class SourceAmiResolutionError(RuntimeError):
+    """Mirrors the shape of CloudContractError (ree_cloud.domain) without
+    importing it — the Cloud Executor image (containers/cloud-executor/
+    Dockerfile.cloud-executor) is debian-slim + python3 stdlib and does not
+    package remediation-engine. backoffLimit=0 already stops any retry at
+    the Job level, so `retryable` here is metadata only, not flow control."""
+    code = "SOURCE_AMI_RESOLUTION_FAILED"
+    retryable = False
+    next_action = "inspect_and_retry"
+
+
+class CredentialRejected(SourceAmiResolutionError):
+    code = "CREDENTIAL_REJECTED"
+    next_action = "replace_or_revalidate_credential"
+
+
+def _sanitize_stderr(stderr):
+    return " ".join((stderr or "").split())[:500]
 
 
 def select_source(images, owner):
@@ -46,11 +79,23 @@ def resolve_source(*, region, owner, name_filter, aws_cli="aws"):
         {"Name": "virtualization-type", "Values": ["hvm"]},
         {"Name": "state", "Values": ["available"]},
     ]
-    result = subprocess.run(
-        [aws_cli, "ec2", "describe-images", "--region", region, "--owners", owner,
-         "--filters", json.dumps(filters), "--output", "json"],
-        check=True, capture_output=True, text=True, timeout=120,
-    )
+    try:
+        result = subprocess.run(
+            [aws_cli, "ec2", "describe-images", "--region", region, "--owners", owner,
+             "--filters", json.dumps(filters), "--output", "json"],
+            check=True, capture_output=True, text=True, timeout=120,
+        )
+    except subprocess.CalledProcessError as exc:
+        raw_stderr = exc.stderr or ""
+        reason = _sanitize_stderr(raw_stderr)
+        error_cls = (
+            CredentialRejected
+            if any(marker in raw_stderr for marker in _CREDENTIAL_ERROR_MARKERS)
+            else SourceAmiResolutionError
+        )
+        raise error_cls(
+            f"aws ec2 describe-images failed (exit {exc.returncode}): {reason}"
+        ) from exc
     return select_source(json.loads(result.stdout)["Images"], owner)
 
 
@@ -61,7 +106,11 @@ def main():
     parser.add_argument("--name-filter", required=True)
     parser.add_argument("--aws-cli", default="aws")
     args = parser.parse_args()
-    print(json.dumps(resolve_source(region=args.region, owner=args.owner, name_filter=args.name_filter, aws_cli=args.aws_cli)))
+    try:
+        print(json.dumps(resolve_source(region=args.region, owner=args.owner, name_filter=args.name_filter, aws_cli=args.aws_cli)))
+    except SourceAmiResolutionError as exc:
+        sys.stderr.write(f"{exc}\n")
+        sys.exit(3)
 
 
 if __name__ == "__main__":
