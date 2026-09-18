@@ -118,7 +118,7 @@ def resolve_source(*, region, owner, name_filter, aws_cli="aws"):
         ) from exc
     except (FileNotFoundError, PermissionError) as exc:
         raise SourceAmiResolutionError(
-            f"aws CLI could not be executed ({aws_cli}): {_sanitize_stderr(str(exc))}"
+            f"aws CLI could not be executed ({_sanitize_stderr(str(aws_cli))}): {_sanitize_stderr(str(exc))}"
         ) from exc
     return select_source(json.loads(result.stdout)["Images"], owner)
 
