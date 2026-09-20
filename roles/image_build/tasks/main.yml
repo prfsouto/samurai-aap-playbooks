@@ -39,7 +39,7 @@
 - name: "[image_build] Validate required inputs are present"
   ansible.builtin.assert:
     that:
-      - samurai_execution_id | default('') | length > 0
+      - samurai_execution_id | default('') | string | length > 0
       - image_build_organization_id | string | length > 0
       - image_build_template_path | length > 0
       - image_build_family | length > 0
