@@ -12,6 +12,7 @@ image_build_template_path: "{{ image_build.template_path | default('') }}"
 image_build_family: "{{ image_build.family | default('') }}"
 image_build_base_image: "{{ image_build.base_image | default('') }}"
 image_build_packer_vars: "{{ image_build.packer_vars | default({}) }}"
+image_build_frozen_destination_packer_vars: "{{ image_build_destination_packer_vars | default({}) }}"
 # syft needs a locally-scannable source (dir:, file:, registry image, ...).
 # A cloud image_ref alone (e.g. a remote AMI id) is NOT one — the packer
 # template must surface a local path itself (e.g. via a provisioner that

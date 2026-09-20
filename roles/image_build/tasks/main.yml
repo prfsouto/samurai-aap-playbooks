@@ -205,9 +205,20 @@
         fail_msg: "The approved variables artifact must contain a JSON object."
       no_log: true
 
-    - name: "[image_build] Use only the approved variables for this build"
+    - name: "[image_build] Validate the frozen destination variable overlay"
+      ansible.builtin.assert:
+        that:
+          - image_build_frozen_destination_packer_vars is mapping
+          - (image_build_frozen_destination_packer_vars.keys() | difference(['vpc_id', 'subnet_id', 'associate_public_ip_address']) | list | length) == 0
+          - image_build_frozen_destination_packer_vars.vpc_id is not defined or image_build_frozen_destination_packer_vars.vpc_id is string
+          - image_build_frozen_destination_packer_vars.subnet_id is not defined or image_build_frozen_destination_packer_vars.subnet_id is string
+          - image_build_frozen_destination_packer_vars.associate_public_ip_address is not defined or image_build_frozen_destination_packer_vars.associate_public_ip_address is boolean
+        fail_msg: "The frozen build destination contains unsupported Packer variables."
+      no_log: true
+
+    - name: "[image_build] Apply the frozen destination after the approved variables"
       ansible.builtin.set_fact:
-        image_build_packer_vars: "{{ image_build_approved_packer_vars }}"
+        image_build_packer_vars: "{{ image_build_approved_packer_vars | combine(image_build_frozen_destination_packer_vars) }}"
       no_log: true
 
     - name: "[image_build] Hash the approved provisioner playbook"
