@@ -377,6 +377,17 @@
       when: not (image_build_source_identity.skipped | default(false))
       tags: [image_build, build]
 
+    - name: "[image_build] List the variables the approved template actually declares"
+      ansible.builtin.set_fact:
+        image_build_declared_vars: "{{ lookup('ansible.builtin.file', image_build_resolved_template_path) | regex_findall('variable\\s+"([^"]+)"') | unique }}"
+      tags: [image_build, build]
+
+    - name: "[image_build] Keep only declared vars and record what the template ignores"
+      ansible.builtin.set_fact:
+        image_build_skipped_vars: "{{ (image_build_packer_vars | dict2items | rejectattr('key', 'in', image_build_declared_vars) | map(attribute='key') | list) }}"
+        image_build_packer_vars: "{{ dict((image_build_packer_vars | dict2items | selectattr('key', 'in', image_build_declared_vars) | list) | map(attribute='key') | zip((image_build_packer_vars | dict2items | selectattr('key', 'in', image_build_declared_vars) | list) | map(attribute='value'))) }}"
+      tags: [image_build, build]
+
     - name: "[image_build] Build the -var argument list from image_build.packer_vars"
       ansible.builtin.set_fact:
         image_build_var_args: "{{ image_build_var_args | default([]) + ['-var', item.key ~ '=' ~ item.value] }}"
