@@ -390,7 +390,7 @@
 
     - name: "[image_build] Build the -var argument list from image_build.packer_vars"
       ansible.builtin.set_fact:
-        image_build_var_args: "{{ image_build_var_args | default([]) + ['-var', item.key ~ '=' ~ item.value] }}"
+        image_build_var_args: "{{ image_build_var_args | default([]) + ['-var', item.key ~ '=' ~ (item.value | to_json if item.value is boolean else item.value | string)] }}"
       loop: "{{ image_build_packer_vars | dict2items }}"
       loop_control:
         label: "{{ item.key }}"
