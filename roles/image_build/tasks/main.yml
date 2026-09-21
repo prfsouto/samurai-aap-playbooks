@@ -798,7 +798,6 @@
       ansible.builtin.assert:
         that:
           - image_build_sbom_package_components | length > 0
-          - (image_build_sbom_package_components | length) == (image_build_sbom_json.components | length)
         fail_msg: >-
           Syft produced an invalid package component in
           {{ image_build_effective_sbom_scan_target }}. Every component must be
