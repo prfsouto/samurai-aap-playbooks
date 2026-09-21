@@ -435,6 +435,8 @@
     - name: "[image_build] packer init (plugin install, idempotent)"
       ansible.builtin.command:
         argv: ["{{ image_build_packer_binary }}", "init", "{{ image_build_resolved_template_path }}"]
+      args:
+        chdir: "{{ image_build_run_dir }}"
       register: image_build_packer_init
       failed_when: false
       changed_when: false
@@ -451,6 +453,8 @@
       ansible.builtin.command:
         argv: >-
           {{ [image_build_packer_binary, 'validate'] + (image_build_var_args | default([])) + [image_build_resolved_template_path] }}
+      args:
+        chdir: "{{ image_build_run_dir }}"
       register: image_build_packer_validate
       failed_when: false
       changed_when: false
@@ -474,6 +478,8 @@
           {{ [image_build_packer_binary, 'build', '-color=false', '-machine-readable']
              + (image_build_var_args | default([]))
              + [image_build_resolved_template_path] }}
+      args:
+        chdir: "{{ image_build_run_dir }}"
       register: image_build_run
       # Do NOT abort on a non-zero exit here: the build log is mandatory
       # evidence (RFC-004 §17.1) and must be persisted EVEN when the build
