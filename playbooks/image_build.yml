@@ -26,7 +26,7 @@
       ansible.builtin.set_stats:
         data:
           samurai_execution_id: "{{ samurai_execution_id | default('') | string }}"
-          organization_id: "{{ organization_id | default('') }}"
+          organization_id: "{{ organization_id | default('') | string }}"
           # ── samurai.image_build_evidence/v1 (plano L2I §4.1) ──────────────
           # The role publishes the real values; the defaults below only cover
           # a role that never ran — an empty envelope the control plane
