@@ -244,6 +244,14 @@
         image_build_packer_vars: "{{ image_build_approved_packer_vars | combine(image_build_frozen_destination_packer_vars) }}"
       no_log: true
 
+    # Recipes approved before the destination contract do not declare
+    # aws_region; the region describes WHERE and belongs to the destination
+    # integration config, which the engine delivers as the flat extra var.
+    - name: "[image_build] Default the region from the destination integration"
+      ansible.builtin.set_fact:
+        image_build_packer_vars: "{{ image_build_packer_vars | combine({'aws_region': aws_region}) if ('aws_region' not in image_build_packer_vars) and ((aws_region | default('', true)) | length > 0) else image_build_packer_vars }}"
+      no_log: true
+
     - name: "[image_build] Hash the approved provisioner playbook"
       ansible.builtin.stat:
         path: "{{ image_build_run_dir }}/playbook.yml"
