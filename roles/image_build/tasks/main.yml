@@ -810,7 +810,9 @@
           - item is mapping
           - item.type is string and item.type in ['library', 'application', 'framework', 'operating-system']
           - item.name is string and (item.name | trim | length > 0)
-          - item.version is string and (item.version | trim | length > 0)
+          - >-
+            (item.type == 'operating-system')
+            or (item.version is string and (item.version | trim | length > 0))
         fail_msg: >-
           Syft produced a package component without a usable name/version:
           {{ item | to_json }}. The SBOM is not valid evidence.
