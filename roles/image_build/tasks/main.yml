@@ -382,6 +382,18 @@
         image_build_declared_vars: "{{ lookup('ansible.builtin.file', image_build_resolved_template_path) | regex_findall(image_build_variable_declaration_pattern) | unique }}"
       tags: [image_build, build]
 
+    - name: "[image_build] Refuse when the approved template does not declare the frozen destination"
+      ansible.builtin.assert:
+        that:
+          - image_build_frozen_destination_packer_vars.keys() | list | select('in', image_build_declared_vars) | list | length == (image_build_frozen_destination_packer_vars.keys() | list | length)
+        fail_msg: >-
+          O template aprovado nao declara as variaveis de rede congelada
+          (nao declaradas: {{ image_build_frozen_destination_packer_vars.keys() | list | difference(image_build_declared_vars) | sort }}).
+          O destino autorizado nao pode ser descartado nem substituido por
+          default do template: gere nova proposta com template que declare
+          o destino e refaca o plano (recusa antes do launch).
+      tags: [image_build, build]
+
     - name: "[image_build] Keep only declared vars and record what the template ignores"
       ansible.builtin.set_fact:
         image_build_skipped_vars: "{{ (image_build_packer_vars | dict2items | rejectattr('key', 'in', image_build_declared_vars) | map(attribute='key') | list) }}"
@@ -773,6 +785,16 @@
           format: cyclonedx-json
           component_count: "{{ image_build_sbom_component_count }}"
           path: "{{ image_build_run_dir }}/sbom.cyclonedx.json"
+
+    - name: "[image_build] Require real package inventory for this rootfs contract"
+      ansible.builtin.assert:
+        that:
+          - image_build_sbom_json.components | selectattr('type', 'equalto', 'library') | list | length > 0
+        fail_msg: >-
+          O SBOM do rootfs precisa conter inventario real de pacotes
+          (componentes library com versao) — documento apenas com metadados
+          de sistema operacional nao comprova os pacotes da imagem.
+      tags: [image_build, sbom]
 
     - name: "[image_build] Refuse an empty package inventory"
       ansible.builtin.assert:
