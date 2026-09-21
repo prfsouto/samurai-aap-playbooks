@@ -181,11 +181,34 @@
       # The presigned URL embeds a signature — never log it.
       no_log: true
 
+    - name: "[image_build] Locate the shared fingerprint script (source tree vs mirrored checkout)"
+      ansible.builtin.command:
+        argv:
+          - bash
+          - -c
+          - >-
+            for d in "{{ playbook_dir }}/../../shared" "{{ playbook_dir }}/../shared"; do
+            [ -f "$d/image_recipe_fingerprint.py" ] && printf '%s' "$d/image_recipe_fingerprint.py" && exit 0;
+            done; exit 1
+      register: image_build_fingerprint_script
+      changed_when: false
+
+    - name: "[image_build] Require the fingerprint script to exist"
+      ansible.builtin.assert:
+        that:
+          - image_build_fingerprint_script.rc == 0
+          - image_build_fingerprint_script.stdout | length > 0
+        fail_msg: >-
+          shared/image_recipe_fingerprint.py was not found beside the playbook
+          checkout (tried {{ playbook_dir }}/../../shared and
+          {{ playbook_dir }}/../shared). The AAP mirror manifest must ship it
+          (see .github/aap-mirror-paths.json).
+
     - name: "[image_build] Recompute the combined recipe sha256 (template \\x00 playbook \\x00 variables)"
       ansible.builtin.command:
         argv:
           - python3
-          - "{{ playbook_dir }}/../../shared/image_recipe_fingerprint.py"
+          - "{{ image_build_fingerprint_script.stdout }}"
           - "{{ image_build_run_dir }}/template.pkr.hcl"
           - "{{ image_build_run_dir }}/playbook.yml"
           - "{{ image_build_run_dir }}/variables.json"
