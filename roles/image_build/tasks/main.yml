@@ -379,7 +379,7 @@
 
     - name: "[image_build] List the variables the approved template actually declares"
       ansible.builtin.set_fact:
-        image_build_declared_vars: "{{ lookup('ansible.builtin.file', image_build_resolved_template_path) | regex_findall('variable\\s+"([^"]+)"') | unique }}"
+        image_build_declared_vars: "{{ lookup('ansible.builtin.file', image_build_resolved_template_path) | regex_findall(image_build_variable_declaration_pattern) | unique }}"
       tags: [image_build, build]
 
     - name: "[image_build] Keep only declared vars and record what the template ignores"
@@ -502,6 +502,7 @@
       tags: [image_build, build]
 
     - name: "[image_build] Default artifact id list after an earlier packer failure"
+
       ansible.builtin.set_fact:
         image_build_artifact_ids: []
       when: image_build_failure_stage is defined

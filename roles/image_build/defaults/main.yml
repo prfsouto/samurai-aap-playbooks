@@ -94,3 +94,8 @@ image_build_cve_scan_binary: "{{ samurai_cve_scan_binary | default('grype') }}"
 # confirmation loop, not the primary wait.
 image_build_describe_retries: "{{ samurai_image_build_describe_retries | default(12) }}"
 image_build_describe_delay: "{{ samurai_image_build_describe_delay | default(10) }}"
+
+# HCL variable declarations in the approved template — the role filters the
+# packer -var list to these (Packer hard-fails on undeclared -var, and the
+# approved variables.json legitimately carries governance-only entries).
+image_build_variable_declaration_pattern: 'variable\s+"([^"]+)"'
