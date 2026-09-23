@@ -109,3 +109,38 @@
     state: terminated
     wait: true
   tags: [decommission, terminate]
+
+- name: "[decommission] Require candidate teardown without a retained B backup"
+  ansible.builtin.assert:
+    that:
+      - samurai_cleanup_cloud_context.manifest.schema == 'samurai.aws-candidate-cleanup/v1'
+      - not (decommission_keep_snapshot | bool)
+    quiet: true
+  when:
+    - samurai_campaign_id is defined
+    - action | default('') == 'candidate_teardown'
+  tags: [decommission, data_sync, cleanup]
+
+- name: "[decommission] Delete exact candidate data volumes and prior root snapshots"
+  samurai_aws_candidate_cleanup:
+    manifest: "{{ samurai_cleanup_cloud_context.manifest }}"
+    region: "{{ region }}"
+    account_id: "{{ samurai_cleanup_cloud_context.account_id }}"
+    instance_id: "{{ old_server.instance_id }}"
+  delegate_to: localhost
+  register: samurai_candidate_artifact_cleanup
+  when:
+    - samurai_campaign_id is defined
+    - action | default('') == 'candidate_teardown'
+  tags: [decommission, data_sync, cleanup]
+
+- name: "[decommission] Publish candidate artifact absence"
+  ansible.builtin.set_stats:
+    data:
+      cloud_cleanup: "{{ samurai_candidate_artifact_cleanup.cloud_cleanup }}"
+    aggregate: false
+    per_host: false
+  when:
+    - samurai_campaign_id is defined
+    - action | default('') == 'candidate_teardown'
+  tags: [decommission, data_sync, cleanup]
