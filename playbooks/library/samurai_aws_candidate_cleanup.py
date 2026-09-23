@@ -10,6 +10,7 @@ from botocore.exceptions import ClientError, WaiterError
 _VOLUME = re.compile(r"vol-[0-9a-f]+")
 _SNAPSHOT = re.compile(r"snap-[0-9a-f]+")
 _DIGEST = re.compile(r"[0-9a-f]{64}")
+_ACCOUNT = re.compile(r"[0-9]{12}")
 _GIB = 1024 ** 3
 
 
@@ -58,13 +59,19 @@ def _optional_snapshot(ec2, snapshot_id):
 def _manifest(manifest, *, account_id, instance_id):
     _require(isinstance(manifest, dict) and manifest.get("schema") == "samurai.aws-candidate-cleanup/v1",
              "Candidate cleanup manifest is missing or unsupported")
+    manifest_account = manifest.get("account_id")
+    if type(manifest_account) is int:
+        manifest_account = str(manifest_account)
+    _require(isinstance(account_id, str) and _ACCOUNT.fullmatch(account_id)
+             and isinstance(manifest_account, str) and _ACCOUNT.fullmatch(manifest_account),
+             "Candidate cleanup account identity is invalid")
     _require(type(manifest.get("organization_id")) is int and manifest["organization_id"] > 0
              and type(manifest.get("campaign_id")) is int and manifest["campaign_id"] > 0
              and type(manifest.get("execution_id")) is int and manifest["execution_id"] > 0
              and type(manifest.get("candidate_managed_server_id")) is int
              and manifest["candidate_managed_server_id"] > 0,
              "Candidate cleanup identity is incomplete")
-    _require(manifest.get("account_id") == account_id and manifest.get("candidate_instance_id") == instance_id,
+    _require(manifest_account == account_id and manifest.get("candidate_instance_id") == instance_id,
              "Candidate cleanup account or instance changed")
     _require(type(manifest.get("plan_id")) is int and manifest["plan_id"] > 0
              and type(manifest.get("plan_revision")) is int and manifest["plan_revision"] > 0
