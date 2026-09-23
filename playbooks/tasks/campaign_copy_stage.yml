@@ -24,7 +24,7 @@
     timeout: 300
   register: campaign_open_stage
   until: not (campaign_open_stage.json.pending | default(false) | bool)
-  retries: 120
+  retries: "{{ 180 if campaign_copy_operation == 'open-seed' else 120 }}"
   delay: 5
   no_log: true
 
