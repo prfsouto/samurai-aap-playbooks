@@ -173,6 +173,12 @@ Safety model:
    Packs and Service Packs are only installed if `WU_CATEGORIES` asks for them.
 4. **Serial by default** (`SERIAL_BATCH=1`) so a wave never takes a whole fleet
    down at once.
+5. **A failed host fails in the PLAY RECAP** — the `rescue` recovers a failing
+   host so `summary.json` is still written, and a last play re-fails it once the
+   consolidated JSON is out. The engine grades each host by its recap line and
+   ignores `localhost`, so without that re-fail a failed update would count as a
+   success. It runs in its own play, not right after the block, because with
+   `serial: 1` a host failing inside play 2 stops the rest of the wave.
 
 The normal remediation call only needs `HOSTNAMES` + `ACTION`. Everything else
 (`ALLOW_REBOOT`, `WU_CATEGORIES`, `EXCLUDE_KB`, `WU_SERVER_SELECTION`,
