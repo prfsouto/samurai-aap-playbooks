@@ -17,7 +17,12 @@ A host that fails a gate or the update is recovered by `rescue` so its
 `summary.json` is still written, and a last play re-fails it after the
 consolidated JSON is out, so the PLAY RECAP grades it failed. The re-fail is not
 in the per-host play: with `serial: 1`, a failing host there would stop the rest
-of the wave. The apt playbook does the same.
+of the wave. For the same reason, fact gathering and the evidence directory run
+inside that `rescue` block. An unreachable host is recorded
+(`unreachable: true` in its summary) instead of aborting the batch, and the last
+play tries to reach it again, so a host that is still down shows as
+`unreachable` in the PLAY RECAP. `started_at` comes from the execution node's
+clock (UTC), like `finished_at`. The apt playbook does the same.
 
 ### linux_yum_targeted_package_update_with_evidence.yml
 
