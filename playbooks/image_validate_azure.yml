@@ -1,0 +1,7 @@
+---
+- name: Validate one Azure Gallery image on a disposable RHEL bench
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  roles:
+    - image_validate_azure

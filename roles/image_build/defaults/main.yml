@@ -29,6 +29,7 @@ image_build_organization_id: "{{ organization_id | default('') }}"
 # bytes, re-computes the combined sha256 and refuses to build on any mismatch
 # ("execução não relê um artefato mutável sem conferir o hash aprovado").
 image_build_artifact_read_urls: "{{ image_build.artifact_read_urls | default({}) }}"
+image_build_artifact_write_urls: "{{ image_build.artifact_write_urls | default({}) }}"
 image_build_proposal_artifact_sha256: "{{ image_build.proposal_artifact_sha256 | default('') }}"
 
 # ── Evidence destination (samurai.image_build_evidence/v1) ─────────────────
@@ -49,6 +50,9 @@ image_build_evidence_kms_key_id: "{{ image_build.evidence_kms_key_id | default('
 # publishes `status: stub` evidence, which the control plane REPROVES —
 # a stub can exercise the pipeline but can never become an ImageVersion draft.
 image_build_provider: "{{ samurai_image_build_provider | default('packer') }}"
+image_build_cloud_provider: "{{ image_build.cloud_provider | default('aws') }}"
+image_build_cloud_account_id: "{{ image_build.cloud_account_id | default('') }}"
+image_build_cloud_region: "{{ image_build.cloud_region | default('') }}"
 image_build_packer_binary: "{{ samurai_packer_binary | default('packer') }}"
 image_build_aws_cli_binary: "{{ samurai_aws_cli_binary | default('aws') }}"
 
@@ -94,6 +98,7 @@ image_build_cve_scan_binary: "{{ samurai_cve_scan_binary | default('grype') }}"
 # confirmation loop, not the primary wait.
 image_build_describe_retries: "{{ samurai_image_build_describe_retries | default(12) }}"
 image_build_describe_delay: "{{ samurai_image_build_describe_delay | default(10) }}"
+image_build_azure_proof_retries: "{{ samurai_image_build_azure_proof_retries | default(60) }}"
 
 # HCL variable declarations in the approved template — the role filters the
 # packer -var list to these (Packer hard-fails on undeclared -var, and the

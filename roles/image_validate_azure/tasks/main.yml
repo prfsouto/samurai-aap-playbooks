@@ -1,0 +1,76 @@
+---
+- name: Validate Azure bench authority
+  ansible.builtin.assert:
+    that:
+      - image_validate_run_mode | default('') in ['provision', 'teardown']
+      - image_validate.cloud_provider | default('') == 'azure'
+      - organization_id | string | regex_search('^[1-9][0-9]*$')
+      - samurai_execution_id | string | regex_search('^[A-Za-z0-9-]{1,40}$')
+      - image_validate.image_version_id | string | regex_search('^[1-9][0-9]*$')
+      - image_validate.azure_subscription_id | default('') | length > 0
+      - image_validate.azure_subnet_id | default('') | regex_search('(?i)^/subscriptions/[0-9a-f-]{36}/resourcegroups/[A-Za-z0-9._()-]+/providers/Microsoft.Network/virtualNetworks/[A-Za-z0-9._-]+/subnets/[A-Za-z0-9._-]+$')
+      - image_validate.region | default(region | default('')) | length > 0
+      - lookup('env', 'AZURE_CLIENT_ID') | length > 0
+      - lookup('env', 'AZURE_SECRET') | length > 0
+      - lookup('env', 'AZURE_TENANT') | length > 0
+      - lookup('env', 'AZURE_SUBSCRIPTION_ID') == image_validate.azure_subscription_id
+    fail_msg: Azure validation requires a scoped AAP Azure credential and frozen bench inputs.
+  no_log: true
+
+- name: Freeze Azure validation resource names
+  ansible.builtin.set_fact:
+    iv_region: "{{ image_validate.region | default(region | default('')) }}"
+    iv_subscription: "{{ image_validate.azure_subscription_id }}"
+    iv_subnet: "{{ image_validate.azure_subnet_id }}"
+    iv_resource_group: "{{ image_validate.azure_subnet_id.split('/')[4] }}"
+    iv_name: "samurai-iv-{{ organization_id }}-{{ samurai_execution_id }}"
+    iv_tags:
+      SamuraiOrganizationId: "{{ organization_id | string }}"
+      SamuraiExecutionId: "{{ samurai_execution_id | string }}"
+      SamuraiImageVersionId: "{{ image_validate.image_version_id | string }}"
+      managed_by: samurai-shield
+
+- name: Validate frozen Azure identifiers
+  ansible.builtin.assert:
+    that:
+      - iv_subnet | regex_search('(?i)^/subscriptions/[0-9a-f-]{36}/resourcegroups/[A-Za-z0-9._()-]+/providers/Microsoft.Network/virtualNetworks/[A-Za-z0-9._-]+/subnets/[A-Za-z0-9._-]+$')
+      - iv_subnet.split('/')[2] | lower == iv_subscription | lower
+      - iv_region | regex_search('^[a-z0-9]+$')
+      - iv_name | length <= 64
+    fail_msg: Azure validation subnet or resource identity differs from the frozen plan.
+
+- name: Set exact Azure resource identities
+  ansible.builtin.set_fact:
+    iv_vm_id: "/subscriptions/{{ iv_subscription }}/resourceGroups/{{ iv_resource_group }}/providers/Microsoft.Compute/virtualMachines/{{ iv_name }}"
+    iv_nic_id: "/subscriptions/{{ iv_subscription }}/resourceGroups/{{ iv_resource_group }}/providers/Microsoft.Network/networkInterfaces/{{ iv_name }}-nic"
+    iv_disk_id: "/subscriptions/{{ iv_subscription }}/resourceGroups/{{ iv_resource_group }}/providers/Microsoft.Compute/disks/{{ iv_name }}-os"
+
+- name: Obtain short lived Azure ARM token from the AAP credential
+  ansible.builtin.uri:
+    url: "https://login.microsoftonline.com/{{ lookup('env', 'AZURE_TENANT') }}/oauth2/v2.0/token"
+    method: POST
+    body_format: form-urlencoded
+    body:
+      grant_type: client_credentials
+      client_id: "{{ lookup('env', 'AZURE_CLIENT_ID') }}"
+      client_secret: "{{ lookup('env', 'AZURE_SECRET') }}"
+      scope: https://management.azure.com/.default
+    status_code: 200
+    return_content: true
+  register: iv_token
+  no_log: true
+
+- name: Require Azure ARM token
+  ansible.builtin.assert:
+    that:
+      - iv_token.json.access_token | default('') | length > 0
+    fail_msg: Azure ARM authentication did not return an access token.
+  no_log: true
+
+- name: Provision Azure validation bench
+  ansible.builtin.include_tasks: provision.yml
+  when: image_validate_run_mode == 'provision'
+
+- name: Tear down Azure validation bench
+  ansible.builtin.include_tasks: teardown.yml
+  when: image_validate_run_mode == 'teardown'

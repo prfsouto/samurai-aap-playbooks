@@ -1,0 +1,142 @@
+---
+- name: Refuse a recorded VM outside this validation identity
+  ansible.builtin.assert:
+    that:
+      - instance_id | default('') | length == 0 or instance_id | lower == iv_vm_id | lower
+    fail_msg: Azure teardown instance ID differs from the frozen execution.
+
+- name: Observe the exact Azure validation VM before deletion
+  ansible.builtin.uri:
+    url: "https://management.azure.com{{ iv_vm_id }}?api-version=2025-04-01"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ iv_token.json.access_token }}"
+    status_code: [200, 404]
+    return_content: true
+  register: iv_teardown_vm
+  no_log: true
+
+- name: Refuse teardown of a foreign Azure VM
+  ansible.builtin.assert:
+    that:
+      - iv_teardown_vm.json.id | lower == iv_vm_id | lower
+      - iv_teardown_vm.json.tags.SamuraiOrganizationId | default('') | string == organization_id | string
+      - iv_teardown_vm.json.tags.SamuraiExecutionId | default('') | string == samurai_execution_id | string
+      - iv_teardown_vm.json.tags.SamuraiImageVersionId | default('') | string == image_validate.image_version_id | string
+      - iv_teardown_vm.json.tags.managed_by | default('') == 'samurai-shield'
+      - iv_teardown_vm.json.properties.networkProfile.networkInterfaces[0].id | lower == iv_nic_id | lower
+    fail_msg: Azure teardown VM ownership or NIC differs from the validation plan.
+  when: iv_teardown_vm.status == 200
+
+- name: Delete only the owned Azure validation VM
+  ansible.builtin.uri:
+    url: "https://management.azure.com{{ iv_vm_id }}?api-version=2025-04-01"
+    method: DELETE
+    headers:
+      Authorization: "Bearer {{ iv_token.json.access_token }}"
+    status_code: [200, 202, 204, 404]
+  when: iv_teardown_vm.status == 200
+  no_log: true
+
+- name: Observe Azure VM absence after deletion
+  ansible.builtin.uri:
+    url: "https://management.azure.com{{ iv_vm_id }}?api-version=2025-04-01"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ iv_token.json.access_token }}"
+    status_code: [200, 404]
+  register: iv_vm_absent
+  until: iv_vm_absent.status == 404
+  retries: 60
+  delay: 10
+  no_log: true
+
+- name: Observe the exact Azure validation NIC before deletion
+  ansible.builtin.uri:
+    url: "https://management.azure.com{{ iv_nic_id }}?api-version=2025-05-01"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ iv_token.json.access_token }}"
+    status_code: [200, 404]
+    return_content: true
+  register: iv_teardown_nic
+  no_log: true
+
+- name: Refuse teardown of a foreign Azure NIC
+  ansible.builtin.assert:
+    that:
+      - iv_teardown_nic.json.id | lower == iv_nic_id | lower
+      - iv_teardown_nic.json.tags.SamuraiOrganizationId | default('') | string == organization_id | string
+      - iv_teardown_nic.json.tags.SamuraiExecutionId | default('') | string == samurai_execution_id | string
+      - iv_teardown_nic.json.tags.SamuraiImageVersionId | default('') | string == image_validate.image_version_id | string
+      - iv_teardown_nic.json.tags.managed_by | default('') == 'samurai-shield'
+      - iv_teardown_nic.json.properties.ipConfigurations[0].properties.subnet.id | lower == iv_subnet | lower
+    fail_msg: Azure teardown NIC ownership or subnet differs from the validation plan.
+  when: iv_teardown_nic.status == 200
+
+- name: Delete only the owned Azure validation NIC
+  ansible.builtin.uri:
+    url: "https://management.azure.com{{ iv_nic_id }}?api-version=2025-05-01"
+    method: DELETE
+    headers:
+      Authorization: "Bearer {{ iv_token.json.access_token }}"
+    status_code: [200, 202, 204, 404]
+  when: iv_teardown_nic.status == 200
+  no_log: true
+
+- name: Observe Azure NIC absence after deletion
+  ansible.builtin.uri:
+    url: "https://management.azure.com{{ iv_nic_id }}?api-version=2025-05-01"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ iv_token.json.access_token }}"
+    status_code: [200, 404]
+  register: iv_nic_absent
+  until: iv_nic_absent.status == 404
+  retries: 30
+  delay: 10
+  no_log: true
+
+- name: Observe Azure OS disk deletion by the VM delete policy
+  ansible.builtin.uri:
+    url: "https://management.azure.com{{ iv_disk_id }}?api-version=2025-01-02"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ iv_token.json.access_token }}"
+    status_code: [200, 404]
+  register: iv_disk_absent
+  until: iv_disk_absent.status == 404
+  retries: 60
+  delay: 10
+  no_log: true
+
+- name: Certify only observed Azure resource absence
+  ansible.builtin.assert:
+    that:
+      - iv_vm_absent.status == 404
+      - iv_nic_absent.status == 404
+      - iv_disk_absent.status == 404
+    fail_msg: Azure bench resources remain after teardown; no receipt can be issued.
+
+- name: Publish the Azure teardown receipt
+  ansible.builtin.set_stats:
+    data:
+      validation:
+        schema_version: samurai.image_validation_bench/v1
+        mode: teardown
+        cloud_provider: azure
+        organization_id: "{{ organization_id | string }}"
+        samurai_execution_id: "{{ samurai_execution_id | string }}"
+        instance_id: "{{ iv_vm_id }}"
+        region: "{{ iv_region }}"
+        teardown:
+          requested: true
+          confirmed: true
+          state: instance-deleted
+          resource_absent:
+            vm: true
+            nic: true
+            disk: true
+          confirmed_at: "{{ now(utc=True).isoformat() }}"
+    aggregate: false
+    per_host: false
