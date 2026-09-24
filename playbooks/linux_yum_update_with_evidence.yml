@@ -11,6 +11,8 @@
 #   1. Build dynamic in-memory inventory from HOSTNAMES (localhost play).
 #   2. Run pre-check, optional update and post-check on each target host.
 #   3. Emit a consolidated samurai_shield_result JSON block on stdout.
+#   4. Re-fail every host whose execution ended failed, so the PLAY RECAP
+#      grades it failed (#3037 C3, moved out of stage 2 by #47).
 #
 # Extra-vars contract — see ansible/playbooks/README_linux_yum_update_with_evidence.md
 # ============================================================================
@@ -637,18 +639,10 @@
             per_host: true
             aggregate: false
 
-    # #3037 (C3) — o rescue recupera o host para o `always` conseguir escrever
-    # a evidência estruturada; SEM este re-fail o host recuperado sairia
-    # `failed=0` no PLAY RECAP e o grading do Execution Center o contaria como
-    # sucesso (FAILED TARGETS ficava em 0 com o job reprovado). Depois da
-    # evidência publicada, o host falho volta a FALHAR — com o erro capturado
-    # legível no stdout, perto do recap.
-    - name: "Fail the host when execution ended failed (structured evidence already published)"
-      ansible.builtin.fail:
-        msg: >-
-          Remediation failed on {{ inventory_hostname }}:
-          {{ (samurai_errors | join(' | ')) if (samurai_errors | length) > 0 else 'see summary.json' }}
-      when: (execution_status | default('')) == 'failed'
+    # #47 — o re-fail do #3037 (C3) NÃO fica mais aqui: com `serial: 1`, um
+    # host re-falhado neste play fecha o batch como "inteiro falhado" e o
+    # ansible-core (PlaybookExecutor, break_play) interrompe a wave — os hosts
+    # seguintes e o play 3 não rodam. Ele foi movido para o play 4.
 
 
 - name: "SamurAI :: yum-update :: emit consolidated stdout JSON"
@@ -692,3 +686,22 @@
           samurai_shield_result: "{{ samurai_shield_result }}"
         aggregate: false
         per_host: false
+
+
+# #3037 (C3) — o rescue do play 2 recupera o host para o `always` conseguir
+# escrever a evidência estruturada; SEM este re-fail o host recuperado sairia
+# `failed=0` no PLAY RECAP e o grading do Execution Center o contaria como
+# sucesso (FAILED TARGETS ficava em 0 com o job reprovado). #47 — o re-fail
+# roda num play PRÓPRIO, depois do JSON consolidado, e não no play 2: aqui
+# cada host já passou pelo play 2 e o play 3 já emitiu o samurai_shield_result.
+# O erro capturado continua legível no stdout, perto do recap.
+- name: "SamurAI :: yum-update :: fail hosts whose execution ended failed"
+  hosts: samurai_yum_update_targets
+  gather_facts: false
+  tasks:
+    - name: "Fail the host when execution ended failed (structured evidence already published)"
+      ansible.builtin.fail:
+        msg: >-
+          Remediation failed on {{ inventory_hostname }}:
+          {{ (samurai_errors | join(' | ')) if (samurai_errors | default([]) | length) > 0 else 'see summary.json' }}
+      when: (execution_status | default('')) == 'failed'
