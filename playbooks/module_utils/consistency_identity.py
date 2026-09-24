@@ -30,19 +30,27 @@ def _resource_parts(value, kind):
 
 
 def _device_target(lun):
-    link = '/dev/disk/azure/scsi1/lun' + str(lun)
-    if not os.path.islink(link):
-        raise SourceIdentityRejected('Azure data disk LUN link is absent')
-    target = os.path.realpath(link)
-    try:
-        valid = (target.startswith('/dev/') and stat.S_ISBLK(os.stat(target).st_mode)
-                 and not os.path.exists('/sys/class/block/' + os.path.basename(target) + '/partition')
-                 and target != os.path.realpath('/dev/disk/azure/root'))
-    except OSError:
-        valid = False
-    if not valid:
-        raise SourceIdentityRejected('Azure data disk LUN does not resolve to a block device')
-    return target
+    links = ('/dev/disk/azure/scsi1/lun' + str(lun),
+             '/dev/disk/azure/data/by-lun/' + str(lun))
+    roots = {os.path.realpath(link) for link in ('/dev/disk/azure/root', '/dev/disk/azure/os')
+             if os.path.islink(link)}
+    targets = set()
+    for link in links:
+        if not os.path.islink(link):
+            continue
+        target = os.path.realpath(link)
+        try:
+            valid = (target.startswith('/dev/') and stat.S_ISBLK(os.stat(target).st_mode)
+                     and not os.path.exists('/sys/class/block/' + os.path.basename(target) + '/partition')
+                     and target not in roots)
+        except OSError:
+            valid = False
+        if not valid:
+            raise SourceIdentityRejected('Azure data disk LUN does not resolve to a data block device')
+        targets.add(target)
+    if len(targets) != 1:
+        raise SourceIdentityRejected('Azure data disk LUN link is absent or ambiguous')
+    return targets.pop()
 
 
 def azure_disk_bindings(compute, expected_instance, product_uuid, resolve=_device_target):
