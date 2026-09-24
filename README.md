@@ -13,6 +13,12 @@ Supported actions:
 - `Check`: validates the host and lists available updates without changing packages.
 - `Apply`: applies yum/dnf updates and collects before/after evidence.
 
+A host that fails a gate or the update is recovered by `rescue` so its
+`summary.json` is still written, and a last play re-fails it after the
+consolidated JSON is out, so the PLAY RECAP grades it failed. The re-fail is not
+in the per-host play: with `serial: 1`, a failing host there would stop the rest
+of the wave. The apt playbook does the same.
+
 ### linux_yum_targeted_package_update_with_evidence.yml
 
 The **targeted** sibling of the yum playbook. It updates only the packages
