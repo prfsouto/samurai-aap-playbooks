@@ -185,6 +185,12 @@ Safety model:
    ignores `localhost`, so without that re-fail a failed update would count as a
    success. It runs in its own play, not right after the block, because with
    `serial: 1` a host failing inside play 2 stops the rest of the wave.
+6. **One bad host never stops the wave** — fact gathering and the gates in
+   item 1 run inside the same `rescue` block, so a rejected host gets a
+   `status: failed` summary and the next host still runs. An unreachable host
+   is recorded (`unreachable: true` in its summary) instead of aborting the
+   batch; the last play tries to reach it again, so a host that is still down
+   shows as `unreachable` in the PLAY RECAP, not as a task failure.
 
 The normal remediation call only needs `HOSTNAMES` + `ACTION`. Everything else
 (`ALLOW_REBOOT`, `WU_CATEGORIES`, `EXCLUDE_KB`, `WU_SERVER_SELECTION`,

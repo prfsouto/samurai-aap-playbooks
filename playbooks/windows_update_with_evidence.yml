@@ -11,9 +11,11 @@
 # Stages:
 #   1. Build dynamic in-memory inventory from HOSTNAMES (localhost play).
 #   2. Run pre-check, optional update and post-check on each target host.
+#      Fact gathering and the pre-flight gates run inside the rescue block,
+#      so an unreachable or rejected host never stops the wave (#49).
 #   3. Emit a consolidated samurai_shield_result JSON block on stdout.
-#   4. Re-fail every host whose execution ended failed, so the PLAY RECAP
-#      grades it failed (#50).
+#   4. Re-check hosts that were unreachable (graded unreachable in the PLAY
+#      RECAP) and re-fail every host whose execution ended failed (#50).
 #
 # Extra-vars contract: HOSTNAMES (required), ACTION (Check|Apply, default
 # Check). Everything else is optional and has a working default, so the normal
@@ -153,7 +155,11 @@
 
 - name: "SamurAI :: windows-update :: pre-check, update and post-check"
   hosts: samurai_win_update_targets
-  gather_facts: true
+  # #49 — facts are gathered INSIDE the block (first task), not here. A host
+  # that failed or was unreachable at play-level fact gathering never reached
+  # the rescue; with `serial: 1` its batch closed as fully failed and
+  # ansible-core stopped the rest of the wave (and plays 3/4).
+  gather_facts: false
   serial: "{{ (SERIAL_BATCH | default('') | string | trim) or 1 }}"
   # Default OFF for the whole play: the pre/post-check win_shell/win_copy tasks
   # run as the connection user (a local admin) and need no elevation. Only the
@@ -216,59 +222,90 @@
 
   tasks:
 
-    # ------------------------------------------------------------------------
-    # Phase 1: Input + OS compatibility validation
-    # ------------------------------------------------------------------------
     - name: "Capture execution start timestamp (UTC, controller-side)"
       # lookup() always runs on the execution node (Linux), never on the target.
       ansible.builtin.set_fact:
         execution_started_at: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
         execution_timestamp: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
 
-    - name: "Fail when target OS family is not Windows"
-      ansible.builtin.fail:
-        msg: >-
-          Unsupported OS family '{{ ansible_os_family }}' on host {{ inventory_hostname }}.
-          This playbook only supports Windows targets reached over WinRM/PSRP.
-      when: ansible_os_family != 'Windows'
-
-    - name: "Inspect Windows Update service (wuauserv)"
-      ansible.windows.win_shell: |
-        $svc = Get-Service -Name wuauserv -ErrorAction SilentlyContinue
-        if (-not $svc) {
-            Write-Output "present=no"
-            exit 0
-        }
-        $wmi = Get-CimInstance -ClassName Win32_Service -Filter "Name='wuauserv'"
-        Write-Output "present=yes"
-        Write-Output ("status=" + $svc.Status)
-        Write-Output ("start_mode=" + $wmi.StartMode)
-      register: wuauserv_state
-      changed_when: false
-
-    - name: "Fail when the Windows Update service is missing or disabled"
-      ansible.builtin.fail:
-        msg: >-
-          Windows Update service (wuauserv) is not usable on {{ inventory_hostname }}:
-          {{ wuauserv_state.stdout | trim }}
-      when: >-
-        'present=no' in wuauserv_state.stdout
-        or 'start_mode=Disabled' in wuauserv_state.stdout
-
-    - name: "Build evidence directory path"
-      ansible.builtin.set_fact:
-        evidence_dir: "{{ wu_evidence_base }}\\{{ inventory_hostname }}\\{{ execution_timestamp }}"
-
-    - name: "Create evidence directory"
-      ansible.windows.win_file:
-        path: "{{ evidence_dir }}"
-        state: directory
-
     # ------------------------------------------------------------------------
-    # Phase 2: Pre-check (always runs, even when ACTION=Check)
+    # #49 — everything that touches the host lives INSIDE the block, including
+    # fact gathering and the pre-flight gates, so every per-host failure goes
+    # through rescue/always (summary + JSON) and is re-failed in play 4. A
+    # failure outside the rescue would close the `serial` batch as fully
+    # failed and stop the rest of the wave.
     # ------------------------------------------------------------------------
     - name: "Pre-check + optional update + post-check"
       block:
+
+        # ---- Phase 1: reachability + OS compatibility (pre-flight) ---------
+        # rescue does NOT catch an unreachable host, so the connection attempt
+        # ignores it and the next task turns it into a normal failure. With
+        # ignore_unreachable the host is not counted as unreachable for the
+        # batch; play 4 re-checks it so the recap still says unreachable.
+        - name: "Gather facts (an unreachable host is recorded, not fatal to the wave)"
+          ansible.builtin.setup:
+          ignore_unreachable: true
+          register: wu_facts
+
+        - name: "Record that the host was unreachable"
+          ansible.builtin.set_fact:
+            wu_unreachable: true
+          when: wu_facts.unreachable | default(false)
+
+        - name: "Fail when the host is unreachable"
+          ansible.builtin.fail:
+            msg: >-
+              Host {{ inventory_hostname }} is unreachable:
+              {{ wu_facts.msg | default('connection failed') }}
+          when: wu_unreachable | default(false)
+
+        - name: "Fail when target OS family is not Windows"
+          ansible.builtin.fail:
+            msg: >-
+              Unsupported OS family '{{ ansible_os_family }}' on host {{ inventory_hostname }}.
+              This playbook only supports Windows targets reached over WinRM/PSRP.
+          when: ansible_os_family != 'Windows'
+
+        - name: "Inspect Windows Update service (wuauserv)"
+          ansible.windows.win_shell: |
+            $svc = Get-Service -Name wuauserv -ErrorAction SilentlyContinue
+            if (-not $svc) {
+                Write-Output "present=no"
+                exit 0
+            }
+            $wmi = Get-CimInstance -ClassName Win32_Service -Filter "Name='wuauserv'"
+            Write-Output "present=yes"
+            Write-Output ("status=" + $svc.Status)
+            Write-Output ("start_mode=" + $wmi.StartMode)
+          register: wuauserv_state
+          changed_when: false
+
+        - name: "Fail when the Windows Update service is missing or disabled"
+          ansible.builtin.fail:
+            msg: >-
+              Windows Update service (wuauserv) is not usable on {{ inventory_hostname }}:
+              {{ wuauserv_state.stdout | trim }}
+          when: >-
+            'present=no' in wuauserv_state.stdout
+            or 'start_mode=Disabled' in wuauserv_state.stdout
+
+        - name: "Build evidence directory path"
+          ansible.builtin.set_fact:
+            evidence_dir: "{{ wu_evidence_base }}\\{{ inventory_hostname }}\\{{ execution_timestamp }}"
+
+        - name: "Create evidence directory"
+          ansible.windows.win_file:
+            path: "{{ evidence_dir }}"
+            state: directory
+
+        # The `always` writes summary.json only when the directory exists — an
+        # unreachable host or a failed gate must not fail again in `always`.
+        - name: "Mark evidence directory as ready"
+          ansible.builtin.set_fact:
+            evidence_dir_ready: true
+
+        # ---- Phase 2: pre-check (always runs, even when ACTION=Check) -----
 
         # ---- system info --------------------------------------------------
         - name: "Capture system info"
@@ -760,7 +797,8 @@
               allow_reboot_source: "{{ wu_reboot_source }}"
               rebooted: "{{ (reboot_action.rebooted | default(false)) | bool }}"
               failed_services_after: "{{ failed_services_list | default([]) }}"
-              evidence_dir: "{{ evidence_dir | default('not_created') }}"
+              evidence_dir: "{{ evidence_dir if (evidence_dir_ready | default(false)) else 'not_created' }}"
+              unreachable: "{{ wu_unreachable | default(false) | bool }}"
               started_at: "{{ execution_started_at }}"
               finished_at: "{{ execution_finished_at }}"
               status: "{{ execution_status }}"
@@ -771,7 +809,7 @@
           ansible.windows.win_copy:
             dest: "{{ evidence_dir }}\\summary.json"
             content: "{{ host_summary | to_nice_json }}\n"
-          when: evidence_dir is defined
+          when: evidence_dir_ready | default(false)
 
         - name: "Publish per-host summary as run stat"
           ansible.builtin.set_stats:
@@ -795,10 +833,12 @@
             | select('defined') | list
           }}
 
-    - name: "Detect targets that produced no summary (unreachable or failed a pre-flight gate)"
-      # A host that dies before the rescue/always block — unreachable, non-Windows,
-      # wuauserv disabled — never publishes host_summary. Without this it would
-      # silently disappear from the JSON and the run would still read 'completed'.
+    - name: "Detect targets that produced no summary"
+      # Safety net. Since #49 an unreachable host and the pre-flight gates
+      # (non-Windows, wuauserv disabled) go through rescue/always and DO
+      # publish host_summary (status=failed). A target can still end up here if
+      # it never reached play 2's block; without this it would silently
+      # disappear from the JSON and the run would still read 'completed'.
       ansible.builtin.set_fact:
         missing_hosts: >-
           {{
@@ -842,7 +882,7 @@
     # (PlaybookExecutor, break_play) não roda nenhum play seguinte — o play 4
     # abaixo nunca rodaria. O job continua reprovado: todo host contado em
     # consolidated_status == 'failed' já sai failed/unreachable no PLAY RECAP
-    # (re-fail do play 4, ou a própria falha de pre-flight no play 2).
+    # (re-fail e re-check de conectividade do play 4).
 
 
 # #50 / #3037 (C3) — o rescue do play 2 recupera o host para o `always`
@@ -856,8 +896,17 @@
 - name: "SamurAI :: windows-update :: fail hosts whose execution ended failed"
   hosts: samurai_win_update_targets
   gather_facts: false
-  become: false  # only evaluates play-2 facts; nothing runs on the target
+  become: false  # win_ping only; the rest evaluates play-2 facts
   tasks:
+    # #49 — the play-2 connection attempt ignored `unreachable` so the wave
+    # could go on. Try again here, WITHOUT ignoring it: a host that is still
+    # down is graded `unreachable` in the PLAY RECAP (what the AAP failure
+    # analyst keys HOST_UNREACHABLE on), not a generic task failure. A host
+    # that answers now still ended failed and is re-failed by the next task.
+    - name: "Re-check hosts that were unreachable in play 2"
+      ansible.windows.win_ping:
+      when: wu_unreachable | default(false) | bool
+
     - name: "Fail the host when execution ended failed (structured evidence already published)"
       ansible.builtin.fail:
         msg: >-
