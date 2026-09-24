@@ -29,6 +29,10 @@
     - name: Pin the verified source Python for this job
       ansible.builtin.set_fact:
         ansible_python_interpreter: "{{ consistency_python.stdout | trim }}"
+    - name: Reject an extra-variable interpreter override
+      ansible.builtin.assert:
+        that:
+          - ansible_python_interpreter == (consistency_python.stdout | trim)
     - name: Require the frozen source command
       ansible.builtin.assert:
         that:
