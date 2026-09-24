@@ -1,0 +1,202 @@
+---
+- name: Require an exact Gallery image and private SSH bootstrap
+  ansible.builtin.assert:
+    that:
+      - image_validate.image_ref | default('') | regex_search('(?i)^/subscriptions/[0-9a-f-]{36}/resourcegroups/[A-Za-z0-9._()-]+/providers/Microsoft.Compute/galleries/[A-Za-z0-9._-]+/images/[A-Za-z0-9._-]+/versions/[0-9]+\.[0-9]+\.[0-9]+$')
+      - image_validate.image_ref.split('/')[2] | lower == iv_subscription | lower
+      - image_validate.azure_vm_size | default('') | regex_search('^Standard_[A-Za-z0-9_]+$')
+      - image_validate.ssh_username | default('') | regex_search('^[A-Za-z_][A-Za-z0-9._-]*$')
+      - image_validate.ssh_public_key | default('') | regex_search('^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp(256|384|521)) [A-Za-z0-9+/=]+$')
+    fail_msg: Azure bench requires a frozen Gallery version, size and public SSH key.
+
+- name: Observe any preexisting Azure validation NIC
+  ansible.builtin.uri:
+    url: "https://management.azure.com{{ iv_nic_id }}?api-version=2025-05-01"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ iv_token.json.access_token }}"
+    status_code: [200, 404]
+    return_content: true
+  register: iv_existing_nic
+  no_log: true
+
+- name: Refuse a NIC owned by another execution or subnet
+  ansible.builtin.assert:
+    that:
+      - iv_existing_nic.json.id | lower == iv_nic_id | lower
+      - iv_existing_nic.json.tags.SamuraiOrganizationId | default('') | string == organization_id | string
+      - iv_existing_nic.json.tags.SamuraiExecutionId | default('') | string == samurai_execution_id | string
+      - iv_existing_nic.json.tags.SamuraiImageVersionId | default('') | string == image_validate.image_version_id | string
+      - iv_existing_nic.json.tags.managed_by | default('') == 'samurai-shield'
+      - iv_existing_nic.json.properties.ipConfigurations[0].properties.subnet.id | lower == iv_subnet | lower
+    fail_msg: Existing Azure validation NIC has foreign ownership or topology.
+  when: iv_existing_nic.status == 200
+
+- name: Create the private Azure validation NIC
+  ansible.builtin.uri:
+    url: "https://management.azure.com{{ iv_nic_id }}?api-version=2025-05-01"
+    method: PUT
+    headers:
+      Authorization: "Bearer {{ iv_token.json.access_token }}"
+    body_format: json
+    body:
+      location: "{{ iv_region }}"
+      tags: "{{ iv_tags }}"
+      properties:
+        ipConfigurations:
+          - name: primary
+            properties:
+              privateIPAllocationMethod: Dynamic
+              subnet:
+                id: "{{ iv_subnet }}"
+    status_code: [200, 201, 202]
+    return_content: true
+  when: iv_existing_nic.status == 404
+  no_log: true
+
+- name: Wait for the exact Azure validation NIC
+  ansible.builtin.uri:
+    url: "https://management.azure.com{{ iv_nic_id }}?api-version=2025-05-01"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ iv_token.json.access_token }}"
+    status_code: [200, 404]
+    return_content: true
+  register: iv_nic_observed
+  until: >-
+    iv_nic_observed.status == 200 and
+    iv_nic_observed.json.properties.provisioningState | default('') == 'Succeeded'
+  retries: 30
+  delay: 10
+  no_log: true
+
+- name: Observe any preexisting Azure validation VM
+  ansible.builtin.uri:
+    url: "https://management.azure.com{{ iv_vm_id }}?api-version=2025-04-01"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ iv_token.json.access_token }}"
+    status_code: [200, 404]
+    return_content: true
+  register: iv_existing_vm
+  no_log: true
+
+- name: Refuse a VM owned by another execution or image
+  ansible.builtin.assert:
+    that:
+      - iv_existing_vm.json.id | lower == iv_vm_id | lower
+      - iv_existing_vm.json.tags.SamuraiOrganizationId | default('') | string == organization_id | string
+      - iv_existing_vm.json.tags.SamuraiExecutionId | default('') | string == samurai_execution_id | string
+      - iv_existing_vm.json.tags.SamuraiImageVersionId | default('') | string == image_validate.image_version_id | string
+      - iv_existing_vm.json.tags.managed_by | default('') == 'samurai-shield'
+      - iv_existing_vm.json.properties.storageProfile.imageReference.id | lower == image_validate.image_ref | lower
+      - iv_existing_vm.json.properties.networkProfile.networkInterfaces[0].id | lower == iv_nic_id | lower
+    fail_msg: Existing Azure validation VM has foreign ownership or lineage.
+  when: iv_existing_vm.status == 200
+
+- name: Create the disposable Azure validation VM
+  ansible.builtin.uri:
+    url: "https://management.azure.com{{ iv_vm_id }}?api-version=2025-04-01"
+    method: PUT
+    headers:
+      Authorization: "Bearer {{ iv_token.json.access_token }}"
+    body_format: json
+    body:
+      location: "{{ iv_region }}"
+      tags: "{{ iv_tags }}"
+      properties:
+        hardwareProfile:
+          vmSize: "{{ image_validate.azure_vm_size }}"
+        storageProfile:
+          imageReference:
+            id: "{{ image_validate.image_ref }}"
+          osDisk:
+            name: "{{ iv_name }}-os"
+            createOption: FromImage
+            deleteOption: Delete
+            managedDisk:
+              storageAccountType: Premium_LRS
+        osProfile:
+          computerName: "{{ iv_name }}"
+          adminUsername: "{{ image_validate.ssh_username }}"
+          linuxConfiguration:
+            disablePasswordAuthentication: true
+            ssh:
+              publicKeys:
+                - path: "/home/{{ image_validate.ssh_username }}/.ssh/authorized_keys"
+                  keyData: "{{ image_validate.ssh_public_key }}"
+        networkProfile:
+          networkInterfaces:
+            - id: "{{ iv_nic_id }}"
+              properties:
+                primary: true
+                deleteOption: Delete
+    status_code: [200, 201, 202]
+    return_content: true
+  when: iv_existing_vm.status == 404
+  no_log: true
+
+- name: Wait for the exact Azure validation VM
+  ansible.builtin.uri:
+    url: "https://management.azure.com{{ iv_vm_id }}?api-version=2025-04-01"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ iv_token.json.access_token }}"
+    status_code: [200, 404]
+    return_content: true
+  register: iv_vm_observed
+  until: >-
+    iv_vm_observed.status == 200 and
+    iv_vm_observed.json.properties.provisioningState | default('') == 'Succeeded'
+  retries: 60
+  delay: 10
+  no_log: true
+
+- name: Observe the assigned private address
+  ansible.builtin.uri:
+    url: "https://management.azure.com{{ iv_nic_id }}?api-version=2025-05-01"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ iv_token.json.access_token }}"
+    status_code: 200
+    return_content: true
+  register: iv_nic_ready
+  until: >-
+    iv_nic_ready.json.properties.ipConfigurations[0].properties.privateIPAddress
+    | default('') | length > 0
+  retries: 30
+  delay: 10
+  no_log: true
+
+- name: Confirm Azure validation VM ownership after provisioning
+  ansible.builtin.assert:
+    that:
+      - iv_vm_observed.json.id | lower == iv_vm_id | lower
+      - iv_vm_observed.json.tags.SamuraiOrganizationId | default('') | string == organization_id | string
+      - iv_vm_observed.json.tags.SamuraiExecutionId | default('') | string == samurai_execution_id | string
+      - iv_vm_observed.json.tags.SamuraiImageVersionId | default('') | string == image_validate.image_version_id | string
+      - iv_vm_observed.json.properties.storageProfile.imageReference.id | lower == image_validate.image_ref | lower
+      - iv_nic_ready.json.id | lower == iv_nic_id | lower
+      - iv_nic_ready.json.properties.ipConfigurations[0].properties.publicIPAddress | default(None) == None
+    fail_msg: Azure bench identity or private network differs after creation.
+
+- name: Publish the governed Azure bench identity
+  ansible.builtin.set_stats:
+    data:
+      validation:
+        schema_version: samurai.image_validation_bench/v1
+        mode: provision
+        cloud_provider: azure
+        organization_id: "{{ organization_id | string }}"
+        samurai_execution_id: "{{ samurai_execution_id | string }}"
+        build_id: "{{ build_id | default('') | string }}"
+        validation_id: "{{ validation_id | default('') | string }}"
+        correlation_id: "{{ correlation_id | default('') | string }}"
+        instance_id: "{{ iv_vm_id }}"
+        private_ip: "{{ iv_nic_ready.json.properties.ipConfigurations[0].properties.privateIPAddress }}"
+        region: "{{ iv_region }}"
+        image_ref: "{{ image_validate.image_ref }}"
+        tags: "{{ iv_tags }}"
+        bench_ready: true
+    aggregate: false
+    per_host: false

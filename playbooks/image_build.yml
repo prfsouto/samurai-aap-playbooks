@@ -33,7 +33,7 @@
           # reproves (no draft), which is exactly the intended outcome.
           schema_version: "samurai.image_build_evidence/v1"
           image_ref: "{{ image_ref | default('') }}"
-          cloud_provider: "{{ (image_build_provider | default('packer') == 'packer') | ternary('aws', 'stub') }}"
+          cloud_provider: "{{ (image_build.cloud_provider | default('aws')) if (image_build_provider | default('packer')) == 'packer' else 'stub' }}"
           region: "{{ image_build_region | default('') }}"
           template_hash: "{{ template_hash | default('') }}"
           base_image: "{{ base_image | default('') }}"

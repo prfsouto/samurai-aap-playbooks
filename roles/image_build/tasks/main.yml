@@ -45,6 +45,7 @@
       - image_build_family | length > 0
       - image_build_base_image | length > 0
       - image_build_provider in ['packer', 'stub']
+      - image_build_cloud_provider in ['aws', 'azure']
     fail_msg: >-
       image_build requires samurai_execution_id, organization_id,
       image_build.template_path, image_build.family and
@@ -52,6 +53,37 @@
       'stub' (got template_path={{ image_build_template_path }},
       family={{ image_build_family }}, base_image={{ image_build_base_image }},
       provider={{ image_build_provider }}).
+  tags: [image_build]
+
+- name: "[image_build] Verify Azure authority came from the AAP credential"
+  ansible.builtin.assert:
+    that:
+      - image_build_cloud_account_id | string | length > 0
+      - image_build_cloud_region | string | length > 0
+      - lookup('ansible.builtin.env', 'AZURE_SUBSCRIPTION_ID') == image_build_cloud_account_id
+      - lookup('ansible.builtin.env', 'AZURE_CLIENT_ID') | length > 0
+      - lookup('ansible.builtin.env', 'AZURE_SECRET') | length > 0
+      - lookup('ansible.builtin.env', 'AZURE_TENANT') | length > 0
+    fail_msg: "Azure image build needs the versioned AAP credential for its frozen Cloud Target."
+  when:
+    - image_build_provider == 'packer'
+    - image_build_cloud_provider == 'azure'
+  no_log: true
+  tags: [image_build]
+
+- name: "[image_build] Require four scoped Azure evidence upload grants"
+  ansible.builtin.assert:
+    that:
+      - image_build_artifact_write_urls is mapping
+      - >-
+        (image_build_artifact_write_urls.keys() | list | sort) ==
+        (['build.log', 'sbom.cyclonedx.json', 'scan.grype.json', 'describe_images.json'] | sort)
+      - image_build_artifact_write_urls.values() | list | select('match', '^https://') | list | length == 4
+    fail_msg: "Azure image build has no exact evidence upload grants."
+  when:
+    - image_build_provider == 'packer'
+    - image_build_cloud_provider == 'azure'
+  no_log: true
   tags: [image_build]
 
 # Real builds carry the FULL v1 evidence contract — refuse up front when the
@@ -228,14 +260,33 @@
         fail_msg: "The approved variables artifact must contain a JSON object."
       no_log: true
 
+    - name: "[image_build] Refuse credential values in approved Azure variables"
+      ansible.builtin.assert:
+        that:
+          - >-
+            (image_build_approved_packer_vars.keys() | list
+             | intersect(['azure_client_secret', 'client_secret', 'azure_tenant_id',
+                          'tenant_id', 'azure_client_id', 'client_id',
+                          'azure_subscription_id', 'subscription_id']) | length) == 0
+        fail_msg: "Azure cloud identity must come from the AAP credential, not approved recipe variables."
+      when: image_build_cloud_provider == 'azure'
+      no_log: true
+
     - name: "[image_build] Validate the frozen destination variable overlay"
       ansible.builtin.assert:
         that:
           - image_build_frozen_destination_packer_vars is mapping
-          - (image_build_frozen_destination_packer_vars.keys() | difference(['vpc_id', 'subnet_id', 'associate_public_ip_address']) | list | length) == 0
+          - >-
+            (image_build_frozen_destination_packer_vars.keys()
+             | difference(['azure_region', 'azure_subscription_id']
+                          if image_build_cloud_provider == 'azure'
+                          else ['vpc_id', 'subnet_id', 'associate_public_ip_address'])
+             | list | length) == 0
           - image_build_frozen_destination_packer_vars.vpc_id is not defined or image_build_frozen_destination_packer_vars.vpc_id is string
           - image_build_frozen_destination_packer_vars.subnet_id is not defined or image_build_frozen_destination_packer_vars.subnet_id is string
           - image_build_frozen_destination_packer_vars.associate_public_ip_address is not defined or image_build_frozen_destination_packer_vars.associate_public_ip_address is boolean
+          - image_build_frozen_destination_packer_vars.azure_region is not defined or image_build_frozen_destination_packer_vars.azure_region is string
+          - image_build_frozen_destination_packer_vars.azure_subscription_id is not defined or image_build_frozen_destination_packer_vars.azure_subscription_id is string
         fail_msg: "The frozen build destination contains unsupported Packer variables."
       no_log: true
 
@@ -376,13 +427,17 @@
           - "{{ image_build_packer_vars.base_image_filter | default('') }}"
       register: image_build_source_identity
       changed_when: false
-      when: (image_build_source_template.content | b64decode) is search('variable\\s+"resolved_source_ami"')
+      when:
+        - image_build_cloud_provider == 'aws'
+        - (image_build_source_template.content | b64decode) is search('variable\\s+"resolved_source_ami"')
       tags: [image_build, build]
 
     - name: "[image_build] Pin the resolved AMI and its root together"
       ansible.builtin.set_fact:
         image_build_packer_vars: "{{ image_build_packer_vars | combine(image_build_source_identity.stdout | from_json) }}"
-      when: not (image_build_source_identity.skipped | default(false))
+      when:
+        - image_build_cloud_provider == 'aws'
+        - not (image_build_source_identity.skipped | default(false))
       tags: [image_build, build]
 
     - name: "[image_build] List the variables the approved template actually declares"
@@ -553,14 +608,18 @@
     - name: "[image_build] Split the artifact id into region and image_ref"
       ansible.builtin.set_fact:
         image_build_primary_artifact: "{{ (image_build_artifact_ids | last).split(',') | first }}"
-      when: image_build_failure_stage is not defined
+      when:
+        - image_build_cloud_provider == 'aws'
+        - image_build_failure_stage is not defined
       tags: [image_build, build]
 
     - name: "[image_build] Split primary artifact fields"
       ansible.builtin.set_fact:
         image_build_primary_artifact_region: "{{ image_build_primary_artifact.split(':') | first if ':' in image_build_primary_artifact else '' }}"
         image_build_primary_artifact_image_ref: "{{ image_build_primary_artifact.split(':') | last if ':' in image_build_primary_artifact else '' }}"
-      when: image_build_failure_stage is not defined
+      when:
+        - image_build_cloud_provider == 'aws'
+        - image_build_failure_stage is not defined
       tags: [image_build, build]
 
     - name: "[image_build] Mark artifact parsing failure when artifact id shape is invalid"
@@ -572,12 +631,53 @@
           determine the AMI region and bare image_ref for the v1 evidence
           contract.
       when: >-
-        image_build_failure_stage is not defined
+        image_build_cloud_provider == 'aws'
+        and image_build_failure_stage is not defined
         and (
           (image_build_primary_artifact_region | length == 0)
           or not (image_build_primary_artifact_image_ref is match('^ami-[0-9a-f]{8,}$'))
         )
       tags: [image_build, build]
+
+    - name: "[image_build] Verify the Packer Gallery artifact with Azure ARM"
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ playbook_dir }}/module_utils/azure_gallery_build_proof.py"
+          - --packer-output
+          - "{{ image_build_run_dir }}/build.log"
+          - --subscription
+          - "{{ image_build_cloud_account_id }}"
+          - --region
+          - "{{ image_build_cloud_region }}"
+          - --organization-id
+          - "{{ image_build_organization_id | string }}"
+          - --execution-id
+          - "{{ samurai_execution_id | string }}"
+          - --output
+          - "{{ image_build_run_dir }}/describe_images.json"
+      register: image_build_azure_proof_run
+      changed_when: false
+      failed_when: false
+      retries: "{{ image_build_azure_proof_retries | int }}"
+      delay: "{{ image_build_describe_delay | int }}"
+      until: image_build_azure_proof_run.rc == 0
+      when:
+        - image_build_cloud_provider == 'azure'
+        - image_build_failure_stage is not defined
+      no_log: true
+      tags: [image_build, build, describe]
+
+    - name: "[image_build] Mark Azure Gallery proof failure"
+      ansible.builtin.set_fact:
+        image_build_failure_stage: azure_proof
+        image_build_failure_message: >-
+          {{ image_build_azure_proof_run.stderr | default('Azure Gallery proof did not complete') | trim }}
+      when:
+        - image_build_cloud_provider == 'azure'
+        - image_build_failure_stage is not defined
+        - image_build_azure_proof_run.rc | default(1) != 0
+      tags: [image_build, build, describe]
 
     - name: "[image_build] Upload build.log after packer/parsing failure"
       ansible.builtin.command:
@@ -599,8 +699,39 @@
           - text/plain
       register: image_build_failure_log_upload
       failed_when: false
-      when: (image_build_failure_stage | default('')) in ['packer_init', 'packer_validate', 'packer_build', 'artifact_parse']
+      when:
+        - image_build_cloud_provider == 'aws'
+        - (image_build_failure_stage | default('')) in ['packer_init', 'packer_validate', 'packer_build', 'artifact_parse']
       changed_when: (image_build_failure_log_upload.rc | default(1)) == 0
+      tags: [image_build, build, evidence]
+
+    - name: "[image_build] Upload Azure build.log through its scoped grant after failure"
+      ansible.builtin.uri:
+        url: "{{ image_build_artifact_write_urls['build.log'] }}"
+        method: PUT
+        src: "{{ image_build_run_dir }}/build.log"
+        headers:
+          Content-Type: text/plain
+          x-amz-server-side-encryption: "aws:kms"
+          x-amz-server-side-encryption-aws-kms-key-id: "{{ image_build_evidence_kms_key_id }}"
+        status_code: [200]
+      register: image_build_azure_failure_upload
+      failed_when: false
+      changed_when: image_build_azure_failure_upload.status | default(0) == 200
+      when:
+        - image_build_cloud_provider == 'azure'
+        - image_build_failure_stage is defined
+      no_log: true
+      tags: [image_build, build, evidence]
+
+    - name: "[image_build] Normalize Azure failure-log receipt"
+      ansible.builtin.set_fact:
+        image_build_failure_log_upload:
+          rc: "{{ 0 if image_build_azure_failure_upload.status | default(0) == 200 else 1 }}"
+          stderr: "Azure evidence upload was not confirmed"
+      when:
+        - image_build_cloud_provider == 'azure'
+        - image_build_failure_stage is defined
       tags: [image_build, build, evidence]
 
     - name: "[image_build] Fail loud after packer/parsing failure and log upload attempt"
@@ -625,7 +756,17 @@
         # build.log on disk (stdout then stderr) — so the excerpt and the
         # persisted file agree, and a failure's stderr shows up here too.
         build_log_url: "{{ ((image_build_run.stdout_lines | default([])) + (image_build_run.stderr_lines | default([])))[-(image_build_log_tail_lines | int):] | join('\n') }}"
+      when: image_build_cloud_provider == 'aws'
       tags: [image_build, build]
+
+    - name: "[image_build] Record verified Azure Gallery image identity"
+      ansible.builtin.set_fact:
+        image_build_azure_proof: "{{ image_build_azure_proof_run.stdout | from_json }}"
+        image_ref: "{{ (image_build_azure_proof_run.stdout | from_json).image_id }}"
+        image_build_region: "{{ image_build_cloud_region }}"
+        build_log_url: "{{ ((image_build_run.stdout_lines | default([])) + (image_build_run.stderr_lines | default([])))[-(image_build_log_tail_lines | int):] | join('\n') }}"
+      when: image_build_cloud_provider == 'azure'
+      tags: [image_build, build, describe]
   tags: [image_build, build]
 
 - name: "[image_build] Record build finish timestamp (UTC)"
@@ -938,7 +1079,9 @@
 # aws CLI — no credential in extra_vars.
 # ─────────────────────────────────────────────────────────────────────────────
 - name: "[image_build] Confirm the built AMI via DescribeImages"
-  when: image_build_provider == 'packer'
+  when:
+    - image_build_provider == 'packer'
+    - image_build_cloud_provider == 'aws'
   block:
     - name: "[image_build] Check for the aws CLI on PATH"
       ansible.builtin.command:
@@ -1077,7 +1220,28 @@
       loop: "{{ image_build_evidence_stats.results }}"
       loop_control:
         label: "{{ item.item }}"
+      when: image_build_cloud_provider == 'aws'
       changed_when: true
+
+    - name: "[image_build] PUT each Azure artifact through its scoped grant"
+      ansible.builtin.uri:
+        url: "{{ image_build_artifact_write_urls[item.item] }}"
+        method: PUT
+        src: "{{ image_build_run_dir }}/{{ item.item }}"
+        headers:
+          Content-Type: "{{ 'application/json' if item.item.endswith('.json') else 'text/plain' }}"
+          x-amz-server-side-encryption: "aws:kms"
+          x-amz-server-side-encryption-aws-kms-key-id: "{{ image_build_evidence_kms_key_id }}"
+        status_code: [200]
+      loop: "{{ image_build_evidence_stats.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      register: image_build_azure_upload
+      retries: 3
+      delay: 5
+      until: image_build_azure_upload.status | default(0) == 200
+      when: image_build_cloud_provider == 'azure'
+      no_log: true
 
     - name: "[image_build] Record the evidence references (S3 URI + sha256)"
       ansible.builtin.set_fact:
@@ -1100,14 +1264,19 @@
                'uri': 's3://' ~ image_build_evidence_s3_bucket ~ '/' ~ image_build_evidence_s3_prefix ~ '/scan.grype.json',
                'sha256': image_build_evidence_sha256['scan.grype.json'],
              }) }}
-        describe_images:
-          uri: "s3://{{ image_build_evidence_s3_bucket }}/{{ image_build_evidence_s3_prefix }}/describe_images.json"
-          sha256: "{{ image_build_evidence_sha256['describe_images.json'] }}"
-          image_id: "{{ image_build_described.ImageId }}"
-          state: "{{ image_build_described.State }}"
-          owner_id: "{{ image_build_described.OwnerId }}"
-          region: "{{ image_build_region }}"
-          execution_tag_verified: true
+        describe_images: >-
+          {{ (image_build_azure_proof | combine({
+               'uri': 's3://' ~ image_build_evidence_s3_bucket ~ '/' ~ image_build_evidence_s3_prefix ~ '/describe_images.json',
+               'sha256': image_build_evidence_sha256['describe_images.json'],
+             })) if image_build_cloud_provider == 'azure' else {
+               'uri': 's3://' ~ image_build_evidence_s3_bucket ~ '/' ~ image_build_evidence_s3_prefix ~ '/describe_images.json',
+               'sha256': image_build_evidence_sha256['describe_images.json'],
+               'image_id': image_build_described.ImageId,
+               'state': image_build_described.State,
+               'owner_id': image_build_described.OwnerId,
+               'region': image_build_region,
+               'execution_tag_verified': true,
+             } }}
   tags: [image_build, evidence]
 
 - name: "[image_build] Record stub evidence references (control plane reproves these)"
@@ -1140,7 +1309,7 @@
       # ── samurai.image_build_evidence/v1 (plano L2I §4.1) ──────────────────
       schema_version: "samurai.image_build_evidence/v1"
       image_ref: "{{ image_ref }}"
-      cloud_provider: "{{ 'aws' if image_build_provider == 'packer' else 'stub' }}"
+      cloud_provider: "{{ image_build_cloud_provider if image_build_provider == 'packer' else 'stub' }}"
       region: "{{ image_build_region | default('') }}"
       template_hash: "{{ template_hash }}"
       base_image: "{{ base_image }}"
