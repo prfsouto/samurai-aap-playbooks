@@ -22,7 +22,12 @@ inside that `rescue` block. An unreachable host is recorded
 (`unreachable: true` in its summary) instead of aborting the batch, and the last
 play tries to reach it again, so a host that is still down shows as
 `unreachable` in the PLAY RECAP. `started_at` comes from the execution node's
-clock (UTC), like `finished_at`. The apt playbook does the same.
+clock (UTC), like `finished_at`. The long, repo-bound tasks (`check-update`,
+the update itself) also tolerate a dropped connection and turn it into a
+failure that `rescue` handles. If `summary.json` cannot be written, the host
+ends `failed` instead of failing inside `always`. In both cases the wave goes
+on. A connection drop in any other, short task still stops the wave. The apt
+playbook does the same, for its index refreshes and the upgrade.
 
 ### linux_yum_targeted_package_update_with_evidence.yml
 
@@ -195,7 +200,10 @@ Safety model:
    `status: failed` summary and the next host still runs. An unreachable host
    is recorded (`unreachable: true` in its summary) instead of aborting the
    batch; the last play tries to reach it again, so a host that is still down
-   shows as `unreachable` in the PLAY RECAP, not as a task failure.
+   shows as `unreachable` in the PLAY RECAP, not as a task failure. The same
+   applies to a host that drops during a `win_updates` call, and a host whose
+   `summary.json` cannot be written ends `failed`. A connection drop in any
+   other, short task still stops the wave.
 
 The normal remediation call only needs `HOSTNAMES` + `ACTION`. Everything else
 (`ALLOW_REBOOT`, `WU_CATEGORIES`, `EXCLUDE_KB`, `WU_SERVER_SELECTION`,

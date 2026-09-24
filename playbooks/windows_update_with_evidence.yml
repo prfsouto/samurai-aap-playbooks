@@ -12,7 +12,9 @@
 #   1. Build dynamic in-memory inventory from HOSTNAMES (localhost play).
 #   2. Run pre-check, optional update and post-check on each target host.
 #      Fact gathering and the pre-flight gates run inside the rescue block,
-#      so an unreachable or rejected host never stops the wave (#49).
+#      so an unreachable or rejected host never stops the wave (#49). A host
+#      that drops during a win_updates call, or whose summary.json cannot
+#      be written, also ends `failed` without stopping the wave (#56).
 #   3. Emit a consolidated samurai_shield_result JSON block on stdout.
 #   4. Re-check hosts that were unreachable (graded unreachable in the PLAY
 #      RECAP) and re-fail every host whose execution ended failed (#50).
@@ -435,6 +437,11 @@
           when: reboot_required_before == 'required'
 
         # ---- updates available before ------------------------------------
+        # #56 — the win_updates calls are the long ones (a single WinRM call
+        # can last a long time), where a dropped connection is likely. rescue
+        # does NOT catch an unreachable host (and its `always` would not run),
+        # so these tasks ignore it and the next task turns it into a normal
+        # failure.
         - name: "Search available Windows Updates (before)"
           ansible.windows.win_updates:
             state: searched
@@ -445,6 +452,19 @@
           become_method: ansible.builtin.runas
           become_user: SYSTEM
           register: wu_search_before
+          ignore_unreachable: true
+
+        - name: "Record that the host became unreachable (update search)"
+          ansible.builtin.set_fact:
+            wu_unreachable: true
+          when: wu_search_before.unreachable | default(false)
+
+        - name: "Fail when the host became unreachable (update search)"
+          ansible.builtin.fail:
+            msg: >-
+              Host {{ inventory_hostname }} became unreachable while searching for updates:
+              {{ wu_search_before.msg | default('connection lost') }}
+          when: wu_search_before.unreachable | default(false)
 
         - name: "Normalize the search result into a list"
           ansible.builtin.set_fact:
@@ -488,7 +508,20 @@
           register: wu_install
           changed_when: wu_install.installed_update_count | default(0) | int > 0
           failed_when: false
+          ignore_unreachable: true  # #56 — see "Search available Windows Updates (before)"
           when: wu_action == 'Apply'
+
+        - name: "Record that the host became unreachable (update install)"
+          ansible.builtin.set_fact:
+            wu_unreachable: true
+          when: wu_install.unreachable | default(false)
+
+        - name: "Fail when the host became unreachable (update install)"
+          ansible.builtin.fail:
+            msg: >-
+              Host {{ inventory_hostname }} became unreachable while installing updates
+              (updates may be partially installed): {{ wu_install.msg | default('connection lost') }}
+          when: wu_install.unreachable | default(false)
 
         - name: "Normalize the install result into a list"
           ansible.builtin.set_fact:
@@ -686,7 +719,20 @@
           become_user: SYSTEM
           register: wu_search_after
           failed_when: false
+          ignore_unreachable: true  # #56 — see "Search available Windows Updates (before)"
           when: wu_action == 'Apply'
+
+        - name: "Record that the host became unreachable (post-update search)"
+          ansible.builtin.set_fact:
+            wu_unreachable: true
+          when: wu_search_after.unreachable | default(false)
+
+        - name: "Fail when the host became unreachable (post-update search)"
+          ansible.builtin.fail:
+            msg: >-
+              Host {{ inventory_hostname }} became unreachable while searching for remaining updates:
+              {{ wu_search_after.msg | default('connection lost') }}
+          when: wu_search_after.unreachable | default(false)
 
         - name: "Normalize the post-run search result into a list"
           ansible.builtin.set_fact:
@@ -805,11 +851,37 @@
               warnings: "{{ samurai_warnings }}"
               errors: "{{ samurai_errors }}"
 
+        # #56 — `always` has no rescue: a failing (or unreachable) write here
+        # used to fail the host inside play 2 and, with `serial: 1`, stop the
+        # rest of the wave. The error is tolerated, then recorded: the host
+        # ends `failed` (the evidence on disk is part of the contract) and is
+        # re-failed in play 4.
         - name: "Write summary.json"
           ansible.windows.win_copy:
             dest: "{{ evidence_dir }}\\summary.json"
             content: "{{ host_summary | to_nice_json }}\n"
-          when: evidence_dir_ready | default(false)
+          register: wu_summary_write
+          ignore_errors: true
+          ignore_unreachable: true
+          when:
+            - evidence_dir_ready | default(false)
+            - not (wu_unreachable | default(false) | bool)
+
+        - name: "Record that summary.json could not be written"
+          ansible.builtin.set_fact:
+            execution_status: "failed"
+            wu_unreachable: "{{ ((wu_unreachable | default(false) | bool) or (wu_summary_write.unreachable | default(false))) | bool }}"
+            samurai_errors: >-
+              {{ samurai_errors + ['summary.json could not be written to ' + evidence_dir + ': '
+                 + (wu_summary_write.msg | default('unknown error'))] }}
+          when: wu_summary_write is failed or (wu_summary_write.unreachable | default(false))
+
+        - name: "Reflect the summary.json write failure in the published summary"
+          ansible.builtin.set_fact:
+            host_summary: >-
+              {{ host_summary | combine({'status': execution_status, 'errors': samurai_errors,
+                                         'unreachable': wu_unreachable | bool}) }}
+          when: wu_summary_write is failed or (wu_summary_write.unreachable | default(false))
 
         - name: "Publish per-host summary as run stat"
           ansible.builtin.set_stats:
