@@ -14,6 +14,21 @@
   gather_facts: false
   become: true
   tasks:
+    - name: Select a supported source Python without changing the system interpreter
+      ansible.builtin.raw: |
+        for candidate in /usr/bin/python3.11 /usr/bin/python3.9; do
+          if [ -x "$candidate" ] && "$candidate" -c 'import sys; assert sys.version_info >= (3, 9)' >/dev/null 2>&1; then
+            printf '%s\n' "$candidate"
+            exit 0
+          fi
+        done
+        exit 1
+      register: consistency_python
+      changed_when: false
+      failed_when: consistency_python.rc != 0 or consistency_python.stdout | trim not in ['/usr/bin/python3.11', '/usr/bin/python3.9']
+    - name: Pin the verified source Python for this job
+      ansible.builtin.set_fact:
+        ansible_python_interpreter: "{{ consistency_python.stdout | trim }}"
     - name: Require the frozen source command
       ansible.builtin.assert:
         that:

@@ -7,13 +7,19 @@ from pathlib import Path
 
 from ansible.module_utils.basic import AnsibleModule
 from ansible.module_utils.consistency_boot import FstabBootFence, BootFenceRejected
+from ansible.module_utils.consistency_identity import SourceIdentityRejected, source_disk_bindings
 from ansible.module_utils.consistency_lease import FenceRejected, FilesystemFence, Journal, LinuxFilesystem
 
 
-def observed_mounts(module):
+def observed_mounts(module, azure_disks):
     rc, output, error = module.run_command([
         'lsblk', '--json', '--bytes', '--output', 'NAME,SERIAL,FSTYPE,UUID,MOUNTPOINTS',
     ])
+    older_lsblk = rc and 'unknown column: MOUNTPOINTS' in error
+    if older_lsblk:
+        rc, output, error = module.run_command([
+            'lsblk', '--json', '--bytes', '--output', 'NAME,SERIAL,FSTYPE,UUID,MOUNTPOINT',
+        ])
     if rc:
         raise FenceRejected('Source volume observation failed')
     result = {}
@@ -22,21 +28,40 @@ def observed_mounts(module):
         fields = line.split()
         target = re.sub(r'\\([0-7]{3})', lambda match: chr(int(match[1], 8)), fields[4])
         mount_options[target] = set(fields[5].split(','))
-    def visit(device, serial=None):
+    def visit(device, serial=None, inherited_stable=None):
         serial = device.get('serial') or serial
-        stable = None
-        if isinstance(serial, str) and re.fullmatch(r'vol-?[0-9a-f]+', serial):
+        stable = inherited_stable
+        if azure_disks is not None:
+            name = device.get('name')
+            if isinstance(name, str) and name:
+                stable = azure_disks.get(os.path.realpath('/dev/' + name), inherited_stable)
+        elif isinstance(serial, str) and re.fullmatch(r'vol-?[0-9a-f]+', serial):
             stable = 'vol-' + serial.removeprefix('vol').removeprefix('-')
-        for mount in device.get('mountpoints') or []:
+        mounts = ([device.get('mountpoint')] if older_lsblk else device.get('mountpoints')) or []
+        for mount in mounts:
             if mount:
                 if mount in result:
                     raise FenceRejected('Ambiguous source mount identity')
                 result[mount] = dict(stable_id=stable, filesystem=device.get('fstype'), uuid=device.get('uuid'),
                                      readonly='ro' in mount_options.get(mount, set()))
         for child in device.get('children', []):
-            visit(child, serial)
+            visit(child, serial, stable)
     for device in json.loads(output)['blockdevices']:
         visit(device)
+    if older_lsblk:
+        rc, mounts, _ = module.run_command(['findmnt', '--json', '--output', 'TARGET'])
+        if rc:
+            raise FenceRejected('Source mount aliases could not be observed')
+        devices = {os.stat(mount).st_dev: details for mount, details in result.items()}
+        def add_aliases(rows):
+            for row in rows:
+                target = row.get('target')
+                if target not in result and os.path.exists(target):
+                    details = devices.get(os.stat(target).st_dev)
+                    if details is not None:
+                        result[target] = dict(details)
+                add_aliases(row.get('children') or [])
+        add_aliases(json.loads(mounts)['filesystems'])
     return result
 
 
@@ -60,10 +85,11 @@ def main():
     module = AnsibleModule(argument_spec=dict(command=dict(type='dict', required=True)), supports_check_mode=False)
     if os.geteuid() != 0:
         module.fail_json(msg='Filesystem fencing requires governed privilege escalation')
-    identity = Path('/sys/devices/virtual/dmi/id/board_asset_tag')
     expected_instance = module.params['command'].get('scope', {}).get('source_instance_id')
-    if not identity.exists() or identity.read_text().strip() != expected_instance:
-        module.fail_json(msg='Observed AWS instance does not match the frozen command')
+    try:
+        azure_disks = source_disk_bindings(expected_instance)
+    except (SourceIdentityRejected, OSError, ValueError, TypeError):
+        module.fail_json(msg='Observed source instance does not match the frozen command')
     journal = Journal()
     lock = journal.lock()
     filesystem = None
@@ -89,7 +115,7 @@ def main():
                 if any((Path(root) / name).exists() or (Path(root) / name).is_symlink()
                        for name in (unit, unit + '.d', 'mount.d')):
                     raise FenceRejected('Custom mount boot unit prevents a verified read-only boot fence')
-        filesystem = LinuxFilesystem(lambda: observed_mounts(module), make_writable, FstabBootFence(resolve_uuid=lambda source: resolve_boot_uuid(module, source)))
+        filesystem = LinuxFilesystem(lambda: observed_mounts(module, azure_disks), make_writable, FstabBootFence(resolve_uuid=lambda source: resolve_boot_uuid(module, source)))
         fence = FilesystemFence(store=journal, filesystem=filesystem,
                                 boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip())
         evidence = fence.execute(module.params['command'])
