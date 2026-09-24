@@ -10,9 +10,12 @@
 # Stages:
 #   1. Build dynamic in-memory inventory from HOSTNAMES (localhost play).
 #   2. Run pre-check, optional update and post-check on each target host.
+#      Fact gathering and the evidence directory run inside the rescue block,
+#      so an unreachable or rejected host never stops the wave (#54).
 #   3. Emit a consolidated samurai_shield_result JSON block on stdout.
-#   4. Re-fail every host whose execution ended failed, so the PLAY RECAP
-#      grades it failed (#3037 C3, moved out of stage 2 by #47).
+#   4. Re-check hosts that were unreachable (graded unreachable in the PLAY
+#      RECAP) and re-fail every host whose execution ended failed (#3037 C3,
+#      moved out of stage 2 by #47).
 #
 # Extra-vars contract — see ansible/playbooks/README_linux_yum_update_with_evidence.md
 # ============================================================================
@@ -71,7 +74,11 @@
 
 - name: "SamurAI :: yum-update :: pre-check, update and post-check"
   hosts: samurai_yum_update_targets
-  gather_facts: true
+  # #54 — facts are gathered INSIDE the block (first task), not here. A host
+  # that failed or was unreachable at play-level fact gathering never reached
+  # the rescue; with `serial: 1` its batch closed as fully failed and
+  # ansible-core stopped the rest of the wave (and plays 3/4).
+  gather_facts: false
   become: true
   serial: "{{ SERIAL_BATCH | default(1) }}"
 
@@ -95,35 +102,65 @@
 
   tasks:
 
-    # ------------------------------------------------------------------------
-    # Phase 1: timestamps + evidence directory (sempre, antes do bloco — o
-    # `always` escreve o summary.json aqui inclusive quando o host reprova)
-    # ------------------------------------------------------------------------
-    - name: "Capture execution start timestamp"
+    # #54 — controller clock (strftime sem epoch = agora, UTC), como o
+    # finished_at desde o #3083: ansible_date_time só existe depois do setup,
+    # que agora roda dentro do bloco e pode não rodar (host inalcançável).
+    - name: "Capture execution start timestamp (UTC, controller-side)"
       ansible.builtin.set_fact:
-        execution_started_at: "{{ '%Y-%m-%dT%H:%M:%SZ' | strftime(ansible_date_time.epoch | int) }}"
-        execution_timestamp: "{{ '%Y%m%dT%H%M%S' | strftime(ansible_date_time.epoch | int) }}"
-
-    - name: "Build evidence directory path"
-      ansible.builtin.set_fact:
-        evidence_dir: "{{ EVIDENCE_BASE_DIR }}/{{ inventory_hostname }}/{{ execution_timestamp }}"
-
-    - name: "Create evidence directory"
-      ansible.builtin.file:
-        path: "{{ evidence_dir }}"
-        state: directory
-        mode: '0750'
+        execution_started_at: "{{ '%Y-%m-%dT%H:%M:%SZ' | strftime(utc=true) }}"
+        execution_timestamp: "{{ '%Y%m%dT%H%M%S' | strftime(utc=true) }}"
 
     # ------------------------------------------------------------------------
-    # Phase 2: OS compatibility + pre-check (always runs, even when
-    # ACTION=Check). #3037 (C3): a validação de compatibilidade vive DENTRO do
-    # block — um host de família errada agora atravessa rescue/always e produz
-    # summary.json + samurai_shield_result estruturados (status=failed, erro
-    # legível), em vez de morrer antes de qualquer evidência.
+    # #3037 (C3) / #54 — tudo que toca o host vive DENTRO do block, inclusive
+    # o fact gathering, a validação de compatibilidade e o diretório de
+    # evidência: toda falha por host atravessa rescue/always (summary.json +
+    # samurai_shield_result estruturados, status=failed, erro legível) e é
+    # re-falhada no play 4. Uma falha fora do rescue fecharia o batch do
+    # `serial` como "inteiro falhado" e interromperia o resto da wave.
     # ------------------------------------------------------------------------
     - name: "Pre-check + optional update + post-check"
       block:
 
+        # ---- Phase 1: reachability + evidence directory ---------------------
+        # rescue NÃO pega host inalcançável: o setup ignora o unreachable e a
+        # task seguinte o transforma numa falha comum. Com ignore_unreachable
+        # o host não conta como unreachable para o batch; o play 4 o testa de
+        # novo para o recap continuar dizendo unreachable.
+        - name: "Gather facts (an unreachable host is recorded, not fatal to the wave)"
+          ansible.builtin.setup:
+          ignore_unreachable: true
+          register: samurai_facts
+
+        - name: "Record that the host was unreachable"
+          ansible.builtin.set_fact:
+            samurai_unreachable: true
+          when: samurai_facts.unreachable | default(false)
+
+        - name: "Fail when the host is unreachable"
+          ansible.builtin.fail:
+            msg: >-
+              Host {{ inventory_hostname }} is unreachable:
+              {{ samurai_facts.msg | default('connection failed') }}
+          when: samurai_unreachable | default(false)
+
+        - name: "Build evidence directory path"
+          ansible.builtin.set_fact:
+            evidence_dir: "{{ EVIDENCE_BASE_DIR }}/{{ inventory_hostname }}/{{ execution_timestamp }}"
+
+        - name: "Create evidence directory"
+          ansible.builtin.file:
+            path: "{{ evidence_dir }}"
+            state: directory
+            mode: '0750'
+
+        # O `always` só grava o summary.json quando o diretório existe — um host
+        # inalcançável (ou sem diretório) não pode falhar de novo no `always`.
+        - name: "Mark evidence directory as ready"
+          ansible.builtin.set_fact:
+            evidence_dir_ready: true
+
+        # ---- Phase 2: OS compatibility + pre-check (always runs, even when
+        # ACTION=Check) ------------------------------------------------------
         - name: "Assert target OS family is RedHat"
           ansible.builtin.assert:
             that: ansible_os_family == 'RedHat'
@@ -619,7 +656,8 @@
               reboot_required_after: "{{ reboot_required_after | default('not_applicable_check_mode') }}"
               rebooted: "{{ (reboot_action.rebooted | default(false)) | bool }}"
               failed_services_after: "{{ failed_services_list | default([]) }}"
-              evidence_dir: "{{ evidence_dir }}"
+              evidence_dir: "{{ evidence_dir if (evidence_dir_ready | default(false)) else 'not_created' }}"
+              unreachable: "{{ samurai_unreachable | default(false) | bool }}"
               started_at: "{{ execution_started_at }}"
               finished_at: "{{ execution_finished_at }}"
               status: "{{ execution_status }}"
@@ -631,6 +669,7 @@
             dest: "{{ evidence_dir }}/summary.json"
             mode: '0640'
             content: "{{ host_summary | to_nice_json }}\n"
+          when: evidence_dir_ready | default(false)
 
         - name: "Publish per-host summary as run stat"
           ansible.builtin.set_stats:
@@ -699,6 +738,15 @@
   hosts: samurai_yum_update_targets
   gather_facts: false
   tasks:
+    # #54 — a tentativa de conexão do play 2 ignorou o `unreachable` para a
+    # wave seguir. Aqui ela é refeita SEM ignorar: um host que continua fora
+    # sai `unreachable` no PLAY RECAP (é nisso que o AAP failure analyst se
+    # apoia para HOST_UNREACHABLE), não como falha genérica de task. Um host
+    # que responde agora terminou falho do mesmo jeito e é re-falhado abaixo.
+    - name: "Re-check hosts that were unreachable in play 2"
+      ansible.builtin.ping:
+      when: samurai_unreachable | default(false) | bool
+
     - name: "Fail the host when execution ended failed (structured evidence already published)"
       ansible.builtin.fail:
         msg: >-
