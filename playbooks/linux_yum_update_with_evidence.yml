@@ -11,7 +11,9 @@
 #   1. Build dynamic in-memory inventory from HOSTNAMES (localhost play).
 #   2. Run pre-check, optional update and post-check on each target host.
 #      Fact gathering and the evidence directory run inside the rescue block,
-#      so an unreachable or rejected host never stops the wave (#54).
+#      so an unreachable or rejected host never stops the wave (#54). A host
+#      that drops during the long update tasks, or whose summary.json cannot
+#      be written, also ends `failed` without stopping the wave (#56).
 #   3. Emit a consolidated samurai_shield_result JSON block on stdout.
 #   4. Re-check hosts that were unreachable (graded unreachable in the PLAY
 #      RECAP) and re-fail every host whose execution ended failed (#3037 C3,
@@ -298,12 +300,29 @@
             content: "{{ pkgs_before.stdout }}\n"
 
         # ---- updates available before ------------------------------------
+        # #56 — the repo-bound tasks (check-update, update) are the long ones,
+        # where a dropped SSH connection is likely. rescue does NOT catch an
+        # unreachable host (and its `always` would not run), so these tasks
+        # ignore it and the next task turns it into a normal failure.
         - name: "Check available updates (before)"
           ansible.builtin.command: "{{ pkg_manager }} -q check-update"
           register: check_update_out
           changed_when: false
           failed_when: check_update_out.rc not in [0, 100]
+          ignore_unreachable: true
           when: ansible_os_family == 'RedHat'
+
+        - name: "Record that the host became unreachable (check available updates)"
+          ansible.builtin.set_fact:
+            samurai_unreachable: true
+          when: check_update_out.unreachable | default(false)
+
+        - name: "Fail when the host became unreachable (check available updates)"
+          ansible.builtin.fail:
+            msg: >-
+              Host {{ inventory_hostname }} became unreachable while checking for updates:
+              {{ check_update_out.msg | default('connection lost') }}
+          when: check_update_out.unreachable | default(false)
 
         - name: "Determine updates available count"
           ansible.builtin.set_fact:
@@ -416,9 +435,22 @@
           register: update_result
           changed_when: ACTION == 'Apply' and update_result.rc == 0 and ('Nothing to do' not in (update_result.stdout | default('')))
           failed_when: false
+          ignore_unreachable: true  # #56 — see "Check available updates (before)"
           when:
             - ACTION == 'Apply'
             - ansible_os_family == 'RedHat'
+
+        - name: "Record that the host became unreachable (package update)"
+          ansible.builtin.set_fact:
+            samurai_unreachable: true
+          when: update_result.unreachable | default(false)
+
+        - name: "Fail when the host became unreachable (package update)"
+          ansible.builtin.fail:
+            msg: >-
+              Host {{ inventory_hostname }} became unreachable during the package update
+              (the update may be partially applied): {{ update_result.msg | default('connection lost') }}
+          when: update_result.unreachable | default(false)
 
         - name: "Write update_stdout.txt"
           ansible.builtin.copy:
@@ -664,12 +696,38 @@
               warnings: "{{ samurai_warnings }}"
               errors: "{{ samurai_errors }}"
 
+        # #56 — `always` has no rescue: a failing (or unreachable) write here
+        # used to fail the host inside play 2 and, with `serial: 1`, stop the
+        # rest of the wave. The error is tolerated, then recorded: the host
+        # ends `failed` (the evidence on disk is part of the contract) and is
+        # re-failed in play 4.
         - name: "Write summary.json"
           ansible.builtin.copy:
             dest: "{{ evidence_dir }}/summary.json"
             mode: '0640'
             content: "{{ host_summary | to_nice_json }}\n"
-          when: evidence_dir_ready | default(false)
+          register: samurai_summary_write
+          ignore_errors: true
+          ignore_unreachable: true
+          when:
+            - evidence_dir_ready | default(false)
+            - not (samurai_unreachable | default(false) | bool)
+
+        - name: "Record that summary.json could not be written"
+          ansible.builtin.set_fact:
+            execution_status: "failed"
+            samurai_unreachable: "{{ ((samurai_unreachable | default(false) | bool) or (samurai_summary_write.unreachable | default(false))) | bool }}"
+            samurai_errors: >-
+              {{ samurai_errors + ['summary.json could not be written to ' + evidence_dir + ': '
+                 + (samurai_summary_write.msg | default('unknown error'))] }}
+          when: samurai_summary_write is failed or (samurai_summary_write.unreachable | default(false))
+
+        - name: "Reflect the summary.json write failure in the published summary"
+          ansible.builtin.set_fact:
+            host_summary: >-
+              {{ host_summary | combine({'status': execution_status, 'errors': samurai_errors,
+                                         'unreachable': samurai_unreachable | bool}) }}
+          when: samurai_summary_write is failed or (samurai_summary_write.unreachable | default(false))
 
         - name: "Publish per-host summary as run stat"
           ansible.builtin.set_stats:
