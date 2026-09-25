@@ -39,6 +39,17 @@ class FilesystemFence:
             raise FenceRejected('Source fence volume manifest changed')
         if record and record['scope']['organization_id'] != scope['organization_id']:
             raise FenceRejected('Foreign organization owns the source fence')
+        if (action == 'inspect_outcome' and record and record['state'] == 'CANDIDATE_WRITABLE'
+                and record['scope']['generation'] > scope['generation']
+                and record['scope'].get('action') == 'activate_candidate'
+                and record['scope'].get('source_instance_id') == scope.get('source_instance_id')
+                and scope.get('source_instance_id')
+                and record['scope']['plan_digest'] != scope['plan_digest']
+                and record.get('volumes') == mounts):
+            for volume in mounts:
+                self.filesystem.confirm_writable(volume['mount_point'])
+            return dict(scope=scope, boot_id=self.boot_id, state='NO_FENCE', frozen=[],
+                        acquired_at=None, protection=None)
         if record and record['scope']['generation'] > scope['generation']:
             raise FenceRejected('Stale fence generation')
         if record and record['scope']['plan_digest'] != scope['plan_digest']:
@@ -69,7 +80,8 @@ class FilesystemFence:
                     for volume in mounts:
                         self.filesystem.confirm_writable(volume['mount_point'])
                 except Exception:
-                    # An unwritable mount can still be owned by this fence.
+                    # A writable check that fails means ownership may still
+                    # exist; the normal inspect path keeps the refusal.
                     pass
                 else:
                     return dict(scope=scope, boot_id=self.boot_id, state='NO_FENCE',

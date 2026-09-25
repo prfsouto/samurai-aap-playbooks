@@ -137,6 +137,75 @@ def test_stale_or_foreign_release_does_not_touch_source():
     assert fs.thawed == []
 
 
+def promoted_source():
+    store, fs, fence = setup()
+    previous = command('activate_candidate', generation=5)
+    previous['scope'].update(source_instance_id='i-promoted', plan_digest='b' * 64)
+    previous['parameters']['volumes'] = [{
+        'stable_id': 'vol-data', 'mount_point': '/data', 'filesystem': 'ext4', 'uuid': 'data-uuid',
+    }]
+    store.record = {
+        'scope': previous['scope'], 'boot_id': 'boot-a', 'state': 'CANDIDATE_WRITABLE',
+        'frozen': [], 'volumes': previous['parameters']['volumes'], 'acquired_at': None,
+    }
+    observation = command('inspect_outcome', generation=1)
+    observation['scope']['source_instance_id'] = 'i-promoted'
+    observation['parameters']['volumes'] = copy.deepcopy(previous['parameters']['volumes'])
+    return store, fs, fence, observation
+
+
+def test_old_candidate_journal_confirms_no_fence_without_resetting_generation():
+    store, fs, fence, observation = promoted_source()
+    original = copy.deepcopy(store.record)
+    writable_checks = []
+    fs.confirm_writable = writable_checks.append
+
+    assert fence.execute(observation)['state'] == 'NO_FENCE'
+    assert writable_checks == ['/data']
+    assert store.record == original
+
+    newer = command(generation=6)
+    newer['scope']['source_instance_id'] = 'i-promoted'
+    newer['parameters']['volumes'] = copy.deepcopy(observation['parameters']['volumes'])
+    assert fence.execute(newer)['state'] == 'HELD'
+    assert store.record['scope']['generation'] == 6
+
+
+@pytest.mark.parametrize('change', ('organization', 'instance', 'volume'))
+def test_old_candidate_journal_cannot_certify_unrelated_source(change):
+    store, fs, fence, observation = promoted_source()
+    original = copy.deepcopy(store.record)
+    if change == 'organization':
+        observation['scope']['organization_id'] = 8
+    elif change == 'instance':
+        observation['scope']['source_instance_id'] = 'i-other'
+    else:
+        observation['parameters']['volumes'][0]['uuid'] = 'another-uuid'
+
+    with pytest.raises(FenceRejected):
+        fence.execute(observation)
+    assert store.record == original
+
+
+def test_old_candidate_journal_requires_current_writable_mount():
+    store, fs, fence, observation = promoted_source()
+    original = copy.deepcopy(store.record)
+    fs.confirm_writable = lambda mount: (_ for _ in ()).throw(FenceRejected('still readonly'))
+    with pytest.raises(FenceRejected, match='readonly'):
+        fence.execute(observation)
+    assert store.record == original
+
+
+@pytest.mark.parametrize('action', ('acquire', 'release_abort', 'activate_candidate'))
+def test_old_candidate_journal_never_permits_stale_mutating_action(action):
+    store, fs, fence, observation = promoted_source()
+    original = copy.deepcopy(store.record)
+    observation['scope']['action'] = action
+    with pytest.raises(FenceRejected, match='Stale fence generation'):
+        fence.execute(observation)
+    assert store.record == original
+
+
 def test_transfer_keeps_source_fenced_and_refuses_abort():
     store, fs, fence = setup()
     fence.execute(command())
