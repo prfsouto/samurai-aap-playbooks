@@ -12,27 +12,9 @@
       - campaign_destination_environment.AWS_WEB_IDENTITY_TOKEN_FILE == ''
       - campaign_destination_environment.AWS_SECURITY_TOKEN == ''
       - campaign_destination_environment.AWS_ROLE_ARN == ''
-      - campaign_destination_environment.AWS_PROFILE == 'samurai'
-      - campaign_destination_environment.AWS_DEFAULT_PROFILE == 'samurai'
       - campaign_destination_environment.AWS_SHARED_CREDENTIALS_FILE == '/dev/null'
+      - campaign_destination_environment.AWS_CONFIG_FILE == '/dev/null'
     quiet: true
-  no_log: true
-
-- name: Prepare an isolated AWS configuration in the execution container
-  ansible.builtin.tempfile:
-    state: file
-    prefix: samurai-destination-
-  register: campaign_destination_config
-
-- name: Declare the selected profile without storing a secret in its configuration
-  ansible.builtin.copy:
-    dest: "{{ campaign_destination_config.path }}"
-    content: "[profile samurai]\nregion = {{ samurai_destination_context.region }}\n"
-    mode: '0600'
-
-- name: Bind the private environment to its isolated configuration
-  ansible.builtin.set_fact:
-    campaign_destination_environment: "{{ campaign_destination_environment | combine({'AWS_CONFIG_FILE': campaign_destination_config.path}) }}"
   no_log: true
 
 - name: Observe the AWS account reached by this execution credential
