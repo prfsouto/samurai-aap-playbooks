@@ -1,10 +1,4 @@
 ---
-- name: Remove the execution container configuration for this destination
-  ansible.builtin.file:
-    path: "{{ campaign_destination_config.path }}"
-    state: absent
-  when: campaign_destination_config is defined and campaign_destination_config.path is defined
-
 - name: Clear the private destination access from host variables
   ansible.builtin.set_fact:
     campaign_private_destination_document: {}
