@@ -201,6 +201,7 @@
               '--epoch-bytes', data_sync_epoch_bytes | string,
               '--epoch-max-age-ms', data_sync_epoch_max_age_ms | string
             ]
+            + (['--delta'] if data_sync_items | default([]) | length > 0 and data_sync_item_stage | default('seed') == 'final' else [])
             + (['--tls-ca', data_sync_tls_ca] if data_sync_tls_ca | length > 0 else [])
             + (['--tls-server-name', data_sync_tls_server_name] if data_sync_tls_server_name | length > 0 else [])
             + (['--tls-cert', data_sync_tls_cert, '--tls-key', data_sync_tls_key] if data_sync_tls_cert | length > 0 else [])
