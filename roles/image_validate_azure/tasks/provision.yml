@@ -2,11 +2,11 @@
 - name: Require an exact Gallery image and private SSH bootstrap
   ansible.builtin.assert:
     that:
-      - image_validate.image_ref | default('') | regex_search('(?i)^/subscriptions/[0-9a-f-]{36}/resourcegroups/[A-Za-z0-9._()-]+/providers/Microsoft.Compute/galleries/[A-Za-z0-9._-]+/images/[A-Za-z0-9._-]+/versions/[0-9]+\.[0-9]+\.[0-9]+$')
+      - (image_validate.image_ref | default('')) is match('(?i)^/subscriptions/[0-9a-f-]{36}/resourcegroups/[A-Za-z0-9._()-]+/providers/Microsoft.Compute/galleries/[A-Za-z0-9._-]+/images/[A-Za-z0-9._-]+/versions/[0-9]+\.[0-9]+\.[0-9]+$')
       - image_validate.image_ref.split('/')[2] | lower == iv_subscription | lower
-      - image_validate.azure_vm_size | default('') | regex_search('^Standard_[A-Za-z0-9_]+$')
-      - image_validate.ssh_username | default('') | regex_search('^[A-Za-z_][A-Za-z0-9._-]*$')
-      - image_validate.ssh_public_key | default('') | regex_search('^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp(256|384|521)) [A-Za-z0-9+/=]+$')
+      - (image_validate.azure_vm_size | default('')) is match('^Standard_[A-Za-z0-9_]+$')
+      - (image_validate.ssh_username | default('')) is match('^[A-Za-z_][A-Za-z0-9._-]*$')
+      - (image_validate.ssh_public_key | default('')) is match('^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp(256|384|521)) [A-Za-z0-9+/=]+$')
     fail_msg: Azure bench requires a frozen Gallery version, size and public SSH key.
 
 - name: Observe any preexisting Azure validation NIC
