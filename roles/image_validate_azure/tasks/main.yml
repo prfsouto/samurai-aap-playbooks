@@ -4,11 +4,11 @@
     that:
       - image_validate_run_mode | default('') in ['provision', 'teardown']
       - image_validate.cloud_provider | default('') == 'azure'
-      - organization_id | string | regex_search('^[1-9][0-9]*$')
-      - samurai_execution_id | string | regex_search('^[A-Za-z0-9-]{1,40}$')
-      - image_validate.image_version_id | string | regex_search('^[1-9][0-9]*$')
+      - (organization_id | string) is match('^[1-9][0-9]*$')
+      - (samurai_execution_id | string) is match('^[A-Za-z0-9-]{1,40}$')
+      - (image_validate.image_version_id | string) is match('^[1-9][0-9]*$')
       - image_validate.azure_subscription_id | default('') | length > 0
-      - image_validate.azure_subnet_id | default('') | regex_search('(?i)^/subscriptions/[0-9a-f-]{36}/resourcegroups/[A-Za-z0-9._()-]+/providers/Microsoft.Network/virtualNetworks/[A-Za-z0-9._-]+/subnets/[A-Za-z0-9._-]+$')
+      - (image_validate.azure_subnet_id | default('')) is match('(?i)^/subscriptions/[0-9a-f-]{36}/resourcegroups/[A-Za-z0-9._()-]+/providers/Microsoft.Network/virtualNetworks/[A-Za-z0-9._-]+/subnets/[A-Za-z0-9._-]+$')
       - image_validate.region | default(region | default('')) | length > 0
       - lookup('env', 'AZURE_CLIENT_ID') | length > 0
       - lookup('env', 'AZURE_SECRET') | length > 0
@@ -33,9 +33,9 @@
 - name: Validate frozen Azure identifiers
   ansible.builtin.assert:
     that:
-      - iv_subnet | regex_search('(?i)^/subscriptions/[0-9a-f-]{36}/resourcegroups/[A-Za-z0-9._()-]+/providers/Microsoft.Network/virtualNetworks/[A-Za-z0-9._-]+/subnets/[A-Za-z0-9._-]+$')
+      - iv_subnet is match('(?i)^/subscriptions/[0-9a-f-]{36}/resourcegroups/[A-Za-z0-9._()-]+/providers/Microsoft.Network/virtualNetworks/[A-Za-z0-9._-]+/subnets/[A-Za-z0-9._-]+$')
       - iv_subnet.split('/')[2] | lower == iv_subscription | lower
-      - iv_region | regex_search('^[a-z0-9]+$')
+      - iv_region is match('^[a-z0-9]+$')
       - iv_name | length <= 64
     fail_msg: Azure validation subnet or resource identity differs from the frozen plan.
 
