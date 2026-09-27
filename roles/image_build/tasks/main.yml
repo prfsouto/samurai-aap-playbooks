@@ -527,25 +527,7 @@
         - image_build_packer_validate.rc != 0
       tags: [image_build, build]
 
-    - name: "[image_build] packer build (machine-readable output)"
-      ansible.builtin.command:
-        argv: >-
-          {{ [image_build_packer_binary, 'build', '-color=false', '-machine-readable']
-             + (image_build_var_args | default([]))
-             + [image_build_resolved_template_path] }}
-      args:
-        chdir: "{{ image_build_run_dir }}"
-      register: image_build_run
-      # Do NOT abort on a non-zero exit here: the build log is mandatory
-      # evidence (RFC-004 §17.1) and must be persisted EVEN when the build
-      # fails — that is exactly the case where it matters most. Capture the
-      # result, write the log to disk, and only THEN fail loud (assert below).
-      failed_when: false
-      changed_when: true
-      when: image_build_failure_stage is not defined
-      tags: [image_build, build]
-
-    - name: "[image_build] Persist the full build log to disk (success OR failure)"
+    - name: "[image_build] Persist init/validate log before Packer launch"
       ansible.builtin.copy:
         dest: "{{ image_build_run_dir }}/build.log"
         content: |
@@ -557,11 +539,25 @@
           {{ image_build_packer_validate.stdout | default('') }}
           [packer validate stderr]
           {{ image_build_packer_validate.stderr | default('') }}
-          [packer build stdout]
-          {{ image_build_run.stdout | default('') }}
-          [packer build stderr]
-          {{ image_build_run.stderr | default('') }}
+          [packer build merged stdout/stderr]
         mode: "0644"
+      tags: [image_build, build]
+
+    - name: "[image_build] packer build (machine-readable output)"
+      ansible.builtin.command:
+        argv: >-
+          {{ ['python3', role_path ~ '/files/packer_capture.py',
+               image_build_run_dir ~ '/build.log', '--',
+               image_build_packer_binary, 'build', '-color=false', '-machine-readable']
+             + (image_build_var_args | default([]))
+             + [image_build_resolved_template_path] }}
+      args:
+        chdir: "{{ image_build_run_dir }}"
+      register: image_build_run
+      # Ansible's JSON transport needs UTF-8; the original Packer bytes stay in build.log.
+      failed_when: false
+      changed_when: true
+      when: image_build_failure_stage is not defined
       tags: [image_build, build]
 
     - name: "[image_build] Mark packer build failure for durable log upload"
