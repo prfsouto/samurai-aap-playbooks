@@ -824,15 +824,22 @@
   tags: [image_build, sbom]
 
 - name: "[image_build] Extract the SBOM source archive"
-  when: image_build_provider == 'packer'
+  when: image_build_provider == 'packer' and not image_build_sbom_archive_path.endswith('.zip')
   ansible.builtin.unarchive:
     src: "{{ image_build_sbom_archive_path }}"
     dest: "{{ image_build_sbom_rootfs_dir }}"
     remote_src: true
-    # ``--no-same-owner``/``--no-same-permissions`` são opções do TAR; passá-las
-    # para um .zip faz o unarchive falhar. A extração continua idêntica onde a
-    # família exporta tar.
     extra_opts: "{{ ['--no-same-owner', '--no-same-permissions'] if image_build_sbom_archive_path.endswith('.tar.gz') else omit }}"
+  tags: [image_build, sbom]
+
+- name: "[image_build] Extract Windows SBOM ZIP with normalized paths"
+  when: image_build_provider == 'packer' and image_build_sbom_archive_path.endswith('.zip')
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - "{{ role_path }}/files/extract_windows_sbom_zip.py"
+      - "{{ image_build_sbom_archive_path }}"
+      - "{{ image_build_sbom_rootfs_dir }}"
   tags: [image_build, sbom]
 
 - name: "[image_build] Select the extracted rootfs for SBOM scanning"
