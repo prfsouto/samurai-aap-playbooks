@@ -2,7 +2,7 @@
 - name: Refuse a recorded VM outside this validation identity
   ansible.builtin.assert:
     that:
-      - instance_id | default('') | length == 0 or instance_id | lower == iv_vm_id | lower
+      - (instance_id | default('', true) | length == 0) or (instance_id | default('', true) | lower == iv_vm_id | lower)
     fail_msg: Azure teardown instance ID differs from the frozen execution.
 
 - name: Observe the exact Azure validation VM before deletion
