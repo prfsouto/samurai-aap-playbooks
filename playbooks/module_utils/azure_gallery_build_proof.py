@@ -172,7 +172,8 @@ def main() -> int:
     args = parser.parse_args()
     try:
         image_id = gallery_id_from_packer(
-            Path(args.packer_output).read_text(), args.subscription
+            Path(args.packer_output).read_text(encoding="utf-8", errors="replace"),
+            args.subscription
         )
         proof = validate_gallery_response(
             read_gallery_from_arm(image_id, args.subscription),
