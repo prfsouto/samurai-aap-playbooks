@@ -870,6 +870,37 @@
       v1 evidence contract requires package evidence over the exported tree.
   tags: [image_build, sbom]
 
+- name: "[image_build] Bind Windows platform inventory exported by Packer"
+  when: image_build_provider == 'packer' and image_build_sbom_archive_path.endswith('.zip')
+  block:
+    - name: "[image_build] Copy Windows registry inventory to build evidence"
+      ansible.builtin.copy:
+        src: "{{ image_build_sbom_rootfs_dir }}/platform-packages.json"
+        dest: "{{ image_build_run_dir }}/platform-inventory.json"
+        remote_src: true
+        mode: "0600"
+
+    - name: "[image_build] Parse the Windows registry inventory"
+      ansible.builtin.set_fact:
+        image_build_platform_json: "{{ lookup('file', image_build_run_dir + '/platform-inventory.json') | from_json }}"
+      no_log: true
+
+    - name: "[image_build] Refuse an empty or incompatible Windows registry inventory"
+      ansible.builtin.assert:
+        that:
+          - image_build_platform_json.schema | default('') == 'samurai.platform_packages/v1'
+          - image_build_platform_json.platform_id | default('') == 'windows_server'
+          - image_build_platform_json.packages is sequence
+          - image_build_platform_json.packages is not string
+          - image_build_platform_json.packages is not mapping
+          - image_build_platform_json.packages | length > 0
+        fail_msg: Windows Packer archive has no measured registry package inventory.
+
+    - name: "[image_build] Mark Windows registry inventory as measured"
+      ansible.builtin.set_fact:
+        image_build_platform_inventory_generated: true
+  tags: [image_build, evidence]
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SBOM — MANDATORY evidence via syft (v1 contract). The tool missing from
 # PATH or exiting non-zero FAILS the job for a real build; the old
@@ -1185,11 +1216,9 @@
         path: "{{ image_build_run_dir }}/{{ item }}"
         checksum_algorithm: sha256
       register: image_build_evidence_stats
-      loop:
-        - build.log
-        - sbom.cyclonedx.json
-        - scan.grype.json
-        - describe_images.json
+      loop: >-
+        {{ ['build.log', 'sbom.cyclonedx.json', 'scan.grype.json', 'describe_images.json']
+           + (['platform-inventory.json'] if (image_build_platform_inventory_generated | default(false)) else []) }}
       loop_control:
         label: "{{ item }}"
 
@@ -1280,6 +1309,14 @@
                'region': image_build_region,
                'execution_tag_verified': true,
              } }}
+
+    - name: "[image_build] Reference the measured Windows platform inventory"
+      when: image_build_platform_inventory_generated | default(false)
+      ansible.builtin.set_fact:
+        platform_inventory:
+          uri: "s3://{{ image_build_evidence_s3_bucket }}/{{ image_build_evidence_s3_prefix }}/platform-inventory.json"
+          sha256: "{{ image_build_evidence_sha256['platform-inventory.json'] }}"
+          package_count: "{{ image_build_platform_json.packages | length }}"
   tags: [image_build, evidence]
 
 - name: "[image_build] Record stub evidence references (control plane reproves these)"
@@ -1320,6 +1357,7 @@
       sbom: "{{ sbom }}"
       cve_scan: "{{ cve_scan }}"
       describe_images: "{{ describe_images }}"
+      platform_inventory: "{{ platform_inventory | default({}) }}"
       build_started_at: "{{ build_started_at }}"
       build_finished_at: "{{ build_finished_at }}"
       recipe_fingerprint_declared: "{{ recipe_fingerprint_declared }}"
