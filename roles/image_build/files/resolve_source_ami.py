@@ -132,7 +132,7 @@ def main():
     args = parser.parse_args()
     try:
         print(json.dumps(resolve_source(region=args.region, owner=args.owner, name_filter=args.name_filter, aws_cli=args.aws_cli)))
-    except SourceAmiResolutionError as exc:
+    except (SourceAmiResolutionError, ValueError) as exc:
         sys.stderr.write(f"{exc}\n")
         sys.exit(3)
 
