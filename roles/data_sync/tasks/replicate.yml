@@ -201,6 +201,20 @@
               '--epoch-bytes', data_sync_epoch_bytes | string,
               '--epoch-max-age-ms', data_sync_epoch_max_age_ms | string
             ]
+            + (['--campaign-id', samurai_campaign_id | string]
+               if samurai_campaign_id is defined and samurai_campaign_id | int > 0 else [])
+            + (['--campaign-execution-id', samurai_campaign_server_execution_id | string]
+               if samurai_campaign_server_execution_id is defined
+               and samurai_campaign_server_execution_id | int > 0 else [])
+            + (['--source-volume-id', data_sync_item_volume_id]
+               if data_sync_items | default([]) | length > 0
+               and data_sync_item_volume_id | default('') | length > 0 else [])
+            + (['--destination-volume-id', data_sync_destination_volume_id]
+               if data_sync_items | default([]) | length > 0
+               and data_sync_destination_volume_id | default('') | length > 0 else [])
+            + (['--stage', data_sync_item_stage]
+               if data_sync_items | default([]) | length > 0
+               and data_sync_item_stage | default('') in ['seed', 'final'] else [])
             + (['--delta'] if data_sync_items | default([]) | length > 0 and data_sync_item_stage | default('seed') == 'final' else [])
             + (['--tls-ca', data_sync_tls_ca] if data_sync_tls_ca | length > 0 else [])
             + (['--tls-server-name', data_sync_tls_server_name] if data_sync_tls_server_name | length > 0 else [])
@@ -400,6 +414,26 @@
           {{ (campaign_data_sync_used_cloud_source | default(false) | bool)
              or (data_sync_source_snapshot | default('') | length > 0) }}
       when: samurai_engine_callback_auth | default(false) | bool
+      tags: [data_sync]
+
+    - name: "[data_sync] Report correlated cleanup outcome"
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            {
+              'event': 'replication.cleanup.observed',
+              'organization_id': organization_id | int,
+              'campaign_id': samurai_campaign_id | default(0) | int,
+              'campaign_execution_id': samurai_campaign_server_execution_id | default(0) | int,
+              'execution_id': data_sync_execution_id,
+              'source_volume_id': data_sync_item_volume_id | default(''),
+              'destination_volume_id': data_sync_destination_volume_id | default(''),
+              'stage': data_sync_item_stage | default('standalone'),
+              'cleanup_failed': (data_sync_cleanup_failed | default(false) | bool)
+                or (data_sync_binary_cleanup.failed | default(false) | bool),
+              'residue_count': campaign_residue_publication.ansible_stats.data.data_sync_residues | length
+            } | to_json
+          }}
       tags: [data_sync]
 
     - name: "[data_sync] Say out loud what survived the cleanup"
