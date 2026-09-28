@@ -41,6 +41,7 @@
           sbom: "{{ sbom | default({'status': 'unavailable', 'reason': 'image_build role did not run'}) }}"
           cve_scan: "{{ cve_scan | default({'status': 'unavailable', 'reason': 'image_build role did not run'}) }}"
           describe_images: "{{ describe_images | default({'status': 'unavailable', 'reason': 'image_build role did not run'}) }}"
+          platform_inventory: "{{ platform_inventory | default({}) }}"
           build_started_at: "{{ build_started_at | default('') }}"
           build_finished_at: "{{ build_finished_at | default('') }}"
           recipe_fingerprint_declared: "{{ recipe_fingerprint_declared | default('') }}"
