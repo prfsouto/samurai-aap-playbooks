@@ -72,6 +72,7 @@
     data_sync_volume_check: {}
     data_sync_cloud_residue: []
     data_sync_cloud_residue_reason: ""
+    data_sync_cleanup_failed: false
     data_sync_item_stage: "{{ data_sync_item.stage | default('seed') }}"
     data_sync_item_volume_id: "{{ data_sync_item.source_volume_stable_id }}"
   tags: [data_sync]
