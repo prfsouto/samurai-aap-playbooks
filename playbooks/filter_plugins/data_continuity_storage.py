@@ -105,7 +105,7 @@ def _windows_destination_disk(volume_id, observation, provider, binding):
         raise StorageObservationError('Windows guest is not the bound candidate')
     if provider == 'aws':
         matches = [row for row in devices if isinstance(row, dict)
-                   and str(row.get('serial') or '').replace('-', '').casefold() == expected.replace('-', '')]
+                   and str(row.get('serial') or '').strip().casefold().removesuffix('_00000001.').replace('-', '') == expected.replace('-', '')]
     elif provider == 'azure':
         vm_uuid = str(UUID(cloud.get('vm_id')))
         if (str(UUID((observation.get('host') or {}).get('product_uuid'))) != vm_uuid

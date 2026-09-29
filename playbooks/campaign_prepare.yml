@@ -46,7 +46,7 @@
 
         - name: "Select the candidate OS from its approved bootstrap"
           ansible.builtin.set_fact:
-            samurai_candidate_windows: "{{ vars[samurai_destination_provider ~ '_replacement'].bootstrap == 'windows_powershell' }}"
+            samurai_candidate_windows: "{{ (vars[samurai_destination_provider ~ '_replacement'].bootstrap | default('')) == 'windows_powershell' }}"
 
         - name: "Require a Windows GPT plan only for a Windows candidate"
           ansible.builtin.assert:

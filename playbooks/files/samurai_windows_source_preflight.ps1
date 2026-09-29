@@ -62,7 +62,10 @@ $observed = @(foreach ($item in $volumes) {
     }
     if ($provider -eq 'aws') {
         $wanted = ([string]$item.stable_id).Replace('-', '').ToLowerInvariant()
-        $matches = @($disks | Where-Object { ([string]$_.SerialNumber).Trim().Replace('-', '').ToLowerInvariant() -eq $wanted })
+        $matches = @($disks | Where-Object {
+            $serial = ([string]$_.SerialNumber).Trim() -replace '_00000001\.$', ''
+            $serial.Replace('-', '').ToLowerInvariant() -eq $wanted
+        })
     } else {
         $profile = @($metadata.compute.storageProfile.dataDisks | Where-Object {
             [string]$_.managedDisk.id -ieq [string]$item.stable_id

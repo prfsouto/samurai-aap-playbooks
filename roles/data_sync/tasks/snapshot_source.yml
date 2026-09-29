@@ -70,6 +70,13 @@
   no_log: true
   when: not (samurai_candidate_windows | default(false) | bool)
 
+- name: "[data_sync] Track the Windows descriptor directory before writing"
+  ansible.builtin.set_fact:
+    data_sync_snapshot_directory:
+      path: "{{ data_sync_journal_dir }}\\snapshot-{{ data_sync_execution_id }}"
+  when: samurai_candidate_windows | default(false) | bool
+  no_log: true
+
 - name: "[data_sync] Store the Windows descriptor under an ACL-bound attempt directory"
   ansible.windows.win_powershell:
     script: |
