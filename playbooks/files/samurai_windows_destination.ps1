@@ -73,7 +73,8 @@ $observed = @(foreach ($binding in $bindings) {
     if ($provider -eq 'aws') {
         $wanted = $volumeId.Replace('-', '').ToLowerInvariant()
         $matches = @($disks | Where-Object {
-            ([string]$_.SerialNumber).Trim().Replace('-', '').ToLowerInvariant() -eq $wanted
+            $serial = ([string]$_.SerialNumber).Trim() -replace '_00000001\.$', ''
+            $serial.Replace('-', '').ToLowerInvariant() -eq $wanted
         })
     } else {
         $profile = @($metadata.compute.storageProfile.dataDisks | Where-Object {
