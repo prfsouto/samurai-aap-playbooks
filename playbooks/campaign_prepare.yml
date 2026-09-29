@@ -44,6 +44,18 @@
             data_sync_destination_bindings: "{{ vars.get({'aws': 'aws_replacement_destination_bindings', 'azure': 'azure_replacement_destination_bindings'}[samurai_destination_provider], []) }}"
             campaign_data_sync_volume_results: []
 
+        - name: "Select the candidate OS from its approved bootstrap"
+          ansible.builtin.set_fact:
+            samurai_candidate_windows: "{{ vars[samurai_destination_provider ~ '_replacement'].bootstrap == 'windows_powershell' }}"
+
+        - name: "Require a Windows GPT plan only for a Windows candidate"
+          ansible.builtin.assert:
+            that:
+              - "(samurai_candidate_windows | bool) == ((data_sync_destination_intents | map(attribute='filesystem_type') | map('lower') | unique | list) == ['ntfs'])"
+              - "not (samurai_candidate_windows | bool) or (data_sync_destination_intents | selectattr('source_partition_guid', 'defined') | list | length == data_sync_destination_intents | length)"
+            quiet: true
+          when: data_sync_destination_intents | default([]) | length > 0
+
         - name: "Connect only to this candidate"
           ansible.builtin.include_tasks:
             file: tasks/data_continuity_prepare_candidate.yml
@@ -64,21 +76,52 @@
           ansible.builtin.set_fact:
             new_ip: "{{ data_continuity_candidate_address }}"
 
+        - name: "Require a Windows hostname supported by the guest before seed"
+          ansible.builtin.assert:
+            that:
+              - new_hostname | length <= 15
+              - new_hostname | regex_search('^[A-Za-z][A-Za-z0-9-]*$') is not none
+            quiet: true
+          when: samurai_candidate_windows | bool
+
+        - name: "Set Windows candidate hostname before any data snapshot"
+          ansible.windows.win_hostname:
+            name: "{{ new_hostname }}"
+          register: campaign_windows_hostname
+          when: samurai_candidate_windows | bool
+
+        - name: "Reboot only the empty Windows candidate before seed"
+          ansible.windows.win_reboot:
+            reboot_timeout: 900
+          when:
+            - samurai_candidate_windows | bool
+            - campaign_windows_hostname.reboot_required | default(false) | bool
+
         - name: "Collect candidate facts through SSH"
           ansible.builtin.setup:
 
-        - name: "Observe the candidate devices before copying"
+        - name: "Observe the Linux candidate devices before copying"
           samurai_destination_observation:
             organization_id: "{{ organization_id | int }}"
             provider: "{{ samurai_destination_provider }}"
           become: true
           register: campaign_devices
+          when: not (samurai_candidate_windows | bool)
+
+        - name: "Keep Windows candidate disks offline before seed"
+          ansible.windows.win_powershell:
+            path: "{{ playbook_dir }}/files/samurai_windows_destination.ps1"
+            parameters:
+              CommandJson: "{{ {'organization_id': organization_id | int, 'provider': samurai_destination_provider, 'instance_id': replacement.instance_id, 'bindings': data_sync_destination_bindings, 'action': 'prepare'} | to_json }}"
+            error_action: stop
+          register: campaign_windows_devices
+          when: samurai_candidate_windows | bool
 
         - name: "Bind provider identities to observed devices"
           ansible.builtin.set_fact:
-            campaign_destination_observation: "{{ campaign_devices.observation }}"
+            campaign_destination_observation: "{{ campaign_windows_devices.result.observation if samurai_candidate_windows | bool else campaign_devices.observation }}"
             data_sync_destination_bindings: >-
-              {{ data_sync_destination_bindings | samurai_observe_destinations(campaign_devices.observation, replacement.instance_id, samurai_destination_provider) }}
+              {{ data_sync_destination_bindings | samurai_observe_destinations(campaign_windows_devices.result.observation if samurai_candidate_windows | bool else campaign_devices.observation, replacement.instance_id, samurai_destination_provider) }}
 
         - name: "Publish provisioning and destination observations"
           ansible.builtin.include_tasks: tasks/campaign_publish_member.yml
@@ -108,10 +151,12 @@
         - name: "Bootstrap the candidate without formatting replicated volumes"
           ansible.builtin.include_role:
             name: bootstrap
+            tasks_from: "{{ 'windows' if samurai_candidate_windows | bool else 'main' }}"
 
-        - name: "Validate the candidate"
+        - name: "Validate the candidate before final delta"
           ansible.builtin.include_role:
             name: validation
+            tasks_from: "{{ 'windows' if samurai_candidate_windows | bool else 'main' }}"
 
         - name: "Publish seed and candidate validation observations"
           ansible.builtin.include_tasks: tasks/campaign_publish_member.yml
@@ -134,6 +179,15 @@
               loop: "{{ data_sync_items }}"
               loop_control:
                 loop_var: data_sync_guard_item
+              when: not (samurai_candidate_windows | bool)
+
+            - name: "Verify Windows B stayed offline after final delta"
+              ansible.windows.win_powershell:
+                path: "{{ playbook_dir }}/files/samurai_windows_destination.ps1"
+                parameters:
+                  CommandJson: "{{ {'organization_id': organization_id | int, 'provider': samurai_destination_provider, 'instance_id': replacement.instance_id, 'bindings': data_sync_destination_bindings, 'action': 'observe'} | to_json }}"
+                error_action: stop
+              when: samurai_candidate_windows | bool
 
         - name: "Record preparation completion without authorizing cutover"
           ansible.builtin.set_fact:

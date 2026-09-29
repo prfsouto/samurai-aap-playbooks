@@ -33,21 +33,32 @@
     quiet: true
   tags: [data_sync, guard]
 
-- name: "[data_sync] Observe current destination identity before opening it"
+- name: "[data_sync] Observe current Linux destination identity before opening it"
   samurai_destination_observation:
     organization_id: "{{ organization_id | int }}"
     provider: "{{ samurai_destination_provider }}"
   become: "{{ data_sync_become | bool }}"
   register: data_sync_current_devices
+  when: not (samurai_candidate_windows | default(false) | bool)
+  tags: [data_sync, guard]
+
+- name: "[data_sync] Reobserve Windows destination isolation for this attempt"
+  ansible.windows.win_powershell:
+    path: "{{ playbook_dir }}/files/samurai_windows_destination.ps1"
+    parameters:
+      CommandJson: "{{ {'organization_id': organization_id | int, 'provider': samurai_destination_provider, 'instance_id': replacement.instance_id, 'bindings': data_sync_destination_bindings, 'action': 'observe'} | to_json }}"
+    error_action: stop
+  register: data_sync_windows_devices
+  when: samurai_candidate_windows | default(false) | bool
   tags: [data_sync, guard]
 
 - name: "[data_sync] Resolve the destination through its provider evidence"
   ansible.builtin.set_fact:
-    campaign_destination_observation: "{{ data_sync_current_devices.observation }}"
+    campaign_destination_observation: "{{ data_sync_windows_devices.result.observation if samurai_candidate_windows | default(false) | bool else data_sync_current_devices.observation }}"
     data_sync_resolved_device: >-
       {{ data_sync_item_destination_volume | samurai_destination_observed_device(
-         data_sync_current_devices.observation, samurai_destination_provider,
-         data_sync_destination_bindings | default([])) }}
+         data_sync_windows_devices.result.observation if samurai_candidate_windows | default(false) | bool else data_sync_current_devices.observation,
+         samurai_destination_provider, data_sync_destination_bindings | default([])) }}
   tags: [data_sync, guard]
 
 - name: "[data_sync] Require an unmounted destination before seed"
@@ -77,13 +88,13 @@
     data_sync_item_volume_id: "{{ data_sync_item.source_volume_stable_id }}"
   tags: [data_sync]
 
-- name: "[data_sync] Prepare the destination for final delta"
+- name: "[data_sync] Prepare the Linux destination for final delta"
   ansible.builtin.include_tasks: final_delta_destination.yml
-  when: data_sync_item_stage == 'final'
+  when: data_sync_item_stage == 'final' and not (samurai_candidate_windows | default(false) | bool)
   tags: [data_sync, guard]
 
 - name: "[data_sync] Replicate this volume"
-  ansible.builtin.include_tasks: replicate.yml
+  ansible.builtin.include_tasks: "{{ 'replicate_windows.yml' if samurai_candidate_windows | default(false) | bool else 'replicate.yml' }}"
   tags: [data_sync]
 
 # Evidência POR ITEM, publicada assim que o volume termina. Publicar só no fim do

@@ -50,6 +50,7 @@
     state: directory
     mode: "0700"
   become: "{{ data_sync_become | bool }}"
+  when: not (samurai_candidate_windows | default(false) | bool)
 
 - name: "[data_sync] Create a private descriptor directory on the candidate"
   ansible.builtin.tempfile:
@@ -58,6 +59,7 @@
     prefix: samurai-snapshot-
   become: "{{ data_sync_become | bool }}"
   register: data_sync_snapshot_directory
+  when: not (samurai_candidate_windows | default(false) | bool)
 
 - name: "[data_sync] Write the private snapshot descriptor"
   ansible.builtin.copy:
@@ -66,9 +68,41 @@
     mode: "0600"
   become: "{{ data_sync_become | bool }}"
   no_log: true
+  when: not (samurai_candidate_windows | default(false) | bool)
+
+- name: "[data_sync] Store the Windows descriptor under an ACL-bound attempt directory"
+  ansible.windows.win_powershell:
+    script: |
+      [CmdletBinding()]
+      param([string]$DirectoryPath, [string]$Descriptor)
+      $ErrorActionPreference = 'Stop'
+      New-Item -ItemType Directory -Force -Path $DirectoryPath | Out-Null
+      icacls.exe $DirectoryPath /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' | Out-Null
+      if ($LASTEXITCODE -ne 0) { throw 'Private descriptor directory ACL failed.' }
+      $path = Join-Path $DirectoryPath 'source.json'
+      [IO.File]::WriteAllText($path, $Descriptor, [Text.UTF8Encoding]::new($false))
+      icacls.exe $path /inheritance:r /grant:r '*S-1-5-32-544:F' '*S-1-5-18:F' | Out-Null
+      if ($LASTEXITCODE -ne 0) { throw 'Private descriptor file ACL failed.' }
+      $Ansible.Result = @{ path = $path; directory = $DirectoryPath }
+    parameters:
+      DirectoryPath: "{{ data_sync_journal_dir }}\\snapshot-{{ data_sync_execution_id }}"
+      Descriptor: "{{ data_sync_snapshot_response.json.descriptor | to_json }}"
+    error_action: stop
+  register: data_sync_windows_snapshot_directory
+  no_log: true
+  when: samurai_candidate_windows | default(false) | bool
 
 - name: "[data_sync] Select the private file endpoint"
   ansible.builtin.set_fact:
     data_sync_source: "http-source+file://{{ data_sync_snapshot_directory.path }}/source.json"
     data_sync_snapshot_response: {}
   no_log: true
+  when: not (samurai_candidate_windows | default(false) | bool)
+
+- name: "[data_sync] Select the private Windows file endpoint"
+  ansible.builtin.set_fact:
+    data_sync_snapshot_directory: "{{ {'path': data_sync_windows_snapshot_directory.result.directory} }}"
+    data_sync_source: "http-source+file://{{ data_sync_windows_snapshot_directory.result.path }}"
+    data_sync_snapshot_response: {}
+  no_log: true
+  when: samurai_candidate_windows | default(false) | bool
