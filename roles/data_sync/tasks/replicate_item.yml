@@ -45,6 +45,7 @@
 - name: "[data_sync] Reobserve Windows destination isolation for this attempt"
   ansible.windows.win_powershell:
     path: "{{ playbook_dir }}/files/samurai_windows_destination.ps1"
+    depth: 8
     parameters:
       CommandJson: "{{ {'organization_id': organization_id | int, 'provider': samurai_destination_provider, 'instance_id': replacement.instance_id, 'bindings': data_sync_destination_bindings, 'action': 'observe'} | to_json }}"
     error_action: stop
