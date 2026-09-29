@@ -1,0 +1,204 @@
+---
+- name: "[data_sync] Require the Windows source export and isolated physical destination"
+  ansible.builtin.assert:
+    that:
+      - samurai_candidate_windows | bool
+      - data_sync_mode == 'data_volume'
+      - data_sync_source_transport == 'snapshot-export'
+      - data_sync_source_snapshot | length > 0
+      - data_sync_execution_id | regex_search('^[A-Za-z0-9._-]+$') is not none
+      - data_sync_destination | length > 0
+      - data_sync_item_stage in ['seed', 'final']
+      - data_sync_destination_serial | length > 0
+    quiet: true
+
+- name: "[data_sync] Select the durable Windows journal and staged executable"
+  ansible.builtin.set_fact:
+    data_sync_journal_dir: 'C:\ProgramData\SamurAI\replication'
+    data_sync_windows_binary_dest: 'C:\ProgramData\SamurAI\samurai-replicate.exe'
+    data_sync_windows_write_attempted: false
+    data_sync_windows_protection_failed: false
+    data_sync_cleanup_failed: false
+    data_sync_verify: {}
+    data_sync_result: {}
+
+- name: "[data_sync] Open, copy, verify and clean up Windows data"
+  block:
+    - name: "[data_sync] Keep the journal directory between seed and delta"
+      ansible.windows.win_file:
+        path: "{{ data_sync_journal_dir }}"
+        state: directory
+
+    - name: "[data_sync] Restrict journal metadata to Administrator and SYSTEM"
+      ansible.windows.win_powershell:
+        script: |
+          [CmdletBinding()]
+          param([string]$JournalPath)
+          icacls.exe $JournalPath /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Windows replication journal ACL failed.' }
+        parameters:
+          JournalPath: "{{ data_sync_journal_dir }}"
+        error_action: stop
+
+    - name: "[data_sync] Open the private source snapshot descriptor"
+      ansible.builtin.include_tasks: snapshot_source.yml
+
+    - name: "[data_sync] Stage the Windows Replication Engine from its pinned EE"
+      ansible.windows.win_copy:
+        src: /opt/samurai/bin/samurai-replicate.exe
+        dest: "{{ data_sync_windows_binary_dest }}"
+      register: data_sync_windows_binary
+
+    - name: "[data_sync] Record arguments with frozen volume and campaign identity"
+      ansible.builtin.set_fact:
+        data_sync_args: >-
+          {{ ['--source', data_sync_source, '--destination', data_sync_destination,
+              '--execution-id', data_sync_execution_id, '--organization-id', organization_id | string,
+              '--campaign-id', samurai_campaign_id | string,
+              '--campaign-execution-id', samurai_campaign_server_execution_id | string,
+              '--source-volume-id', data_sync_item_volume_id,
+              '--destination-volume-id', data_sync_destination_volume_id,
+              '--expected-destination-serial', data_sync_destination_serial,
+              '--stage', data_sync_item_stage, '--journal-dir', data_sync_journal_dir,
+              '--mode', 'data-volume', '--chunk-size', data_sync_chunk_size | string,
+              '--in-flight', data_sync_in_flight | string, '--epoch-bytes', data_sync_epoch_bytes | string,
+              '--epoch-max-age-ms', data_sync_epoch_max_age_ms | string]
+             + (['--delta'] if data_sync_item_stage == 'final' else []) }}
+
+    - name: "[data_sync] Register the raw-write attempt before changing disk attributes"
+      ansible.builtin.set_fact:
+        data_sync_windows_write_attempted: true
+
+    - name: "[data_sync] Permit only Rust raw writes while the disk stays offline"
+      ansible.windows.win_powershell:
+        path: "{{ playbook_dir }}/files/samurai_windows_destination.ps1"
+        parameters:
+          CommandJson: "{{ {'organization_id': organization_id | int, 'provider': samurai_destination_provider, 'instance_id': replacement.instance_id, 'bindings': data_sync_destination_bindings | selectattr('destination_volume_stable_id', 'equalto', data_sync_destination_volume_id) | list, 'action': 'write'} | to_json }}"
+        error_action: stop
+      register: data_sync_windows_write_guard
+
+    - name: "[data_sync] Prove capacity and sector geometry before raw writes"
+      ansible.windows.win_command:
+        argv: "{{ [data_sync_windows_binary_dest, 'preflight'] + data_sync_args }}"
+      changed_when: false
+
+    - name: "[data_sync] Copy all blocks, including logical zeros"
+      ansible.windows.win_command:
+        argv: "{{ [data_sync_windows_binary_dest, 'copy'] + data_sync_args }}"
+      register: data_sync_run
+      async: "{{ data_sync_timeout_seconds }}"
+      poll: 15
+
+    - name: "[data_sync] Parse the actual Rust copy result"
+      ansible.builtin.set_fact:
+        data_sync_result: "{{ data_sync_run.stdout | from_json }}"
+
+    - name: "[data_sync] Reread both physical endpoints in the same logical range"
+      ansible.windows.win_command:
+        argv: "{{ [data_sync_windows_binary_dest, 'verify'] + data_sync_args }}"
+      register: data_sync_verify_run
+      changed_when: false
+      async: "{{ data_sync_timeout_seconds }}"
+      poll: 15
+
+    - name: "[data_sync] Record a measured verification timestamp on B"
+      ansible.windows.win_powershell:
+        script: '$Ansible.Result = @{ utc = [DateTime]::UtcNow.ToString("o") }'
+      register: data_sync_windows_verify_clock
+      changed_when: false
+
+    - name: "[data_sync] Require matching full-range digests from the engine"
+      ansible.builtin.set_fact:
+        data_sync_verify: "{{ data_sync_verify_run.stdout | from_json }}"
+        data_sync_verify_measured_at: "{{ data_sync_windows_verify_clock.result.utc }}"
+
+    - name: "[data_sync] Reject an incomplete or unequal reread"
+      ansible.builtin.assert:
+        that:
+          - data_sync_verify.comparable | bool
+          - data_sync_verify.source_digest | length > 0
+          - data_sync_verify.source_digest == data_sync_verify.destination_digest
+          - data_sync_verify.source_verified_bytes | int == data_sync_item.size_bytes | int
+          - data_sync_verify.destination_verified_bytes | int == data_sync_item.size_bytes | int
+        quiet: true
+  always:
+    - name: "[data_sync] Restore offline readonly B after success or failure"
+      ansible.windows.win_powershell:
+        path: "{{ playbook_dir }}/files/samurai_windows_destination.ps1"
+        parameters:
+          CommandJson: "{{ {'organization_id': organization_id | int, 'provider': samurai_destination_provider, 'instance_id': replacement.instance_id, 'bindings': data_sync_destination_bindings | selectattr('destination_volume_stable_id', 'equalto', data_sync_destination_volume_id) | list, 'action': 'protect'} | to_json }}"
+        error_action: stop
+      register: data_sync_windows_protect
+      ignore_errors: true
+      when: data_sync_windows_write_attempted | bool
+
+    - name: "[data_sync] Declare uncertain disk protection as a blocking residue"
+      ansible.builtin.set_fact:
+        data_sync_windows_protection_failed: "{{ (data_sync_windows_protect.failed | default(true)) | bool }}"
+        data_sync_cloud_residue: "{{ data_sync_cloud_residue | default([]) + ['disk-protection:' ~ data_sync_destination_volume_id] }}"
+        data_sync_cleanup_failed: true
+      when:
+        - data_sync_windows_write_attempted | bool
+        - data_sync_windows_protect.failed | default(true) | bool
+
+    - name: "[data_sync] Revoke source access even if descriptor creation failed"
+      when: data_sync_source_snapshot | length > 0
+      block:
+        - ansible.builtin.include_tasks: snapshot_cleanup.yml
+      rescue:
+        - ansible.builtin.set_fact:
+            data_sync_cleanup_failed: true
+            data_sync_cloud_residue: "{{ data_sync_cloud_residue | default([]) + ['snapshot-access:' ~ data_sync_execution_id] }}"
+
+    - name: "[data_sync] Preserve descriptor cleanup failure as a blocking residue"
+      ansible.builtin.set_fact:
+        data_sync_cleanup_failed: true
+        data_sync_cloud_residue: "{{ data_sync_cloud_residue | default([]) + ['snapshot-descriptor:' ~ data_sync_execution_id] }}"
+      when:
+        - data_sync_snapshot_directory.path | default('') | length > 0
+        - data_sync_snapshot_windows_observation.stat.exists | default(true) | bool
+
+    - name: "[data_sync] Remove staged Windows executable"
+      ansible.windows.win_file:
+        path: "{{ data_sync_windows_binary_dest }}"
+        state: absent
+      register: data_sync_windows_binary_cleanup
+      ignore_errors: true
+
+    - name: "[data_sync] Observe binary cleanup rather than assuming it"
+      ansible.windows.win_stat:
+        path: "{{ data_sync_windows_binary_dest }}"
+      register: data_sync_windows_binary_observation
+      ignore_errors: true
+
+    - name: "[data_sync] Track unremoved executable for the commit hygiene gate"
+      ansible.builtin.set_fact:
+        campaign_data_sync_tracked_resources: >-
+          {{ campaign_data_sync_tracked_resources | default([]) + [{
+             'kind': 'staged_binary', 'identifier': new_hostname ~ ':' ~ data_sync_windows_binary_dest,
+             'expected_disposition': 'must_be_deleted_before_commit',
+             'actual_state': ('present' if data_sync_windows_binary_observation.stat.exists else 'absent')
+               if data_sync_windows_binary_observation.stat.exists | default(none) | type_debug == 'bool'
+               else 'unknown'}] }}
+        campaign_data_sync_residues: "{{ campaign_data_sync_residues | default([]) + (data_sync_cloud_residue | default([])) }}"
+
+- name: "[data_sync] Refuse to publish success without destination isolation and cleanup"
+  ansible.builtin.assert:
+    that:
+      - not (data_sync_cleanup_failed | bool)
+      - data_sync_verify.comparable | default(false) | bool
+      - data_sync_result.manifest_root_blake3 | default('') | length > 0
+      - not (data_sync_windows_binary_observation.stat.exists | default(true) | bool)
+    quiet: true
+
+- name: "[data_sync] Publish the same per-volume result contract as Linux"
+  ansible.builtin.set_stats:
+    data:
+      data_sync_done: true
+      bytes_copied: "{{ data_sync_result.bytes_copied }}"
+      bytes_skipped_sparse: "{{ data_sync_result.bytes_skipped_sparse }}"
+      sparse_method: "{{ data_sync_result.sparse_method }}"
+      epochs_total: "{{ data_sync_result.epochs_total }}"
+      epochs_resumed: "{{ data_sync_result.epochs_resumed }}"
+      manifest_root_blake3: "{{ data_sync_result.manifest_root_blake3 }}"
+      data_sync_completed_at: "{{ data_sync_windows_verify_clock.result.utc }}"

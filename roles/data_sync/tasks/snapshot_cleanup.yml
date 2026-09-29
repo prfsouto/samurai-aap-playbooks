@@ -4,9 +4,21 @@
     path: "{{ data_sync_snapshot_directory.path }}"
     state: absent
   become: "{{ data_sync_become | bool }}"
-  when: data_sync_snapshot_directory.path | default('') | length > 0
+  when:
+    - data_sync_snapshot_directory.path | default('') | length > 0
+    - not (samurai_candidate_windows | default(false) | bool)
   register: data_sync_snapshot_file_cleanup
   failed_when: false
+
+- name: "[data_sync] Remove the Windows private snapshot descriptor directory"
+  ansible.windows.win_file:
+    path: "{{ data_sync_snapshot_directory.path }}"
+    state: absent
+  register: data_sync_snapshot_windows_cleanup
+  failed_when: false
+  when:
+    - data_sync_snapshot_directory.path | default('') | length > 0
+    - samurai_candidate_windows | default(false) | bool
 
 - name: "[data_sync] Observe the private directory after removal"
   ansible.builtin.stat:
@@ -14,9 +26,20 @@
     get_checksum: false
     get_mime: false
   become: "{{ data_sync_become | bool }}"
-  when: data_sync_snapshot_directory.path | default('') | length > 0
+  when:
+    - data_sync_snapshot_directory.path | default('') | length > 0
+    - not (samurai_candidate_windows | default(false) | bool)
   register: data_sync_snapshot_file_observation
   failed_when: false
+
+- name: "[data_sync] Observe the Windows private directory after removal"
+  ansible.windows.win_stat:
+    path: "{{ data_sync_snapshot_directory.path }}"
+  register: data_sync_snapshot_windows_observation
+  failed_when: false
+  when:
+    - data_sync_snapshot_directory.path | default('') | length > 0
+    - samurai_candidate_windows | default(false) | bool
 
 - name: "[data_sync] Retain descriptor cleanup evidence"
   ansible.builtin.set_fact:
@@ -25,8 +48,8 @@
            {'kind': 'snapshot_source_descriptor',
             'identifier': new_hostname ~ ':' ~ data_sync_snapshot_directory.path,
             'expected_disposition': 'must_be_deleted_before_commit',
-            'actual_state': ('present' if data_sync_snapshot_file_observation.stat.exists else 'absent')
-              if data_sync_snapshot_file_observation.stat.exists | default(none) | type_debug == 'bool' else 'unknown'}
+            'actual_state': ('present' if (data_sync_snapshot_windows_observation.stat.exists if samurai_candidate_windows | default(false) | bool else data_sync_snapshot_file_observation.stat.exists) else 'absent')
+              if (data_sync_snapshot_windows_observation.stat.exists if samurai_candidate_windows | default(false) | bool else data_sync_snapshot_file_observation.stat.exists) | default(none) | type_debug == 'bool' else 'unknown'}
          ] }}
   when: data_sync_snapshot_directory.path | default('') | length > 0
 

@@ -71,6 +71,7 @@ grep -Fqx -- '{key}' "$h/.ssh/authorized_keys" || printf '%s\\n' '{key}' >> "$h/
         return {'publisher': 'Microsoft.Azure.Extensions', 'type': 'CustomScript', 'typeHandlerVersion': '2.1',
                 'autoUpgradeMinorVersion': True, 'settings': {'script': base64.b64encode(script.encode()).decode()}}
     script = f'''$ErrorActionPreference = 'Stop'
+Set-StorageSetting -NewDiskPolicy OfflineAll -ErrorAction Stop
 $u = Get-LocalUser -Name '{user}'
 $admin = Get-LocalGroup -SID 'S-1-5-32-544'
 $members = Get-LocalGroupMember -Group $admin

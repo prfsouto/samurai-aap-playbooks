@@ -31,6 +31,7 @@
     ansible_host: "{{ data_continuity_candidate_address }}"
     ansible_user: "{{ samurai_candidate_login_user }}"
     ansible_connection: ssh
+    ansible_shell_type: "{{ 'powershell' if samurai_candidate_windows | bool else 'sh' }}"
     ansible_ssh_private_key_file: "{{ data_continuity_candidate_key_file | default(omit, true) }}"
 
 - name: "Wait for candidate access"

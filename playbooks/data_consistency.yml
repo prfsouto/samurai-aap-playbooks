@@ -8,11 +8,12 @@
         name: samurai_consistency_source
         ansible_host: "{{ consistency_host }}"
         ansible_connection: ssh
+        ansible_shell_type: "{{ 'powershell' if samurai_consistency_command.parameters.platform | default('linux') == 'windows_server' else 'sh' }}"
 
 - name: Governed source filesystem consistency
   hosts: samurai_consistency_source
   gather_facts: false
-  become: true
+  become: "{{ samurai_consistency_command.parameters.platform | default('linux') != 'windows_server' }}"
   tasks:
     - name: Select a supported source Python without changing the system interpreter
       ansible.builtin.raw: |
@@ -26,13 +27,16 @@
       register: consistency_python
       changed_when: false
       failed_when: consistency_python.rc != 0 or consistency_python.stdout | trim not in ['/usr/bin/python3.11', '/usr/bin/python3.9']
+      when: samurai_consistency_command.parameters.platform | default('linux') != 'windows_server'
     - name: Pin the verified source Python for this job
       ansible.builtin.set_fact:
         ansible_python_interpreter: "{{ consistency_python.stdout | trim }}"
+      when: samurai_consistency_command.parameters.platform | default('linux') != 'windows_server'
     - name: Reject an extra-variable interpreter override
       ansible.builtin.assert:
         that:
           - ansible_python_interpreter == (consistency_python.stdout | trim)
+      when: samurai_consistency_command.parameters.platform | default('linux') != 'windows_server'
     - name: Require the frozen source command
       ansible.builtin.assert:
         that:
@@ -44,8 +48,24 @@
       samurai_consistency:
         command: "{{ samurai_consistency_command }}"
       register: consistency_result
+      when: samurai_consistency_command.parameters.platform | default('linux') != 'windows_server'
     - name: Publish measured source consistency
       ansible.builtin.set_stats:
         data:
           samurai_consistency_observation: "{{ consistency_result.consistency_observation }}"
         aggregate: false
+      when: samurai_consistency_command.parameters.platform | default('linux') != 'windows_server'
+    - name: Validate Windows source identity, partition and elevated token
+      ansible.windows.win_powershell:
+        path: "{{ playbook_dir }}/files/samurai_windows_source_preflight.ps1"
+        parameters:
+          CommandJson: "{{ samurai_consistency_command | to_json }}"
+        error_action: stop
+      register: windows_consistency_result
+      when: samurai_consistency_command.parameters.platform | default('linux') == 'windows_server'
+    - name: Publish measured Windows source preflight
+      ansible.builtin.set_stats:
+        data:
+          samurai_consistency_observation: "{{ windows_consistency_result.result.consistency_observation }}"
+        aggregate: false
+      when: samurai_consistency_command.parameters.platform | default('linux') == 'windows_server'

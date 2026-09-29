@@ -86,6 +86,56 @@ def _azure_destination_disk(volume_id, observation, binding):
     return devices[0]
 
 
+def _windows_destination_disk(volume_id, observation, provider, binding):
+    cloud = observation.get('cloud') or {}
+    devices = observation.get('blockdevices')
+    if (cloud.get('platform') != 'windows_server' or cloud.get('provider') != provider
+            or not isinstance(devices, list) or type(observation.get('organization_id')) is not int
+            or observation['organization_id'] <= 0):
+        raise StorageObservationError('Windows guest and tenant observation is incomplete')
+    expected = _identity(volume_id)
+    if isinstance(binding, list):
+        owned = [row for row in binding if isinstance(row, dict)
+                 and _identity(row.get('destination_volume_stable_id')) == expected]
+        if len(owned) != 1:
+            raise StorageObservationError('Windows destination binding is ambiguous')
+        binding = owned[0]
+    if (not isinstance(binding, dict) or not isinstance(cloud.get('instance_id'), str)
+            or cloud['instance_id'].casefold() != str(binding.get('candidate_instance_id', '')).casefold()):
+        raise StorageObservationError('Windows guest is not the bound candidate')
+    if provider == 'aws':
+        matches = [row for row in devices if isinstance(row, dict)
+                   and str(row.get('serial') or '').replace('-', '').casefold() == expected.replace('-', '')]
+    elif provider == 'azure':
+        vm_uuid = str(UUID(cloud.get('vm_id')))
+        if (str(UUID((observation.get('host') or {}).get('product_uuid'))) != vm_uuid
+                or str(UUID(binding.get('instance_uuid'))) != vm_uuid
+                or str(cloud.get('instance_id', '')).casefold() != str(binding.get('candidate_instance_id', '')).casefold()):
+            raise StorageObservationError('Azure Windows guest and provider VM identities differ')
+        lun = binding.get('attached_lun')
+        if type(lun) is not int or lun < 0:
+            raise StorageObservationError('Azure Windows attached LUN is invalid')
+        data_disks = (cloud.get('storage_profile') or {}).get('dataDisks')
+        if not isinstance(data_disks, list):
+            raise StorageObservationError('Azure Windows disk attachment list is missing')
+        attached = [disk for disk in data_disks if isinstance(disk, dict)
+                    and _identity((disk.get('managedDisk') or {}).get('id')) == expected
+                    and str(disk.get('lun')) == str(lun)]
+        if len(attached) != 1:
+            raise StorageObservationError('Azure Windows disk LUN is not owned by this VM')
+        matches = [row for row in devices if isinstance(row, dict)
+                   and row.get('lun') == lun]
+    else:
+        raise StorageObservationError('Windows destination provider is unsupported')
+    if len(matches) != 1:
+        raise StorageObservationError('Windows provider disk is missing or ambiguous')
+    disk = matches[0]
+    if (disk.get('type') != 'disk' or not str(disk.get('name') or '').startswith(r'\\.\PhysicalDrive')
+            or disk.get('offline') is not True or disk.get('readonly') is not True):
+        raise StorageObservationError('Windows data disk is not an isolated physical destination')
+    return disk
+
+
 _DESTINATION_FINDERS = {"aws": _aws_destination_disk, "azure": _azure_destination_disk}
 
 
@@ -94,6 +144,8 @@ def _find_destination_disk(provider_volume_id, observation, provider, binding=No
     if find is None:
         raise StorageObservationError("Destination provider is required and must be supported")
     try:
+        if (observation.get('cloud') or {}).get('platform') == 'windows_server':
+            return _windows_destination_disk(provider_volume_id, observation, provider, binding or {})
         device = find(provider_volume_id, observation, binding or {})
         if device.get('type') != 'disk' or not str(device.get('name', '')).startswith('/dev/'):
             raise StorageObservationError('Destination is not an observed disk device')

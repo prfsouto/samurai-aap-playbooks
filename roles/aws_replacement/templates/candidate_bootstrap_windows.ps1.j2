@@ -1,5 +1,6 @@
 <powershell>
 $ErrorActionPreference = 'Stop'
+Set-StorageSetting -NewDiskPolicy OfflineAll -ErrorAction Stop
 $candidateUser = '{{ aws_replacement_ssh_username }}'
 $candidateKey  = '{{ aws_replacement_ssh_public_key }}'
 if (-not (Get-LocalUser -Name $candidateUser -ErrorAction SilentlyContinue)) {

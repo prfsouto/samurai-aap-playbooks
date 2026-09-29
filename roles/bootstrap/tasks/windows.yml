@@ -1,0 +1,50 @@
+---
+- name: "[bootstrap] Require a valid Windows candidate hostname"
+  ansible.builtin.assert:
+    that:
+      - samurai_candidate_windows | bool
+      - new_hostname | length <= 15
+      - new_hostname | regex_search('^[A-Za-z][A-Za-z0-9-]*$') is not none
+      - not (bootstrap_install_security | bool) or samurai_windows_security_service | default('') | length > 0
+    quiet: true
+
+- name: "[bootstrap] Confirm the hostname fixed before seed still matches B"
+  ansible.windows.win_powershell:
+    script: |
+      [CmdletBinding()]
+      param([string]$ExpectedName)
+      if ($env:COMPUTERNAME -ine $ExpectedName) { throw 'Windows candidate hostname changed after seed.' }
+      $Ansible.Result = @{ hostname = $env:COMPUTERNAME }
+    parameters:
+      ExpectedName: "{{ new_hostname }}"
+    error_action: stop
+  changed_when: false
+
+- name: "[bootstrap] Reassert offline isolation without a reboot"
+  ansible.windows.win_powershell:
+    path: "{{ playbook_dir }}/files/samurai_windows_destination.ps1"
+    parameters:
+      CommandJson: "{{ {'organization_id': organization_id | int, 'provider': samurai_destination_provider, 'instance_id': replacement.instance_id, 'bindings': data_sync_destination_bindings, 'action': 'prepare'} | to_json }}"
+    error_action: stop
+  register: data_sync_windows_bootstrap_disks
+  when: data_sync_destination_bindings | default([]) | length > 0
+
+- name: "[bootstrap] Require the approved Windows image to carry monitoring if requested"
+  ansible.windows.win_service:
+    name: Telegraf
+    state: started
+  when: bootstrap_install_monitoring | bool
+
+- name: "[bootstrap] Require the approved Windows image to carry its security service"
+  ansible.windows.win_service:
+    name: "{{ samurai_windows_security_service }}"
+    state: started
+  when: bootstrap_install_security | bool
+
+- name: "[bootstrap] Publish verified Windows bootstrap completion"
+  ansible.builtin.set_stats:
+    data:
+      bootstrap_done: true
+      bootstrapped_at: "{{ ansible_date_time.iso8601 | default('') }}"
+    aggregate: false
+    per_host: false

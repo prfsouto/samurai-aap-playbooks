@@ -1,0 +1,65 @@
+---
+- name: "[validation] Verify Windows Server health without mounting the data disks"
+  ansible.windows.win_powershell:
+    script: |
+      [CmdletBinding()]
+      param([int]$MinimumFreePercent, [string[]]$RequiredServices)
+      $ErrorActionPreference = 'Stop'
+      $os = Get-CimInstance Win32_OperatingSystem
+      if ([int]$os.ProductType -ne 3 -or [int]$os.BuildNumber -lt 20348) {
+        throw 'Candidate is not an approved Windows Server generation.'
+      }
+      $root = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+      if ($null -eq $root -or [long]$root.Size -le 0) {
+        throw 'Windows candidate root capacity is unavailable.'
+      }
+      $free = [math]::Floor(100 * [long]$root.FreeSpace / [long]$root.Size)
+      if ($free -lt $MinimumFreePercent) { throw 'Windows candidate root has insufficient free capacity.' }
+      $checks = @(@{ name = 'server_os'; status = 'passed'; build = [string]$os.BuildNumber },
+                  @{ name = 'root_free_pct'; status = 'passed'; value = $free })
+      foreach ($serviceName in $RequiredServices) {
+        $service = Get-Service -Name $serviceName -ErrorAction Stop
+        if ($service.Status -ne 'Running') { throw "Required Windows service $serviceName is not running." }
+        $checks += @{ name = "service_$serviceName"; status = 'passed' }
+      }
+      $Ansible.Result = @{ validation_passed = $true; checks = $checks;
+          measured_at = [DateTime]::UtcNow.ToString('o') }
+    parameters:
+      MinimumFreePercent: "{{ validation_min_disk_free_pct | int }}"
+      RequiredServices: "{{ validation_required_services }}"
+    error_action: stop
+  register: data_sync_windows_health
+
+- name: "[validation] Prove every REQUIRED data disk remains offline and readonly"
+  ansible.windows.win_powershell:
+    path: "{{ playbook_dir }}/files/samurai_windows_destination.ps1"
+    parameters:
+      CommandJson: "{{ {'organization_id': organization_id | int, 'provider': samurai_destination_provider, 'instance_id': replacement.instance_id, 'bindings': data_sync_destination_bindings, 'action': 'observe'} | to_json }}"
+    error_action: stop
+  register: data_sync_windows_validation_disks
+  when: data_sync_destination_bindings | default([]) | length > 0
+
+- name: "[validation] Check every required candidate TCP port"
+  ansible.builtin.wait_for:
+    host: "{{ new_ip }}"
+    port: "{{ item }}"
+    timeout: 10
+    state: started
+  delegate_to: localhost
+  loop: "{{ validation_required_ports }}"
+
+- name: "[validation] Refuse an incomplete Windows health observation"
+  ansible.builtin.assert:
+    that:
+      - data_sync_windows_health.result.validation_passed is sameas true
+      - data_sync_windows_health.result.checks | length >= 2
+      - data_sync_destination_bindings | default([]) | length == 0 or data_sync_windows_validation_disks.result.observation.blockdevices | length == data_sync_destination_bindings | length
+    quiet: true
+
+- name: "[validation] Publish the observed Windows candidate checks"
+  ansible.builtin.set_stats:
+    data:
+      validation_passed: "{{ data_sync_windows_health.result.validation_passed }}"
+      validation_checks: "{{ data_sync_windows_health.result.checks }}"
+    aggregate: false
+    per_host: false

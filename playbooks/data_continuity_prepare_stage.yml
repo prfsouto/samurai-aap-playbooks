@@ -16,5 +16,9 @@
               - new_hostname == replacement.hostname
             quiet: true
 
+        - name: "Select the shell of the frozen candidate image"
+          ansible.builtin.set_fact:
+            samurai_candidate_windows: "{{ vars[samurai_destination_provider ~ '_replacement'].bootstrap == 'windows_powershell' }}"
+
         - name: "Bind and check access to the individual candidate"
           ansible.builtin.include_tasks: tasks/data_continuity_prepare_candidate.yml
