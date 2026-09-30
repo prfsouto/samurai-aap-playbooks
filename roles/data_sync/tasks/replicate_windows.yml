@@ -21,6 +21,9 @@
     data_sync_cleanup_failed: false
     data_sync_verify: {}
     data_sync_result: {}
+    campaign_data_sync_used_cloud_source: >-
+      {{ (campaign_data_sync_used_cloud_source | default(false) | bool)
+         or (data_sync_source_snapshot | length > 0) }}
 
 - name: "[data_sync] Open, copy, verify and clean up Windows data"
   block:
