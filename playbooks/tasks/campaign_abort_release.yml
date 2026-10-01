@@ -11,17 +11,28 @@
   vars:
     data_continuity_callback_operation: release-quiesce
 
-- name: Restore source writes after the observed preparation failure
-  ansible.builtin.uri:
-    url: "{{ samurai_engine_base_url | regex_replace('/$', '') }}/campaign-executions/{{ samurai_campaign_server_execution_id }}/data-continuity/release-quiesce"
-    method: POST
-    headers: "{{ data_continuity_callback_headers }}"
-    body_format: json
-    body: {}
-    status_code: [200]
-    timeout: 300
-  register: campaign_abort_release
-  no_log: true
+- name: Restore source writes after the observed preparation failure with private transport
+  block:
+    - name: Restore source writes after the observed preparation failure
+      ansible.builtin.uri:
+        url: "{{ samurai_engine_base_url | regex_replace('/$', '') }}/campaign-executions/{{ samurai_campaign_server_execution_id }}/data-continuity/release-quiesce"
+        method: POST
+        headers: "{{ data_continuity_callback_headers }}"
+        body_format: json
+        body: {}
+        status_code: [200]
+        timeout: 300
+      register: campaign_abort_release
+      no_log: true
+  rescue:
+    - name: Report the scoped transport failure without private values
+      ansible.builtin.include_tasks: campaign_callback_diagnostic.yml
+      vars:
+        campaign_diagnostic_result: "{{ campaign_abort_release | default({}) }}"
+        campaign_diagnostic_operation: "release-quiesce"
+    - name: Stop the failed stage after its safe diagnostic
+      ansible.builtin.fail:
+        msg: "Governed callback stage failed; see scoped safe diagnostic"
 
 - name: Require measured source recovery
   ansible.builtin.assert:

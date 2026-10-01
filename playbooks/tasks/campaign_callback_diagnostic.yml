@@ -1,0 +1,22 @@
+---
+- name: Emit only bounded callback outcome fields
+  ansible.builtin.debug:
+    msg:
+      event: campaign.callback.request.failed
+      organization_id: "{{ organization_id | int }}"
+      campaign_execution_id: "{{ samurai_campaign_server_execution_id | int }}"
+      execution_id: "{{ samurai_execution_id | default('') | regex_search('^[A-Za-z0-9._:-]{1,128}$') | default('unknown', true) }}"
+      operation: "{{ campaign_diagnostic_operation }}"
+      http_status: "{{ campaign_diagnostic_result.status | default(-1) | int }}"
+      attempts: "{{ campaign_diagnostic_result.attempts | default(0) | int }}"
+      elapsed_seconds: "{{ campaign_diagnostic_result.elapsed | default(-1) | int }}"
+      pending: "{{ (campaign_diagnostic_result.json | default({})).pending | default(false) | bool }}"
+      opened: "{{ (campaign_diagnostic_result.json | default({})).opened | default(false) | bool }}"
+      released: "{{ (campaign_diagnostic_result.json | default({})).released | default(false) | bool }}"
+      error_kind: >-
+        {{ 'conditional' if (campaign_diagnostic_result.msg | default('') | regex_search('(?i)conditional|condition failed|Conditional result'))
+           else 'timeout' if (campaign_diagnostic_result.msg | default('') | regex_search('(?i)timed out|timeout'))
+           else 'tls' if (campaign_diagnostic_result.msg | default('') | regex_search('(?i)certificate|ssl|tls'))
+           else 'http' if (campaign_diagnostic_result.status | default(-1) | int) >= 100
+           else 'unknown' }}
+      bytes_processed: 0
