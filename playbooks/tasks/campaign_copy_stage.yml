@@ -10,23 +10,34 @@
   vars:
     data_continuity_callback_operation: "{{ campaign_copy_operation }}"
 
-- name: "Request the governed copy stage"
-  ansible.builtin.uri:
-    url: "{{ samurai_engine_base_url | regex_replace('/$', '') }}/campaign-executions/{{ samurai_campaign_server_execution_id }}/data-continuity/{{ campaign_copy_operation }}"
-    method: POST
-    headers: "{{ data_continuity_callback_headers }}"
-    body_format: json
-    body: >-
-      {{ {'source_instance_id': samurai_source_instance_id}
-         | combine({'lease_seconds': samurai_quiesce_lease_seconds | default(900) | int}
-                   if campaign_copy_operation == 'open-final-delta' else {}) }}
-    status_code: [200]
-    timeout: 300
-  register: campaign_open_stage
-  until: not (campaign_open_stage.json.pending | default(false) | bool)
-  retries: "{{ 180 if campaign_copy_operation == 'open-seed' else 120 }}"
-  delay: 5
-  no_log: true
+- name: Request the governed copy stage with private transport
+  block:
+    - name: "Request the governed copy stage"
+      ansible.builtin.uri:
+        url: "{{ samurai_engine_base_url | regex_replace('/$', '') }}/campaign-executions/{{ samurai_campaign_server_execution_id }}/data-continuity/{{ campaign_copy_operation }}"
+        method: POST
+        headers: "{{ data_continuity_callback_headers }}"
+        body_format: json
+        body: >-
+          {{ {'source_instance_id': samurai_source_instance_id}
+             | combine({'lease_seconds': samurai_quiesce_lease_seconds | default(900) | int}
+                       if campaign_copy_operation == 'open-final-delta' else {}) }}
+        status_code: [200]
+        timeout: 300
+      register: campaign_open_stage
+      until: not (campaign_open_stage.json.pending | default(false) | bool)
+      retries: "{{ 180 if campaign_copy_operation == 'open-seed' else 120 }}"
+      delay: 5
+      no_log: true
+  rescue:
+    - name: Report the scoped transport failure without private values
+      ansible.builtin.include_tasks: campaign_callback_diagnostic.yml
+      vars:
+        campaign_diagnostic_result: "{{ campaign_open_stage | default({}) }}"
+        campaign_diagnostic_operation: "{{ campaign_copy_operation }}"
+    - name: Stop the failed stage after its safe diagnostic
+      ansible.builtin.fail:
+        msg: "Governed callback stage failed; see scoped safe diagnostic"
 
 - name: "Require the actual execution items for this stage"
   ansible.builtin.assert:
