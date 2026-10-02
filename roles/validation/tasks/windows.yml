@@ -57,6 +57,11 @@
       - data_sync_destination_bindings | default([]) | length == 0 or data_sync_windows_validation_disks.result.observation.blockdevices | length == data_sync_destination_bindings | length
     quiet: true
 
+- name: "[validation] Retain the observed Windows result for campaign consumers"
+  ansible.builtin.set_fact:
+    validation_passed: "{{ data_sync_windows_health.result.validation_passed }}"
+    validation_checks: "{{ data_sync_windows_health.result.checks }}"
+
 - name: "[validation] Publish the observed Windows candidate checks"
   ansible.builtin.set_stats:
     data:
