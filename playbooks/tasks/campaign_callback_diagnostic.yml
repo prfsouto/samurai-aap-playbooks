@@ -13,6 +13,12 @@
       pending: "{{ (campaign_diagnostic_result.json | default({})).pending | default(false) | bool }}"
       opened: "{{ (campaign_diagnostic_result.json | default({})).opened | default(false) | bool }}"
       released: "{{ (campaign_diagnostic_result.json | default({})).released | default(false) | bool }}"
+      reason_code: >-
+        {{ 'WINDOWS_GUEST_VOLUME_PROOF_UNAVAILABLE'
+           if (campaign_diagnostic_result.json | default({})).reason | default('')
+              in ['Windows guest proof contains another volume', 'Windows abort proof includes a foreign volume']
+           else 'CONTRACT_REFUSAL_UNCLASSIFIED' }}
+      correlation_id: "{{ campaign_diagnostic_result.x_correlation_id | default('') | regex_search('^[0-9a-fA-F-]{36}$') | default('unavailable', true) }}"
       error_kind: >-
         {{ 'conditional' if (campaign_diagnostic_result.msg | default('') | regex_search('(?i)conditional|condition failed|Conditional result'))
            else 'timeout' if (campaign_diagnostic_result.msg | default('') | regex_search('(?i)timed out|timeout'))

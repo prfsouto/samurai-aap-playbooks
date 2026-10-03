@@ -40,13 +40,21 @@
         msg: "Governed callback stage failed; see scoped safe diagnostic"
 
 - name: "Require the actual execution items for this stage"
-  ansible.builtin.assert:
-    that:
-      - campaign_open_stage.json.opened | default(false) | bool
-      - campaign_open_stage.json.data_sync_items | default([]) | length > 0
-      - campaign_open_stage.json.data_sync_items | map(attribute='stage') | unique | list == [ 'seed' if campaign_copy_operation == 'open-seed' else 'final' ]
-    fail_msg: "The Engine did not authorize the requested copy stage with execution evidence"
-    quiet: true
+  block:
+    - ansible.builtin.assert:
+        that:
+          - campaign_open_stage.json.opened | default(false) | bool
+          - campaign_open_stage.json.data_sync_items | default([]) | length > 0
+          - campaign_open_stage.json.data_sync_items | map(attribute='stage') | unique | list == [ 'seed' if campaign_copy_operation == 'open-seed' else 'final' ]
+        fail_msg: "The Engine did not authorize the requested copy stage with execution evidence"
+        quiet: true
+  rescue:
+    - ansible.builtin.include_tasks: campaign_callback_diagnostic.yml
+      vars:
+        campaign_diagnostic_result: "{{ campaign_open_stage }}"
+        campaign_diagnostic_operation: "{{ campaign_copy_operation }}"
+    - ansible.builtin.fail:
+        msg: "Governed copy stage refused; see scoped safe diagnostic"
 
 - name: "Use only the execution items returned by the Engine"
   ansible.builtin.set_fact:

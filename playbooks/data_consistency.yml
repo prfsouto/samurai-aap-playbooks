@@ -58,6 +58,7 @@
     - name: Validate Windows source identity, partition and elevated token
       ansible.windows.win_powershell:
         path: "{{ playbook_dir }}/files/samurai_windows_source_preflight.ps1"
+        depth: 8
         parameters:
           CommandJson: "{{ samurai_consistency_command | to_json }}"
         error_action: stop
