@@ -23,6 +23,9 @@
         status_code: [200]
         timeout: 300
       register: campaign_abort_release
+      until: not (campaign_abort_release.json.pending | default(false) | bool)
+      retries: 120
+      delay: 5
       no_log: true
   rescue:
     - name: Report the scoped transport failure without private values
@@ -35,11 +38,16 @@
         msg: "Governed callback stage failed; see scoped safe diagnostic"
 
 - name: Require measured source recovery
-  ansible.builtin.assert:
-    that:
-      - (campaign_abort_release.json | default({})).released | default(false) | bool
-    fail_msg: >-
-      Source recovery was not confirmed:
-      {{ (campaign_abort_release.json | default({})).reason
-         | default((campaign_abort_release.json | default({})).detail | default('no recovery evidence')) }}
-    quiet: true
+  block:
+    - ansible.builtin.assert:
+        that:
+          - (campaign_abort_release.json | default({})).released | default(false) | bool
+        fail_msg: "Source recovery was not confirmed"
+        quiet: true
+  rescue:
+    - ansible.builtin.include_tasks: campaign_callback_diagnostic.yml
+      vars:
+        campaign_diagnostic_result: "{{ campaign_abort_release }}"
+        campaign_diagnostic_operation: release-quiesce
+    - ansible.builtin.fail:
+        msg: "Source recovery unconfirmed; see scoped safe diagnostic"
