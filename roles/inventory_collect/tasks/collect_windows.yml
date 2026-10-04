@@ -26,6 +26,18 @@
       {{ ansible_facts | combine({'samurai_windows_storage': inventory_collect_windows_storage.stdout | from_json}) }}
   tags: [inventory_collect, collect]
 
+- name: "[inventory_collect] Observe native Windows security inventory (read-only)"
+  ansible.windows.win_shell: "{{ lookup('ansible.builtin.file', role_path + '/files/collect_windows_security.ps1') }}"
+  register: inventory_collect_windows_security
+  changed_when: false
+  tags: [inventory_collect, collect]
+
+- name: "[inventory_collect] Publish native Windows security observations"
+  ansible.builtin.set_fact:
+    ansible_facts: >-
+      {{ ansible_facts | combine({'samurai_windows_security': inventory_collect_windows_security.stdout | from_json}) }}
+  tags: [inventory_collect, collect]
+
 - name: "[inventory_collect] Enumerate installed packages via the registry (read-only)"
   # O Windows Server 2022 entrega **PowerShell 5.1** (medido: powershell_version
   # 5 na coleta 208). O `-AsArray` do ConvertTo-Json só existe do PowerShell 6
