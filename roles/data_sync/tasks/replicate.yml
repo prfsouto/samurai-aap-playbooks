@@ -260,13 +260,18 @@
       when: data_sync_verify_enabled | bool
       tags: [data_sync]
 
+    - name: "[data_sync] Observe verification completion time in UTC"
+      ansible.builtin.command:
+        argv: [date, -u, '+%Y-%m-%dT%H:%M:%S.%NZ']
+      register: data_sync_verify_clock
+      changed_when: false
+      tags: [data_sync]
+
     - name: "[data_sync] Parse the verification result"
       ansible.builtin.set_fact:
         data_sync_verify: "{{ data_sync_verify_run.stdout | from_json }}"
-        # O instante em que a MEDIDA foi tomada. O control plane compara a
-        # evidência com o nascimento do candidato; a hora da ingestão não
-        # responde quando o disco foi lido.
-        data_sync_verify_measured_at: "{{ ansible_date_time.iso8601 | default('') }}"
+        # Hora de conclusão da releitura, posterior ao verify; não o fato coletado no início do play.
+        data_sync_verify_measured_at: "{{ data_sync_verify_clock.stdout | trim }}"
       when:
         - data_sync_verify_enabled | bool
         - data_sync_verify_run.stdout | default('') | length > 0
@@ -460,5 +465,5 @@
       epochs_total: "{{ data_sync_result.epochs_total }}"
       epochs_resumed: "{{ data_sync_result.epochs_resumed }}"
       manifest_root_blake3: "{{ data_sync_result.manifest_root_blake3 }}"
-      data_sync_completed_at: "{{ ansible_date_time.iso8601 | default('') }}"
+      data_sync_completed_at: "{{ data_sync_verify_clock.stdout | trim }}"
   tags: [data_sync]
