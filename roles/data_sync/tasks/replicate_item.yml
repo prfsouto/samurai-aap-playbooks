@@ -130,7 +130,7 @@
           destination_verified_bytes: "{{ (data_sync_verify | default({})).destination_verified_bytes | default(0) }}"
           destination_device_size: "{{ (data_sync_verify | default({})).destination_device_size | default(0) }}"
           destination_device: "{{ data_sync_destination }}"
-          completed_at: "{{ ansible_date_time.iso8601 | default('') }}"
+          completed_at: "{{ ((data_sync_verify_clock | default({})).stdout | default(data_sync_verify_measured_at | default(''))) | trim }}"
   tags: [data_sync]
 
 - name: "[data_sync] Retain observed results for the current campaign member"
