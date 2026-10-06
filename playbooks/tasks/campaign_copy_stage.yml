@@ -22,10 +22,12 @@
           {{ {'source_instance_id': samurai_source_instance_id}
              | combine({'lease_seconds': samurai_quiesce_lease_seconds | default(900) | int}
                        if campaign_copy_operation == 'open-final-delta' else {}) }}
-        status_code: [200]
+        status_code: [200, 425]
         timeout: 300
       register: campaign_open_stage
-      until: not (campaign_open_stage.json.pending | default(false) | bool)
+      until: >-
+        (campaign_open_stage.status | default(0) | int != 425)
+        and not (campaign_open_stage.json.pending | default(false) | bool)
       retries: "{{ 180 if campaign_copy_operation == 'open-seed' else 120 }}"
       delay: 5
       no_log: true
