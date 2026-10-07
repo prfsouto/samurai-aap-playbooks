@@ -161,9 +161,20 @@
   failed_when: false
   tags: [inventory_collect, collect, functional]
 
+- name: "[inventory_collect] Observe IIS endpoint and service configuration (read-only)"
+  ansible.windows.win_shell: "{{ lookup('ansible.builtin.file', role_path + '/files/collect_windows_iis_function.ps1') }}"
+  register: inventory_collect_windows_iis_function
+  changed_when: false
+  failed_when: false
+  tags: [inventory_collect, collect, functional]
+
 - name: "[inventory_collect] Record functional observations (Windows)"
   ansible.builtin.set_fact:
     inventory_collect_functional:
+      windows_iis_observation: >-
+        {{ inventory_collect_windows_iis_function.stdout | from_json
+           if (inventory_collect_windows_iis_function.rc | default(1)) == 0
+           else {'schema_version': 'samurai.windows_iis_function_observation/v1', 'observation_state': 'unavailable'} }}
       # Chegar até aqui pela conexão da máquina prova a conversa SSH usada
       # por esta coleta — o OpenSSH nativo do Windows Server.
       ssh_ok: true
