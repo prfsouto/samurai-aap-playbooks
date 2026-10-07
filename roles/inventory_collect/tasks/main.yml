@@ -3,6 +3,17 @@
 # mutated by this role. The package map and workload evidence are observations
 # only; downstream deterministic ETL owns interpretation.
 
+- name: "[inventory_collect] Require the explicit dependency collection context"
+  ansible.builtin.assert:
+    that:
+      - inventory_collect_schema == ('samurai.inventory_collect/v2' if (inventory_collect_dependency_observation_enabled | bool) else 'samurai.inventory_collect/v1')
+      - not (inventory_collect_dependency_observation_enabled | bool) or (inventory_collect_dependency_request is mapping and inventory_collect_dependency_request | length > 0)
+      - not (inventory_collect_dependency_observation_enabled | bool) or ((asset_id | default(0) | int) > 0 and (managed_server_id | default(0) | int) > 0 and (collection_run_id | default(0) | int) > 0)
+      - not (inventory_collect_dependency_observation_enabled | bool) or ((ansible_facts.os_family | default('')) == 'Windows' or (ansible_facts.system | default('')) == 'Linux')
+      - not (inventory_collect_dependency_observation_enabled | bool) or (inventory_collect_dependency_request.collector.platform == ('windows' if (ansible_facts.os_family | default('')) == 'Windows' else 'linux'))
+    fail_msg: "Dependency observation requires an approved profile, explicit limits and tenant/Asset/server/run identity."
+  tags: [inventory_collect, dependency_observation]
+
 - name: "[inventory_collect] Display incoming payload (the presigned URL carries the signature, so only its presence is shown)"
   ansible.builtin.debug:
     msg:
@@ -23,6 +34,11 @@
   ansible.builtin.include_tasks:
     file: "collect_{{ 'windows' if (ansible_facts.os_family | default('')) == 'Windows' else 'linux' }}.yml"
   tags: [inventory_collect, collect]
+
+- name: "[inventory_collect] Collect dependency observations only when explicitly requested"
+  ansible.builtin.include_tasks: collect_dependency.yml
+  when: inventory_collect_dependency_observation_enabled | bool
+  tags: [inventory_collect, dependency_observation]
 
 - name: "[inventory_collect] Publish the facts document (common to every arm)"
   ansible.builtin.include_tasks: publish.yml

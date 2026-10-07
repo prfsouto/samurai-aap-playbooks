@@ -38,10 +38,31 @@
       packages: "{{ ansible_facts.packages | default({}) }}"
   tags: [inventory_collect]
 
+- name: "[inventory_collect] Attach only the actual opt-in dependency evidence"
+  ansible.builtin.set_fact:
+    inventory_collect_document: >-
+      {{ inventory_collect_document | combine({
+          'asset_id': asset_id,
+          'managed_server_id': managed_server_id,
+          'collection_run_id': collection_run_id,
+          'dependency_observation': inventory_collect_dependency_observation
+        }) }}
+  when: inventory_collect_dependency_observation_enabled | bool
+  no_log: true
+  tags: [inventory_collect, dependency_observation]
+
 - name: "[inventory_collect] Serialize the facts document once (the exact bytes that get uploaded)"
   ansible.builtin.set_fact:
-    inventory_collect_document_json: "{{ inventory_collect_document | to_json }}"
+    inventory_collect_document_json: "{{ inventory_collect_document | to_json(ensure_ascii=True) }}"
   tags: [inventory_collect]
+
+- name: "[inventory_collect] Enforce the approved complete raw byte limit before upload"
+  ansible.builtin.assert:
+    that:
+      - inventory_collect_document_json | length <= inventory_collect_dependency_request.limits.max_raw_bytes
+    fail_msg: "Raw v2 exceeds the approved publication byte limit."
+  when: inventory_collect_dependency_observation_enabled | bool
+  tags: [inventory_collect, dependency_observation]
 
 - name: "[inventory_collect] Record integrity (sha256), size and package count"
   ansible.builtin.set_fact:
@@ -107,6 +128,8 @@
       facts_sha256: "{{ inventory_collect_facts_sha256 }}"
       facts_size_bytes: "{{ inventory_collect_facts_size_bytes }}"
       packages_count: "{{ inventory_collect_packages_count }}"
+      raw_schema: "{{ inventory_collect_schema }}"
+      dependency_observation_requested: "{{ inventory_collect_dependency_observation_enabled | bool }}"
       workload_root_signal: >-
         {{ 'apt_manual' if inventory_collect_manual_packages is defined else 'unavailable' }}
       workload_root_status: "{{ inventory_collect_manual_packages_status }}"

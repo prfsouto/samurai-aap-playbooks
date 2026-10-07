@@ -1,0 +1,39 @@
+---
+- name: "[inventory_collect] Read approved Linux dependency projections"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_facts.python.executable }}"
+      - -c
+      - "{{ lookup('ansible.builtin.file', role_path + '/files/collect_dependency_linux.py') }}"
+      - "{{ inventory_collect_dependency_request | to_json }}"
+  register: inventory_collect_dependency_linux
+  changed_when: false
+  async: "{{ inventory_collect_dependency_request.limits.max_duration_seconds | int }}"
+  poll: 1
+  no_log: true
+  when: inventory_collect_dependency_request.collector.platform == 'linux'
+  tags: [inventory_collect, dependency_observation]
+
+- name: "[inventory_collect] Read approved Windows dependency projections"
+  ansible.windows.win_shell: |
+    {{ lookup('ansible.builtin.file', role_path + '/files/collect_dependency_windows.ps1') }}
+    $json = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{{ inventory_collect_dependency_request | to_json | b64encode }}'))
+    $request = ConvertFrom-DependencyRequestJson $json
+    $observation = Invoke-DependencyCollection $request
+    ConvertTo-StableJson $observation
+  register: inventory_collect_dependency_windows
+  changed_when: false
+  async: "{{ inventory_collect_dependency_request.limits.max_duration_seconds | int }}"
+  poll: 1
+  no_log: true
+  when: inventory_collect_dependency_request.collector.platform == 'windows'
+  tags: [inventory_collect, dependency_observation]
+
+- name: "[inventory_collect] Retain the actual dependency source results"
+  ansible.builtin.set_fact:
+    inventory_collect_dependency_observation: >-
+      {{ (inventory_collect_dependency_windows.stdout
+          if inventory_collect_dependency_request.collector.platform == 'windows'
+          else inventory_collect_dependency_linux.stdout) | from_json }}
+  no_log: true
+  tags: [inventory_collect, dependency_observation]

@@ -58,4 +58,8 @@ inventory_collect_facts_s3_put_headers: "{{ facts_s3_put_headers | default({}) }
 
 # ── Document schema id — versioned so the Layer-2 transformers (RFC-004
 # §16.5) can evolve the mapping without re-collecting the raw. ──────────────
-inventory_collect_schema: "samurai.inventory_collect/v1"
+inventory_collect_dependency_observation_enabled: "{{ dependency_observation_enabled | default(false) }}"
+inventory_collect_dependency_request: "{{ dependency_observation_request | default({}) }}"
+inventory_collect_schema: >-
+  {{ 'samurai.inventory_collect/v2' if (inventory_collect_dependency_observation_enabled | bool)
+     else 'samurai.inventory_collect/v1' }}
