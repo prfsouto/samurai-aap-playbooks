@@ -67,6 +67,11 @@ function Add-DependencyRecord($Record, $Source, $Records) {
     [void]$Records.Add($projected)
 }
 
+function Get-DependencyServiceIdentity([string]$Name) {
+    if ($Name -cmatch '[^\x00-\x7f]') { throw 'service_identity_unresolved' }
+    return $Name.ToLowerInvariant()
+}
+
 function Assert-DependencyRequest($Request) {
     $keys = @($Request.PSObject.Properties.Name | Sort-Object)
     if (($keys -join ',') -ne 'collector,limits,policy,sources') { throw 'explicit_request_required' }
@@ -110,10 +115,13 @@ function Assert-DependencyRequest($Request) {
                  elseif ($dimension -in @('services','configuration')) { 'named_services' } else { 'local_network_stack' }
         if ($source.scope -ne $scope) { throw 'unsupported_scope' }
         if ($scope -eq 'named_services') {
-            if (@($source.service_names).Count -eq 0 -or
-                @($source.service_names | Sort-Object -Unique).Count -ne @($source.service_names).Count -or
-                @($source.service_names | Where-Object { $_ -notmatch '^[A-Za-z0-9][A-Za-z0-9_.@:-]*$' }).Count -gt 0) {
-                throw 'exact_service_allowlist_required'
+            if (@($source.service_names).Count -eq 0) { throw 'exact_service_allowlist_required' }
+            $names = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            foreach ($name in $source.service_names) {
+                if ($name -cnotmatch '\A[A-Za-z0-9][A-Za-z0-9_.@:-]*\z' -or
+                    -not $names.Add((Get-DependencyServiceIdentity $name))) {
+                    throw 'exact_service_allowlist_required'
+                }
             }
         } elseif (@($source.service_names).Count -ne 0) { throw 'invalid_service_selector' }
         $validity = $Request.limits.signal_validity_seconds.$dimension
@@ -142,11 +150,15 @@ function Invoke-DependencyCollection($Request) {
                         Add-DependencyRecord @{ name = [string]$_.ProcessName; pid = [int]$_.Id } $source $records
                     }
                 } elseif ($dimension -in @('services','configuration')) {
+                    $seenServices = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
                     foreach ($name in $source.service_names) {
+                        $expectedIdentity = Get-DependencyServiceIdentity $name
                         Start-DependencyRead
                         Get-CimInstance -ClassName Win32_Service -Filter "Name='$name'" -Property Name,State,ProcessId,StartMode -ErrorAction Stop |
                             ForEach-Object {
-                                if ($_.Name -ne $name) { throw 'service_identity_unresolved' }
+                                $identity = Get-DependencyServiceIdentity ([string]$_.Name)
+                                if ($identity -cne $expectedIdentity) { throw 'service_identity_unresolved' }
+                                if (-not $seenServices.Add($identity)) { throw 'service_identity_repeated' }
                                 $record = if ($dimension -eq 'services') {
                                     @{ name = [string]$_.Name; pid = [int]$_.ProcessId; state = ([string]$_.State).ToLowerInvariant() }
                                 } else { @{ name = [string]$_.Name; startup_mode = [string]$_.StartMode } }
@@ -170,6 +182,7 @@ function Invoke-DependencyCollection($Request) {
                 $reason = ''
             } catch {
                 $code = [string]$_.Exception.Message
+                if ($code -ceq 'service_identity_repeated') { throw }
                 if ($code -in @('duration_limit','byte_limit','call_limit','record_limit','field_limit')) {
                     $state = 'partial'; $reason = $code; $truncated = $true
                 } elseif ($_.Exception -is [UnauthorizedAccessException] -or $_.CategoryInfo.Category -eq 'PermissionDenied') {
