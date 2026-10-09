@@ -6,6 +6,25 @@
 # SSH+PowerShell, e guard por task viraria ruído em vinte lugares — a
 # boundary é o arquivo, como no template do lab.
 
+- name: "[inventory_collect] Observe service state and startup configuration (read-only)"
+  ansible.builtin.service_facts:
+  register: inventory_collect_service_facts
+  failed_when: false
+  tags: [inventory_collect, collect]
+
+- name: "[inventory_collect] Preserve service inventory absence when observation fails"
+  ansible.builtin.set_fact:
+    ansible_facts: >-
+      {{ ansible_facts | combine({
+          'services': {}, 'services_collected': false,
+          'service_inventory_status': 'unavailable'
+        }) }}
+  when: >-
+    inventory_collect_service_facts.ansible_facts is not defined
+    or inventory_collect_service_facts.ansible_facts.services is not defined
+    or inventory_collect_service_facts.ansible_facts.services is not mapping
+  tags: [inventory_collect, collect]
+
 - name: "[inventory_collect] Enumerate installed packages (read-only)"
   ansible.builtin.package_facts:
     manager: auto

@@ -1,0 +1,38 @@
+---
+- name: "[inventory_collect] Require bound RHEL Candidate B service measurements"
+  ansible.builtin.assert:
+    that:
+      - (ansible_facts.distribution | default('')) == 'RedHat'
+      - (ansible_facts.service_mgr | default('')) == 'systemd'
+      - rhel_service_observation_request is mapping
+      - rhel_service_observation_request.organization_id | int == inventory_collect_organization_id | int
+      - rhel_service_observation_request.target_host == inventory_collect_target_host
+      - rhel_service_observation_request.samurai_execution_id == samurai_execution_id
+      - rhel_service_observation_request.transport == 'ssh'
+      - rhel_service_observation_request.transport == target_connection_type
+      - rhel_service_observation_request.target_port | int == target_port | int
+    fail_msg: "RHEL service measurements require the bound validation candidate and its collection."
+  tags: [inventory_collect, collect, functional]
+
+- name: "[inventory_collect] Measure selected RHEL services without guest mutation"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_facts.python.executable }}"
+      - -c
+      - "{{ lookup('file', role_path + '/files/collect_rhel_service_function.py') }}"
+    stdin: "{{ rhel_service_observation_request | to_json }}"
+  register: inventory_collect_rhel_services
+  changed_when: false
+  failed_when: false
+  no_log: true
+  tags: [inventory_collect, collect, functional]
+
+- name: "[inventory_collect] Preserve actual RHEL service measurement receipts"
+  ansible.builtin.set_fact:
+    inventory_collect_functional: >-
+      {{ inventory_collect_functional | combine({
+          'rhel_service_observation': (inventory_collect_rhel_services.stdout | from_json)
+        }) }}
+  when: (inventory_collect_rhel_services.rc | default(1)) == 0
+  no_log: true
+  tags: [inventory_collect, collect, functional]
