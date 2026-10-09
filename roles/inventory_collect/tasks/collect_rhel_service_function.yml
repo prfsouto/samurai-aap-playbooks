@@ -9,6 +9,8 @@
       - rhel_service_observation_request.target_host == inventory_collect_target_host
       - rhel_service_observation_request.samurai_execution_id == samurai_execution_id
       - rhel_service_observation_request.transport == 'ssh'
+      - rhel_service_observation_request.transport == target_connection_type
+      - rhel_service_observation_request.target_port | int == target_port | int
     fail_msg: "RHEL service measurements require the bound validation candidate and its collection."
   tags: [inventory_collect, collect, functional]
 

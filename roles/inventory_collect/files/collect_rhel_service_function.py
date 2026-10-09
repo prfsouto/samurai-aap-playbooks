@@ -83,8 +83,9 @@ def collect(request):
         value["ssh"] = {"transport": request.get("transport"), "port": request.get("target_port"),
                         "connection": connection, "command": command(["/usr/bin/printf", "%s\n", request["samurai_execution_id"]])}
     if "chronyd.service" in subjects:
-        argv = ["chronyc", "-h", "/var/run/chrony/chronyd.sock", "-c"]
-        value["chrony"] = {"tracking": command([*argv, "tracking"]), "sources": command([*argv, "sources"])}
+        argv = ["chronyc", "-h", "127.0.0.1", "-p", "323", "-c"]
+        value["chrony"] = {"transport": "udp_loopback", "target_host": "127.0.0.1", "target_port": 323,
+                           "tracking": command([*argv, "tracking"]), "sources": command([*argv, "sources"])}
     if "NetworkManager.service" in subjects:
         value["network_manager"] = network(connection)
     return value
