@@ -40,6 +40,11 @@
   when: inventory_collect_dependency_observation_enabled | bool
   tags: [inventory_collect, dependency_observation]
 
+- name: "[inventory_collect] Measure RHEL validation services only when explicitly bound"
+  ansible.builtin.include_tasks: collect_rhel_service_function.yml
+  when: rhel_service_observation_request is defined and rhel_service_observation_request | length > 0
+  tags: [inventory_collect, collect, functional]
+
 - name: "[inventory_collect] Publish the facts document (common to every arm)"
   ansible.builtin.include_tasks: publish.yml
   tags: [inventory_collect, collect]
