@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import stat
 import subprocess
 import sys
 from urllib.parse import urlsplit
@@ -28,6 +29,7 @@ EUS_IDS = {"rhel-9-appstream-eus-rhui-rpms", "rhel-9-baseos-eus-rhui-rpms"}
 CLIENT_ID = "rhui-client-config-server-9"
 CORPUS_SHA = "efe00c019eecd9c7170842614c09408a362d2d72b2bae8f78363e3e746ca9505"
 FILE_LIMIT = 262144
+TRUSTED_FILE_LIMIT = 32768
 OUTPUT_LIMIT = 32768
 
 
@@ -46,6 +48,22 @@ def sha(data):
 
 def read_bounded(path, limit=FILE_LIMIT):
     with Path(path).open("rb") as stream:
+        raw = stream.read(limit + 1)
+    require(len(raw) <= limit, "source_file_limit")
+    return raw
+
+
+def read_trusted(path, limit=TRUSTED_FILE_LIMIT):
+    before = os.lstat(path)
+    require(stat.S_ISREG(before.st_mode) and before.st_uid == 0
+            and not before.st_mode & 0o022, "trusted_file_ownership_or_mode")
+    require(before.st_size <= limit, "source_file_limit")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, "rb") as stream:
+        opened = os.fstat(stream.fileno())
+        require((opened.st_dev, opened.st_ino) == (before.st_dev, before.st_ino)
+                and stat.S_ISREG(opened.st_mode) and opened.st_uid == 0
+                and not opened.st_mode & 0o022, "trusted_file_changed_during_open")
         raw = stream.read(limit + 1)
     require(len(raw) <= limit, "source_file_limit")
     return raw
@@ -115,7 +133,7 @@ def observe_profile(repo_dir=Path("/etc/yum.repos.d")):
     paths = sorted(repo_dir.glob("*.repo*"))
     require(len(paths) <= 32, "repository_file_count_limit")
     for path in paths:
-        raw = read_bounded(path)
+        raw = read_trusted(path)
         parser = configparser.ConfigParser(interpolation=None)
         parser.read_string(raw.decode())
         loaded = path.suffix == ".repo"
@@ -151,7 +169,7 @@ def observe_profile(repo_dir=Path("/etc/yum.repos.d")):
 def vendor_snapshot():
     expected = dict(VENDOR_FILES)
     expected[CALLBACK_PATH] = CALLBACK_SHA
-    observed = {path: sha(read_bounded(path, 1048576)) for path in expected}
+    observed = {path: sha(read_trusted(path)) for path in expected}
     require(observed == expected, "reviewed_vendor_code_mismatch")
     return observed
 
