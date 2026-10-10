@@ -61,7 +61,15 @@
 
 - name: "[inventory_collect] Serialize the facts document once (the exact bytes that get uploaded)"
   ansible.builtin.set_fact:
-    inventory_collect_document_json: "{{ inventory_collect_document | to_json(ensure_ascii=True) }}"
+    inventory_collect_document_json: "{{ inventory_collect_document | combine({'organization_id': inventory_collect_organization_id | int}) | to_json(ensure_ascii=True) }}"
+  tags: [inventory_collect]
+
+- name: "[inventory_collect] Validate the JSON tenant before upload"
+  ansible.builtin.assert:
+    that:
+      - (inventory_collect_document_json | from_json).organization_id is integer
+      - (inventory_collect_document_json | from_json).organization_id == (inventory_collect_organization_id | int)
+    fail_msg: "Serialized inventory tenant must remain the admitted integer."
   tags: [inventory_collect]
 
 - name: "[inventory_collect] Enforce the approved complete raw byte limit before upload"
