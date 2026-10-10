@@ -124,7 +124,7 @@ def configuration_snapshot(repo_dir=Path("/etc/yum.repos.d")):
     if Path("/etc/dnf/dnf.conf").is_file():
         paths.append(Path("/etc/dnf/dnf.conf"))
     require(len(paths) <= 96, "source_configuration_file_limit")
-    return {str(path): sha(read_bounded(path)) for path in sorted(paths) if path.is_file()}
+    return {str(path): sha(read_trusted(path, FILE_LIMIT)) for path in sorted(paths)}
 
 
 def observe_profile(repo_dir=Path("/etc/yum.repos.d")):
@@ -162,8 +162,9 @@ def observe_profile(repo_dir=Path("/etc/yum.repos.d")):
     return {"state": "target_profile_available", "repository_ids": sorted(EUS_IDS | {CLIENT_ID}),
             "profile_file_sha256": dict(PROFILE_HASHES),
             "profile_paths": {"client": str(client[0][0]), "eus": str(eus[0][0])},
-            "eus_file_loaded_by_current_dnf": eus[0][4],
-            "active_repository_ids": sorted(active), "origins": origins}
+            "eus_file_matches_default_repo_glob": eus[0][4],
+            "configured_enabled_repository_ids": sorted(active),
+            "effective_dnf_repository_state": "not_measured", "origins": origins}
 
 
 def vendor_snapshot():
@@ -226,7 +227,13 @@ if __name__ == "__main__":
     signal.alarm(60)
     try:
         require(len(sys.argv) == 3, "fixed_observation_arguments")
-        output = json.dumps(observe(sys.argv[1], parse_binding(sys.argv[2])), sort_keys=True, separators=(",", ":"))
+        binding = parse_binding(sys.argv[2])
+        if sys.argv[1] == "identity":
+            result = {"schema": "samurai.rhel_eus_source_identity/v1", "source": binding,
+                      "physical_identity": physical_identity(binding), "measurement_euid": os.geteuid()}
+        else:
+            result = observe(sys.argv[1], binding)
+        output = json.dumps(result, sort_keys=True, separators=(",", ":"))
         require(len(output.encode()) <= OUTPUT_LIMIT, "observation_output_limit")
         signal.alarm(0)
         print(output)

@@ -9,15 +9,48 @@
           - HOSTNAMES | default('') is match('^[A-Za-z0-9][A-Za-z0-9.:-]{0,252}$')
           - ACTION | default('Check') == 'Check'
           - OBSERVATION | default('') in ['repository', 'eligibility']
+          - HOSTNAMES not in groups
+          - "['rhel_eus_program', 'rhel_eus_binding_json', 'rhel_eus_identity', 'rhel_eus_observed'] | intersect(vars.keys() | list) | length == 0"
         fail_msg: Source observation requires one host and a fixed readonly mode.
+    - name: Validate the source binding on the Controller before connecting
+      ansible.builtin.include_role:
+        name: rhel_eus_source_observe
+        tasks_from: validate_binding
+    - name: Refuse inventory aliases that redirect the protected endpoint
+      ansible.builtin.assert:
+        that:
+          - (hostvars[HOSTNAMES] | default({})).get('ansible_host', HOSTNAMES) == HOSTNAMES
+          - (hostvars[HOSTNAMES] | default({})).get('ansible_ssh_host', HOSTNAMES) == HOSTNAMES
+          - (hostvars[HOSTNAMES] | default({})).get('ansible_port', 22) | string == '22'
+          - (hostvars[HOSTNAMES] | default({})).get('ansible_ssh_port', 22) | string == '22'
+          - (hostvars[HOSTNAMES] | default({})).get('ansible_connection', 'ssh') == 'ssh'
+        fail_msg: Inventory overrides conflict with the protected single SSH endpoint on port22.
     - name: Register only the governed target in memory
       ansible.builtin.add_host:
         name: "{{ HOSTNAMES }}"
-        groups: samurai_rhel_eus_source
+        ansible_host: "{{ HOSTNAMES }}"
+        ansible_ssh_host: "{{ HOSTNAMES }}"
+        ansible_port: 22
+        ansible_ssh_port: 22
+        ansible_connection: ssh
+    - name: Refuse effective variables that override the Machine credential or SSH execution
+      ansible.builtin.assert:
+        that:
+          - query('ansible.builtin.inventory_hostnames', HOSTNAMES) | sort == [HOSTNAMES]
+          - >-
+            ['ansible_user', 'ansible_ssh_user', 'ansible_password', 'ansible_ssh_pass',
+             'ansible_private_key_file', 'ansible_ssh_private_key_file',
+             'ansible_ssh_common_args', 'ansible_ssh_extra_args', 'ansible_ssh_args',
+             'ansible_ssh_executable', 'ansible_shell_type', 'ansible_shell_executable',
+             'ansible_python_interpreter', 'ansible_become', 'ansible_become_user',
+             'ansible_become_method', 'ansible_become_password', 'ansible_become_pass',
+             'rhel_eus_program', 'rhel_eus_binding_json', 'rhel_eus_identity', 'rhel_eus_observed']
+            | intersect(hostvars[HOSTNAMES].keys() | list) | length == 0
+        fail_msg: Target must be singleton and preserve the admitted Machine user/key/SSH execution.
 
 - name: Observe the available target profile without changing the source
-  hosts: samurai_rhel_eus_source
+  hosts: "{{ HOSTNAMES }}"
   gather_facts: false
-  become: true
+  become: false
   roles:
     - rhel_eus_source_observe
