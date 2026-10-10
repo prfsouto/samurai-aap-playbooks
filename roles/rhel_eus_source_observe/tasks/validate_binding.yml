@@ -1,0 +1,14 @@
+---
+- name: Validate non-secret source binding before executing a fixed observation
+  ansible.builtin.assert:
+    that:
+      - SOURCE_ORGANIZATION_ID | default('') | string is match('^[1-9][0-9]*$')
+      - SOURCE_ID | default('') | string is match('^[1-9][0-9]*$')
+      - INVENTORY_RUN_ID | default('') | string is match('^[1-9][0-9]*$')
+      - SOURCE_EXECUTION_ID | default('') is match('^[a-f0-9]{32}$')
+      - PREPARED_FINGERPRINT | default('') is match('^[a-f0-9]{64}$')
+      - SOURCE_INSTANCE_ID | default('') is match('^i-[a-f0-9]{17}$')
+      - SOURCE_ACCOUNT_ID | default('') | string is match('^[0-9]{12}$')
+      - SOURCE_REGION | default('') is match('^[a-z]{2}-[a-z]+-[0-9]+$')
+      - OBSERVATION in ['repository', 'eligibility']
+    fail_msg: Source observation requires the current prepared source identity.

@@ -1,21 +1,39 @@
 ---
-- name: Validate non-secret source binding before executing a fixed observation
-  ansible.builtin.assert:
-    that:
-      - SOURCE_ORGANIZATION_ID | default('') | string is match('^[1-9][0-9]*$')
-      - SOURCE_ID | default('') | string is match('^[1-9][0-9]*$')
-      - INVENTORY_RUN_ID | default('') | string is match('^[1-9][0-9]*$')
-      - SOURCE_EXECUTION_ID | default('') is match('^[a-f0-9]{32}$')
-      - PREPARED_FINGERPRINT | default('') is match('^[a-f0-9]{64}$')
-      - SOURCE_INSTANCE_ID | default('') is match('^i-[a-f0-9]{17}$')
-      - SOURCE_ACCOUNT_ID | default('') | string is match('^[0-9]{12}$')
-      - SOURCE_REGION | default('') is match('^[a-z]{2}-[a-z]+-[0-9]+$')
-      - OBSERVATION in ['repository', 'eligibility']
-    fail_msg: Source observation requires the current prepared source identity.
-
 - name: Load only the published fixed program
   ansible.builtin.set_fact:
     rhel_eus_program: "{{ lookup('ansible.builtin.file', role_path ~ '/files/observe_source.py', rstrip=False) }}"
+
+- name: Serialize the expected binding once with JSON integer IDs
+  ansible.builtin.set_fact:
+    rhel_eus_binding_json: >-
+      {{ {'organization_id': SOURCE_ORGANIZATION_ID | int,
+          'source_id': SOURCE_ID | int, 'inventory_run_id': INVENTORY_RUN_ID | int,
+          'source_execution_id': SOURCE_EXECUTION_ID,
+          'prepared_content_fingerprint': PREPARED_FINGERPRINT,
+          'instance_id': SOURCE_INSTANCE_ID, 'account_id': SOURCE_ACCOUNT_ID | string,
+          'region': SOURCE_REGION} | to_json(ensure_ascii=True) }}
+
+- name: Verify physical identity without elevation before any root observation
+  ansible.builtin.command:
+    argv: [/usr/bin/python3, -B, '-', identity, "{{ rhel_eus_binding_json }}"]
+    stdin: "{{ rhel_eus_program }}"
+    stdin_add_newline: false
+  become: false
+  vars:
+    ansible_become: false
+  register: rhel_eus_identity
+  changed_when: false
+  check_mode: false
+
+- name: Bind the unprivileged identity receipt to the current expected source
+  ansible.builtin.assert:
+    that:
+      - (rhel_eus_identity.stdout | from_json).schema == 'samurai.rhel_eus_source_identity/v1'
+      - (rhel_eus_identity.stdout | from_json).source == (rhel_eus_binding_json | from_json)
+      - (rhel_eus_identity.stdout | from_json).physical_identity.instance_id == SOURCE_INSTANCE_ID
+      - (rhel_eus_identity.stdout | from_json).physical_identity.account_id == SOURCE_ACCOUNT_ID | string
+      - (rhel_eus_identity.stdout | from_json).physical_identity.region == SOURCE_REGION
+    fail_msg: Unprivileged identity differs from the prepared source; root observation refused.
 
 - name: Run the fixed readonly source observation
   ansible.builtin.command:
@@ -24,16 +42,13 @@
       - -B
       - '-'
       - "{{ OBSERVATION }}"
-      - >-
-        {{ {'organization_id': SOURCE_ORGANIZATION_ID | int,
-            'source_id': SOURCE_ID | int, 'inventory_run_id': INVENTORY_RUN_ID | int,
-            'source_execution_id': SOURCE_EXECUTION_ID,
-            'prepared_content_fingerprint': PREPARED_FINGERPRINT,
-            'instance_id': SOURCE_INSTANCE_ID, 'account_id': SOURCE_ACCOUNT_ID | string,
-            'region': SOURCE_REGION} | to_json(ensure_ascii=True) }}
+      - "{{ rhel_eus_binding_json }}"
     stdin: "{{ rhel_eus_program }}"
     stdin_add_newline: false
   register: rhel_eus_observed
+  become: true
+  vars:
+    ansible_become: true
   changed_when: false
   check_mode: false
 
@@ -41,11 +56,17 @@
   ansible.builtin.assert:
     that:
       - rhel_eus_observed.stdout | length <= 32768
+      - (rhel_eus_observed.stdout | from_json).schema == 'samurai.rhel_eus_source_observation/v1'
+      - (rhel_eus_observed.stdout | from_json).observation == OBSERVATION
+      - (rhel_eus_observed.stdout | from_json).source == (rhel_eus_binding_json | from_json)
+      - (rhel_eus_observed.stdout | from_json).physical_identity == (rhel_eus_identity.stdout | from_json).physical_identity
       - (rhel_eus_observed.stdout | from_json).source.organization_id is integer
       - (rhel_eus_observed.stdout | from_json).source.organization_id == SOURCE_ORGANIZATION_ID | int
       - (rhel_eus_observed.stdout | from_json).source.source_id == SOURCE_ID | int
       - (rhel_eus_observed.stdout | from_json).source.inventory_run_id == INVENTORY_RUN_ID | int
       - (rhel_eus_observed.stdout | from_json).source_configuration_changed == false
+      - (rhel_eus_observed.stdout | from_json).new_repository_requests == 0
+      - (rhel_eus_observed.stdout | from_json).package_transactions == 0
       - (rhel_eus_observed.stdout | from_json).catalog_qualified == false
 
 - name: Publish actual measurement and byte integrity through the job artifact
