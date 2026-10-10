@@ -5,12 +5,20 @@
 # MESMAS variáveis: ansible_facts.packages, inventory_collect_functional,
 # inventory_collect_manual_packages_*.
 
+- name: "[inventory_collect] Require a positive integer tenant before publication"
+  ansible.builtin.assert:
+    that:
+      - inventory_collect_organization_id | string is match('^[0-9]+\\Z')
+      - inventory_collect_organization_id | int > 0
+    fail_msg: "Inventory publication requires a positive integer tenant."
+  tags: [inventory_collect]
+
 - name: "[inventory_collect] Assemble the raw facts document"
   ansible.builtin.set_fact:
     inventory_collect_document:
       schema: "{{ inventory_collect_schema }}"
       samurai_execution_id: "{{ samurai_execution_id }}"
-      organization_id: "{{ inventory_collect_organization_id }}"
+      organization_id: "{{ inventory_collect_organization_id | int }}"
       target_host: "{{ inventory_collect_target_host }}"
       collected_at: "{{ now(utc=True, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
       ansible_facts: >-
