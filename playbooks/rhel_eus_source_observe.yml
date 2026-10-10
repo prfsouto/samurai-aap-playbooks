@@ -1,0 +1,23 @@
+---
+- name: Validate the governed single source target
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Require exactly one server-owned host
+      ansible.builtin.assert:
+        that:
+          - HOSTNAMES | default('') is match('^[A-Za-z0-9][A-Za-z0-9.:-]{0,252}$')
+          - ACTION | default('Check') == 'Check'
+          - OBSERVATION | default('') in ['repository', 'eligibility']
+        fail_msg: Source observation requires one host and a fixed readonly mode.
+    - name: Register only the governed target in memory
+      ansible.builtin.add_host:
+        name: "{{ HOSTNAMES }}"
+        groups: samurai_rhel_eus_source
+
+- name: Observe the available target profile without changing the source
+  hosts: samurai_rhel_eus_source
+  gather_facts: false
+  become: true
+  roles:
+    - rhel_eus_source_observe
