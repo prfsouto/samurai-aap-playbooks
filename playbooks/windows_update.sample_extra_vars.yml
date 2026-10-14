@@ -32,6 +32,12 @@ ACTION: "Check"
 # BECOME_SYSTEM: true                 # run as SYSTEM (runas) to avoid the WinRM double hop
 # MIN_FREE_GB: 5                      # refuse to update below this free space on the system drive
 # SERIAL_BATCH: 1                     # hosts patched at a time
+# SERVICE_CHECK: "on"                 # on | off. Records running services + listening TCP
+#                                     # ports before the change; after Apply (and the reboot)
+#                                     # starts again whatever did not come back. What stays
+#                                     # down is a warning with the start error (job not failed).
+# SERVICE_SETTLE_SECONDS: 180         # max wait for services to come back by themselves
+# SERVICE_IGNORE: ""                  # csv of service names (trailing * = prefix) or TCP ports
 # EVIDENCE_BASE_DIR: 'C:\ProgramData\samurai-shield\windows-update'
 # LOG_LEVEL: "package"                # summary | package | full
 

@@ -39,5 +39,11 @@ ACTION: "Check"
 #                                     # (a kernel upgrade with a full /boot can leave
 #                                     # the host unbootable)
 # SERIAL_BATCH: 1                     # hosts updated at a time
+# SERVICE_CHECK: "on"                 # on | off. Records running services + listening TCP
+#                                     # ports before the change; after Apply (and the reboot)
+#                                     # starts again whatever did not come back. What stays
+#                                     # down is a warning with the start error (job not failed).
+# SERVICE_SETTLE_SECONDS: 120         # max wait for services to come back by themselves
+# SERVICE_IGNORE: ""                  # csv of service names (trailing * = prefix) or TCP ports
 # EVIDENCE_BASE_DIR: "/var/tmp/samurai-shield/apt-update"
 # LOG_LEVEL: "package"                # summary | package | full

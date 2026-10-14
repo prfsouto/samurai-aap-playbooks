@@ -29,6 +29,33 @@ ends `failed` instead of failing inside `always`. In both cases the wave goes
 on. A connection drop in any other, short task still stops the wave. The apt
 playbook does the same, for its index refreshes and the upgrade.
 
+**Service check (`SERVICE_CHECK`, default `on`).** Before the change (in
+`Check` and `Apply`), the playbook records the running services (systemd units,
+except `static` ones activated on demand) and the listening TCP ports with the
+process that owns each one. That second list also covers applications that are
+not services, such as a `java -jar` started by a script. After `Apply` and the
+reboot, it waits up to `SERVICE_SETTLE_SECONDS` (default 120) for those
+services to come back, starts again whatever did not, and compares:
+
+- everything back: `SERVIÇOS VALIDADOS ... conforme o cenário pré-mudança` in
+  the job output, plus a note listing the services the playbook had to start;
+- something still down: `ATENÇÃO: SERVIÇOS NÃO CONFORMES COM O CENÁRIO
+  PRÉ-MUDANÇA`, one line per service (with the error from the start attempt) or
+  port, asking the operator to check why. **The job does not fail because of
+  it**: the items also go to `warnings` in the summary.
+
+The result goes to `service_check` in `summary.json` and in the consolidated
+JSON, to `services_before.json` / `services_check.json` in the evidence
+directory, and play 3 prints one line per host. A unit that was already failed
+before the change is reported apart (`failed_services_before`) and not blamed on
+the update. A port counts as lost only if it is gone and its process now listens
+on fewer ports than before, so dynamic ports that move on reboot (RPC,
+`rpc.statd`) are tolerated, while one of two applications sharing a process name
+(`java`) going down is still caught. `SERVICE_IGNORE` takes names (trailing `*` = prefix) or ports to
+leave out. Any unexpected error inside the check also becomes a warning instead
+of failing the host. The failed-units list (`failed_services_after`) is now
+collected after the reboot, too.
+
 ### linux_yum_targeted_package_update_with_evidence.yml
 
 The **targeted** sibling of the yum playbook. It updates only the packages
@@ -204,6 +231,15 @@ Safety model:
    applies to a host that drops during a `win_updates` call, and a host whose
    `summary.json` cannot be written ends `failed`. A connection drop in any
    other, short task still stops the wave.
+7. **Services back as they were** — same service check as the Linux
+   playbooks (`SERVICE_CHECK`, see the yum section), comparing the running
+   automatic-start services and the listening TCP ports before the change and
+   after the reboot. What did not come back is started again with
+   `win_service`; what stays down is a warning, never a job failure.
+   `SERVICE_SETTLE_SECONDS` defaults to 180 here, because delayed-start services
+   come up about 2 minutes after boot. Per-user service instances (`Name_1a2b3c`)
+   and services that stop by design (Windows Update, BITS, licensing, update
+   agents) are left out by default.
 
 The normal remediation call only needs `HOSTNAMES` + `ACTION`. Everything else
 (`ALLOW_REBOOT`, `WU_CATEGORIES`, `EXCLUDE_KB`, `WU_SERVER_SELECTION`,
