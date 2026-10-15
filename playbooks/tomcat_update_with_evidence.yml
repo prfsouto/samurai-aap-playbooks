@@ -1,0 +1,1150 @@
+---
+# ============================================================================
+# SamurAI Shield :: Apache Tomcat update with evidence
+# ----------------------------------------------------------------------------
+# Controlled patch of a self-managed Apache Tomcat installation (NOT an
+# OS package — tomcat here is an unarchived tarball, the real shape found in
+# the SamurAI Shield lab hosts: vm1-samurai/vm2-samurai run Tomcat 9.0.50 at
+# /opt/apache-tomcat-9.0.50, outside rpm/dpkg). Executed from Ansible
+# Automation Platform (AAP). Same evidence/service-check discipline as
+# linux_yum_update_with_evidence.yml / linux_apt_update_with_evidence.yml /
+# windows_update_with_evidence.yml (explicit template requested by the
+# product owner): pre-checks, optional patch, post-checks, structured
+# evidence files, and a consolidated samurai_shield_result JSON block on
+# stdout. The SERVICE_CHECK block (before/after, wait + auto-restart +
+# warning-not-failure) is reused with the SAME contract names
+# (SERVICE_CHECK/SERVICE_IGNORE/SERVICE_SETTLE_SECONDS) as those playbooks.
+#
+# Why a dedicated playbook (scope): the existing yum/apt playbooks only
+# speak rpm/dpkg. A Tomcat installed by hand under /opt is invisible to
+# both. This playbook never touches a package manager.
+#
+# Patch strategy (symlink cutover — "deliver the environment exactly as it
+# was found", same philosophy as oracle_rac_patch_with_evidence.yml):
+#   1. CATALINA_HOME (extra-var) is whatever the systemd service references
+#      TODAY — a symlink, or (as on the lab hosts) a real, version-named
+#      directory. The playbook never assumes which.
+#   2. The new version is downloaded + extracted into a SIBLING directory
+#      (apache-tomcat-<TARGET_VERSION>), never on top of the old one.
+#   3. conf/, custom webapps (anything not in the stock Tomcat set) and any
+#      extra jars under lib/ are migrated from the old install into the new
+#      one — the new version's own conf/lib are the baseline, the old
+#      install's customizations are layered on top.
+#   4. A systemd drop-in override (CATALINA_HOME.d/) points the service at a
+#      stable indirection path (<parent>/current), created once and
+#      re-pointed on every subsequent Apply via `ln -sfn` — the first Apply
+#      against a host "adopts" its unmanaged install into this convention;
+#      every later Apply is a pure symlink flip. The OLD version directory
+#      is left on disk untouched (trivial rollback: flip the symlink back +
+#      restart the service).
+#
+# Stages:
+#   1. Build dynamic in-memory inventory from HOSTNAMES (localhost play).
+#   2. Pre-check, optional patch and post-check on each target host. Fact
+#      gathering and the evidence directory run inside the rescue block, so
+#      an unreachable or rejected host never stops the wave (same pattern
+#      as #54/#56 in the yum playbook).
+#   3. Emit a consolidated samurai_shield_result JSON block on stdout.
+#   4. Re-check hosts that were unreachable and re-fail every host whose
+#      execution ended failed (same pattern as the yum playbook's play 4).
+#
+# Extra-vars contract — see tomcat_update.sample_extra_vars.yml
+# ============================================================================
+
+- name: "SamurAI :: tomcat-update :: build dynamic inventory from HOSTNAMES"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    # Distinct internal names: a play var that references its own name
+    # resolves to ITSELF when the extra-var is absent and dies with
+    # "recursive loop detected in template". Survey blanks arrive as ''
+    # (defined), so the fallback is `(X | default('') | trim) or Y`, never
+    # `default(Y)`.
+    samurai_hostnames_raw: "{{ HOSTNAMES | default('') | string | trim }}"
+    samurai_action_raw: "{{ (ACTION | default('') | string | trim) or 'Check' }}"
+    samurai_catalina_home_raw: "{{ CATALINA_HOME | default('') | string | trim }}"
+    samurai_service_name_raw: "{{ SERVICE_NAME | default('') | string | trim }}"
+    samurai_target_version_raw: "{{ TARGET_VERSION | default('') | string | trim }}"
+    samurai_artifact_url_raw: "{{ TOMCAT_ARTIFACT_URL | default('') | string | trim }}"
+    samurai_artifact_sha512_raw: "{{ TOMCAT_ARTIFACT_SHA512 | default('') | string | trim }}"
+    samurai_stock_webapps_raw: >-
+      {{ (TOMCAT_STOCK_WEBAPPS | default('') | string | trim) or 'ROOT,docs,examples,host-manager,manager' }}
+  tasks:
+    - name: "Validate HOSTNAMES is provided"
+      ansible.builtin.fail:
+        msg: "HOSTNAMES extra-var is required (single host, IP, or space/comma-separated list)."
+      when: samurai_hostnames_raw == ''
+
+    - name: "Validate ACTION is Check or Apply"
+      ansible.builtin.fail:
+        msg: "Invalid ACTION '{{ samurai_action_raw }}'. Allowed values: Check, Apply."
+      when: samurai_action_raw not in ['Check', 'Apply']
+
+    - name: "Validate CATALINA_HOME is provided"
+      ansible.builtin.fail:
+        msg: >-
+          CATALINA_HOME extra-var is required: the absolute path the target's
+          Tomcat service references today (a symlink, or a real directory —
+          this playbook detects which). Never guessed.
+      when: samurai_catalina_home_raw == '' or samurai_catalina_home_raw is not match('^/')
+
+    - name: "Validate SERVICE_NAME is provided"
+      ansible.builtin.fail:
+        msg: "SERVICE_NAME extra-var is required: the systemd unit that fronts this Tomcat."
+      when: samurai_service_name_raw == ''
+
+    - name: "Validate TARGET_VERSION is provided"
+      ansible.builtin.fail:
+        msg: >-
+          TARGET_VERSION extra-var is required (e.g. "9.0.121") — the exact
+          version to converge on. Never "latest": the scope can never be
+          guessed.
+      when: samurai_target_version_raw == '' or samurai_target_version_raw is not match('^[0-9]+\.[0-9]+\.[0-9]+$')
+
+    - name: "Validate TOMCAT_ARTIFACT_URL is provided for Apply"
+      ansible.builtin.fail:
+        msg: "TOMCAT_ARTIFACT_URL extra-var is required when ACTION=Apply (the exact tar.gz for TARGET_VERSION)."
+      when:
+        - samurai_action_raw == 'Apply'
+        - samurai_artifact_url_raw == ''
+
+    - name: "Validate TOMCAT_ARTIFACT_SHA512 is provided for Apply"
+      ansible.builtin.fail:
+        msg: >-
+          TOMCAT_ARTIFACT_SHA512 extra-var is required when ACTION=Apply —
+          this playbook never installs an artifact without verifying its
+          checksum first.
+      when:
+        - samurai_action_raw == 'Apply'
+        - samurai_artifact_sha512_raw == ''
+
+    - name: "Publish resolved run parameters as localhost facts"
+      ansible.builtin.set_fact:
+        samurai_action: "{{ samurai_action_raw }}"
+        samurai_catalina_home: "{{ samurai_catalina_home_raw }}"
+        samurai_service_name: "{{ samurai_service_name_raw }}"
+        samurai_target_version: "{{ samurai_target_version_raw }}"
+        samurai_artifact_url: "{{ samurai_artifact_url_raw }}"
+        samurai_artifact_sha512: "{{ samurai_artifact_sha512_raw }}"
+        samurai_stock_webapps: >-
+          {{ samurai_stock_webapps_raw.split(',') | map('trim') | reject('equalto', '') | list }}
+
+    - name: "Parse HOSTNAMES into a list (tolerant: space OR comma)"
+      ansible.builtin.set_fact:
+        samurai_target_hosts: >-
+          {{ samurai_hostnames_raw.replace(',', ' ').split() | reject('equalto', '') | list }}
+
+    - name: "Add hosts to dynamic group samurai_tomcat_targets"
+      ansible.builtin.add_host:
+        name: "{{ item }}"
+        groups: samurai_tomcat_targets
+      loop: "{{ samurai_target_hosts }}"
+      changed_when: false
+
+    - name: "Show resolved target hosts"
+      ansible.builtin.debug:
+        msg: >-
+          Targets: {{ samurai_target_hosts | join(', ') }} | ACTION={{ samurai_action }} |
+          CATALINA_HOME={{ samurai_catalina_home }} | TARGET_VERSION={{ samurai_target_version }}
+
+
+- name: "SamurAI :: tomcat-update :: pre-check, patch and post-check"
+  hosts: samurai_tomcat_targets
+  gather_facts: false
+  become: true
+  serial: "{{ SERIAL_BATCH | default(1) }}"
+
+  vars:
+    ACTION: "{{ hostvars['localhost']['samurai_action'] | default('Check') }}"
+    CATALINA_HOME: "{{ hostvars['localhost']['samurai_catalina_home'] }}"
+    SERVICE_NAME: "{{ hostvars['localhost']['samurai_service_name'] }}"
+    TARGET_VERSION: "{{ hostvars['localhost']['samurai_target_version'] }}"
+    TOMCAT_ARTIFACT_URL: "{{ hostvars['localhost']['samurai_artifact_url'] | default('') }}"
+    TOMCAT_ARTIFACT_SHA512: "{{ hostvars['localhost']['samurai_artifact_sha512'] | default('') }}"
+    TOMCAT_STOCK_WEBAPPS: "{{ hostvars['localhost']['samurai_stock_webapps'] }}"
+    EVIDENCE_BASE_DIR: "{{ hostvars['localhost']['EVIDENCE_BASE_DIR'] | default('/var/tmp/samurai-shield/tomcat-update') }}"
+
+    samurai_warnings: []
+    samurai_errors: []
+
+    # Mesmo contrato SERVICE_CHECK dos playbooks de yum/apt/windows (pedido
+    # explícito do dono do produto): serviços e portas em escuta antes/depois
+    # da mudança. O que estava de pé e não voltou é iniciado de novo; se não
+    # subir, vira aviso (o job não falha). SERVICE_CHECK=off desliga;
+    # SERVICE_IGNORE aceita nomes (sufixo * = prefixo) e portas;
+    # SERVICE_SETTLE_SECONDS é a espera máxima para os serviços voltarem
+    # sozinhos depois do restart do Tomcat.
+    svc_check_enabled: "{{ ((SERVICE_CHECK | default('') | string | trim) or 'on') | lower not in ['off', 'false', 'no', '0', 'disabled'] }}"
+    svc_settle_seconds: "{{ ((SERVICE_SETTLE_SECONDS | default('') | string | trim) or '120') | int }}"
+    svc_wait_retries: "{{ [((svc_settle_seconds | int) / 10) | round(0, 'ceil') | int, 1] | max + 1 }}"
+    svc_ignore_default:
+      - "user@*"
+      - "user-runtime-dir@*"
+      - "session-*"
+      - "systemd-hostnamed"
+      - "systemd-timedated"
+      - "systemd-localed"
+      - "systemd-fsckd"
+    svc_ignore_list: "{{ svc_ignore_default + ((SERVICE_IGNORE | default('') | string).split(',') | map('trim') | reject('equalto', '') | list) }}"
+    svc_ignore_ports: "{{ svc_ignore_list | select('match', '^[0-9]+$') | list }}"
+    svc_ignore_regex: >-
+      {%- set ns = namespace(r=[]) -%}
+      {%- for e in svc_ignore_list | reject('match', '^[0-9]+$') -%}
+      {%- set ns.r = ns.r + [((e[:-1] | regex_escape) if e.endswith('*') else ((e | regex_escape) ~ '([.]service)?$'))] -%}
+      {%- endfor -%}
+      ^({{ ns.r | join('|') }})
+    svc_all_facts: "{{ svc_src.ansible_facts.services | default({}) | dict2items | map(attribute='value') | list }}"
+    svc_facts_list: "{{ (svc_all_facts | selectattr('source', 'defined') | selectattr('source', 'equalto', 'systemd') | list) or svc_all_facts }}"
+    svc_running_from_facts: >-
+      {{ ((svc_facts_list | selectattr('status', 'defined') | rejectattr('status', 'equalto', 'static') | list)
+          + (svc_facts_list | selectattr('status', 'undefined') | list))
+         | selectattr('state', 'equalto', 'running')
+         | map(attribute='name') | reject('match', svc_ignore_regex, true) | sort }}
+    svc_failed_from_facts: >-
+      {{ svc_facts_list | selectattr('status', 'defined') | selectattr('status', 'equalto', 'failed')
+         | map(attribute='name') | reject('match', svc_ignore_regex, true) | sort }}
+    svc_listeners_from_ss: >-
+      {%- set ns = namespace(out=[]) -%}
+      {%- for l in (svc_ss_src.stdout_lines | default([])) -%}
+      {%- set f = l.split() -%}
+      {%- if f | length >= 4 and f[0] != 'State' -%}
+      {%- set item = {'port': f[3].split(':')[-1], 'process': (l.split('"')[1] if '"' in l else 'unknown')} -%}
+      {%- if item not in ns.out and item.port not in svc_ignore_ports and not (item.process is match(svc_ignore_regex, true)) -%}
+      {%- set ns.out = ns.out + [item] -%}
+      {%- endif -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ ns.out | sort(attribute='port') }}
+
+  tasks:
+
+    - name: "Capture execution start timestamp (UTC, controller-side)"
+      ansible.builtin.set_fact:
+        execution_started_at: "{{ '%Y-%m-%dT%H:%M:%SZ' | strftime(utc=true) }}"
+        execution_timestamp: "{{ '%Y%m%dT%H%M%S' | strftime(utc=true) }}"
+
+    # ------------------------------------------------------------------------
+    # Tudo que toca o host vive DENTRO do block, inclusive o fact gathering e
+    # o diretório de evidência: toda falha por host atravessa rescue/always
+    # (summary.json + samurai_shield_result estruturados, status=failed, erro
+    # legível) e é re-falhada no play 4. Uma falha fora do rescue fecharia o
+    # batch do `serial` como "inteiro falhado" e interromperia o resto da wave
+    # (mesmo padrão #54/#3037 do linux_yum_update_with_evidence.yml).
+    # ------------------------------------------------------------------------
+    - name: "Pre-check + optional patch + post-check"
+      block:
+
+        # ---- Phase 1: reachability + evidence directory ---------------------
+        - name: "Gather facts (an unreachable host is recorded, not fatal to the wave)"
+          ansible.builtin.setup:
+          ignore_unreachable: true
+          register: samurai_facts
+
+        - name: "Record that the host was unreachable"
+          ansible.builtin.set_fact:
+            samurai_unreachable: true
+          when: samurai_facts.unreachable | default(false)
+
+        - name: "Fail when the host is unreachable"
+          ansible.builtin.fail:
+            msg: >-
+              Host {{ inventory_hostname }} is unreachable:
+              {{ samurai_facts.msg | default('connection failed') }}
+          when: samurai_unreachable | default(false)
+
+        - name: "Build evidence directory path"
+          ansible.builtin.set_fact:
+            evidence_dir: "{{ EVIDENCE_BASE_DIR }}/{{ inventory_hostname }}/{{ execution_timestamp }}"
+
+        - name: "Create evidence directory"
+          ansible.builtin.file:
+            path: "{{ evidence_dir }}"
+            state: directory
+            mode: '0750'
+
+        - name: "Mark evidence directory as ready"
+          ansible.builtin.set_fact:
+            evidence_dir_ready: true
+
+        # ---- Phase 2: platform compatibility (systemd Linux only — Tomcat
+        # itself has no OS-family dependency; the service management does) --
+        - name: "Assert target is Linux with systemd"
+          ansible.builtin.assert:
+            that:
+              - ansible_system == 'Linux'
+              - ansible_service_mgr == 'systemd'
+            fail_msg: >-
+              Unsupported target {{ inventory_hostname }} ({{ ansible_system | default('unknown') }},
+              service manager {{ ansible_service_mgr | default('unknown') }}). This playbook requires
+              Linux with systemd.
+
+        - name: "Capture system info"
+          ansible.builtin.set_fact:
+            system_info:
+              hostname: "{{ ansible_hostname }}"
+              fqdn: "{{ ansible_fqdn }}"
+              primary_ip: "{{ ansible_default_ipv4.address | default('unknown') }}"
+              distribution: "{{ ansible_distribution }}"
+              distribution_version: "{{ ansible_distribution_version }}"
+              architecture: "{{ ansible_architecture }}"
+              started_at: "{{ execution_started_at }}"
+              run_user: "{{ ansible_user_id | default('root') }}"
+
+        - name: "Write system_before.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/system_before.txt"
+            mode: '0640'
+            content: |
+              hostname: {{ system_info.hostname }}
+              fqdn: {{ system_info.fqdn }}
+              primary_ip: {{ system_info.primary_ip }}
+              distribution: {{ system_info.distribution }} {{ system_info.distribution_version }}
+              architecture: {{ system_info.architecture }}
+              catalina_home: {{ CATALINA_HOME }}
+              service_name: {{ SERVICE_NAME }}
+              target_version: {{ TARGET_VERSION }}
+              started_at: {{ system_info.started_at }}
+              run_user: {{ system_info.run_user }}
+
+        # ---- disk space (new install needs room beside the old one) -------
+        - name: "Collect disk usage"
+          ansible.builtin.command: df -P -k
+          register: df_out
+          changed_when: false
+
+        - name: "Write disk_before.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/disk_before.txt"
+            mode: '0640'
+            content: "{{ df_out.stdout }}\n"
+
+        # ---- resolve the current Tomcat install (symlink or real dir) -----
+        - name: "Stat CATALINA_HOME"
+          ansible.builtin.stat:
+            path: "{{ CATALINA_HOME }}"
+          register: catalina_home_stat
+
+        - name: "Fail when CATALINA_HOME does not exist"
+          ansible.builtin.fail:
+            msg: "CATALINA_HOME {{ CATALINA_HOME }} does not exist on {{ inventory_hostname }}."
+          when: not catalina_home_stat.stat.exists
+
+        - name: "Resolve the real install directory (realpath, follows a symlink)"
+          ansible.builtin.command: "realpath {{ CATALINA_HOME | quote }}"
+          register: catalina_realpath
+          changed_when: false
+
+        - name: "Record install topology"
+          ansible.builtin.set_fact:
+            tomcat_current_dir: "{{ catalina_realpath.stdout | trim }}"
+            tomcat_is_symlink: "{{ catalina_home_stat.stat.islnk | default(false) }}"
+            # Convenção estável de indirection: <pai de CATALINA_HOME>/current.
+            # Na 1a Apply contra um host, CATALINA_HOME ainda é um diretório
+            # real (não um symlink) — essa execução "adota" o host nesta
+            # convenção; toda Apply seguinte já encontra o symlink pronto.
+            tomcat_link_path: "{{ (CATALINA_HOME | dirname) }}/current"
+
+        # ---- installed version (before) ------------------------------------
+        - name: "Read installed Tomcat version"
+          ansible.builtin.shell: |
+            set -o pipefail
+            {{ tomcat_current_dir | quote }}/bin/version.sh 2>/dev/null | grep -i '^Server version' | sed 's#.*/##' | tr -d '[:space:]'
+          args:
+            executable: /bin/bash
+          register: tomcat_version_before_raw
+          changed_when: false
+          failed_when: false
+
+        - name: "Fail when the installed version cannot be determined"
+          ansible.builtin.fail:
+            msg: >-
+              Could not read the installed Tomcat version from
+              {{ tomcat_current_dir }}/bin/version.sh on {{ inventory_hostname }}.
+          when: (tomcat_version_before_raw.stdout | default('') | trim) == ''
+
+        - name: "Record installed version"
+          ansible.builtin.set_fact:
+            tomcat_version_before: "{{ tomcat_version_before_raw.stdout | trim }}"
+
+        - name: "Write version_before.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/version_before.txt"
+            mode: '0640'
+            content: |
+              catalina_home: {{ CATALINA_HOME }}
+              resolved_install_dir: {{ tomcat_current_dir }}
+              is_symlink: {{ tomcat_is_symlink }}
+              installed_version: {{ tomcat_version_before }}
+              target_version: {{ TARGET_VERSION }}
+
+        - name: "Determine whether a patch is needed"
+          ansible.builtin.set_fact:
+            tomcat_update_needed: "{{ tomcat_version_before != TARGET_VERSION }}"
+
+        # ---- #86-style serviços e portas em escuta (antes) — TODO o host,
+        # não só a unit do Tomcat, pelo mesmo motivo do yum/apt: uma
+        # dependência colateral (ex. um proxy na frente) também é pega. ------
+        - name: "Service check :: pre-change baseline"
+          when:
+            - svc_check_enabled | bool
+          block:
+            - name: "Service check :: collect services (before)"
+              ansible.builtin.service_facts:
+              register: svc_facts_before
+              ignore_errors: true
+
+            - name: "Service check :: collect TCP listeners (before)"
+              ansible.builtin.command:
+                argv: [ss, -ltnp]
+              register: svc_ss_before
+              changed_when: false
+              failed_when: false
+
+            - name: "Service check :: select the pre-change sources"
+              ansible.builtin.set_fact:
+                svc_src: "{{ svc_facts_before }}"
+                svc_ss_src: "{{ svc_ss_before }}"
+
+            - name: "Service check :: record the pre-change baseline"
+              ansible.builtin.set_fact:
+                svc_running_before: "{{ svc_running_from_facts }}"
+                svc_failed_before: "{{ svc_failed_from_facts }}"
+                svc_listeners_before: "{{ svc_listeners_from_ss }}"
+
+            - name: "Write services_before.json"
+              ansible.builtin.copy:
+                dest: "{{ evidence_dir }}/services_before.json"
+                mode: '0640'
+                content: >-
+                  {{ {'running_services': svc_running_before, 'failed_services': svc_failed_before,
+                      'tcp_listeners': svc_listeners_before} | to_nice_json }}
+
+            - name: "Service check :: baseline result (Check)"
+              ansible.builtin.set_fact:
+                svc_check_result:
+                  status: baseline_only
+                  running_services_before: "{{ svc_running_before }}"
+                  tcp_listeners_before: "{{ svc_listeners_before }}"
+                  failed_services_before: "{{ svc_failed_before }}"
+                svc_check_message:
+                  - >-
+                    BASELINE DE SERVIÇOS REGISTRADA (ACTION=Check) em {{ inventory_hostname }}:
+                    {{ svc_running_before | length }} serviço(s) em execução e
+                    {{ svc_listeners_before | length }} porta(s) TCP em escuta.
+                    A validação pós-mudança roda no ACTION=Apply.
+              when: ACTION == 'Check'
+
+            - name: "Service check :: result"
+              ansible.builtin.debug:
+                msg: "{{ svc_check_message }}"
+              when: ACTION == 'Check'
+          rescue:
+            - name: "Service check :: record that the check could not be completed (before)"
+              ansible.builtin.set_fact:
+                svc_check_result:
+                  status: error
+                  phase: before
+                  error: "{{ ansible_failed_result.msg | default('erro desconhecido') }}"
+                svc_check_message:
+                  - >-
+                    ATENÇÃO: a validação de serviços não pôde ser concluída em {{ inventory_hostname }}
+                    (foto de antes da mudança). O job NÃO foi marcado como falho por isso; valide manualmente os
+                    serviços do host. Erro: {{ ansible_failed_result.msg | default('erro desconhecido') }}
+
+            - name: "Service check :: record the warning in the summary (before)"
+              ansible.builtin.set_fact:
+                samurai_warnings: "{{ samurai_warnings + svc_check_message }}"
+
+            - name: "Service check :: result (before)"
+              ansible.builtin.debug:
+                msg: "{{ svc_check_message }}"
+
+        # ------------------------------------------------------------------
+        # Phase 3: Apply — download, stage, migrate, cut over (skipped in
+        # Check mode, and skipped entirely when the version already matches).
+        # ------------------------------------------------------------------
+        - name: "Patch :: build the new version's sibling directory path"
+          ansible.builtin.set_fact:
+            tomcat_new_dir: "{{ (tomcat_current_dir | dirname) }}/apache-tomcat-{{ TARGET_VERSION }}"
+          when:
+            - ACTION == 'Apply'
+            - tomcat_update_needed | bool
+
+        - name: "Patch :: fail when the new version's directory already exists"
+          ansible.builtin.stat:
+            path: "{{ tomcat_new_dir }}"
+          register: tomcat_new_dir_stat
+          when:
+            - ACTION == 'Apply'
+            - tomcat_update_needed | bool
+
+        - name: "Patch :: refuse to overwrite a pre-existing target directory"
+          ansible.builtin.fail:
+            msg: >-
+              {{ tomcat_new_dir }} already exists on {{ inventory_hostname }} — refusing to overwrite it
+              (a previous Apply may have failed partway through; inspect and remove it manually before retrying).
+          when:
+            - ACTION == 'Apply'
+            - tomcat_update_needed | bool
+            - tomcat_new_dir_stat.stat.exists
+
+        - name: "Patch :: download the Tomcat artifact (checksum verified)"
+          ansible.builtin.get_url:
+            url: "{{ TOMCAT_ARTIFACT_URL }}"
+            dest: "/tmp/samurai-tomcat-{{ TARGET_VERSION }}.tar.gz"
+            checksum: "sha512:{{ TOMCAT_ARTIFACT_SHA512 }}"
+            mode: '0640'
+          when:
+            - ACTION == 'Apply'
+            - tomcat_update_needed | bool
+
+        - name: "Patch :: create the new version's parent directory"
+          ansible.builtin.file:
+            path: "{{ tomcat_current_dir | dirname }}"
+            state: directory
+            mode: '0755'
+          when:
+            - ACTION == 'Apply'
+            - tomcat_update_needed | bool
+
+        - name: "Patch :: extract the new version (tarball's own top-level apache-tomcat-<version>/ dir)"
+          ansible.builtin.unarchive:
+            src: "/tmp/samurai-tomcat-{{ TARGET_VERSION }}.tar.gz"
+            dest: "{{ tomcat_current_dir | dirname }}"
+            remote_src: true
+          when:
+            - ACTION == 'Apply'
+            - tomcat_update_needed | bool
+
+        - name: "Patch :: confirm the extracted directory matches the expected name"
+          ansible.builtin.stat:
+            path: "{{ tomcat_new_dir }}"
+          register: tomcat_new_dir_after_extract
+          when:
+            - ACTION == 'Apply'
+            - tomcat_update_needed | bool
+
+        - name: "Patch :: fail when the artifact did not extract to apache-tomcat-<TARGET_VERSION>/"
+          ansible.builtin.fail:
+            msg: >-
+              TOMCAT_ARTIFACT_URL did not extract to {{ tomcat_new_dir }} on {{ inventory_hostname }} —
+              the tarball's top-level directory name must be apache-tomcat-{{ TARGET_VERSION }}
+              (the official Apache Tomcat release layout).
+          when:
+            - ACTION == 'Apply'
+            - tomcat_update_needed | bool
+            - not tomcat_new_dir_after_extract.stat.exists
+
+        # ---- migrate conf/ (full copy — safe within the same 9.0.x line;
+        # a cross-major upgrade needs a manual conf review, out of scope) ---
+        - name: "Patch :: capture the owner/group of the current install"
+          ansible.builtin.stat:
+            path: "{{ tomcat_current_dir }}"
+          register: tomcat_current_dir_stat
+          when:
+            - ACTION == 'Apply'
+            - tomcat_update_needed | bool
+
+        - name: "Patch :: migrate conf/ from the current install"
+          ansible.builtin.copy:
+            src: "{{ tomcat_current_dir }}/conf/"
+            dest: "{{ tomcat_new_dir }}/conf/"
+            remote_src: true
+            owner: "{{ tomcat_current_dir_stat.stat.pw_name }}"
+            group: "{{ tomcat_current_dir_stat.stat.gr_name }}"
+          when:
+            - ACTION == 'Apply'
+            - tomcat_update_needed | bool
+
+        # ---- migrate custom webapps (anything not in the stock set) ------
+        - name: "Patch :: list webapps in the current install"
+          ansible.builtin.find:
+            paths: "{{ tomcat_current_dir }}/webapps"
+            file_type: any
+            depth: 1
+          register: tomcat_webapps_before
+          when:
+            - ACTION == 'Apply'
+            - tomcat_update_needed | bool
+
+        - name: "Patch :: identify custom (non-stock) webapps"
+          ansible.builtin.set_fact:
+            tomcat_custom_webapps: >-
+              {{
+                (tomcat_webapps_before.files | default([]) | map(attribute='path') | map('basename') | list)
+                | difference(TOMCAT_STOCK_WEBAPPS)
+              }}
+          when:
+            - ACTION == 'Apply'
+            - tomcat_update_needed | bool
+
+        - name: "Patch :: migrate each custom webapp"
+          ansible.builtin.copy:
+            src: "{{ tomcat_current_dir }}/webapps/{{ item }}"
+            dest: "{{ tomcat_new_dir }}/webapps/"
+            remote_src: true
+            owner: "{{ tomcat_current_dir_stat.stat.pw_name }}"
+            group: "{{ tomcat_current_dir_stat.stat.gr_name }}"
+          loop: "{{ tomcat_custom_webapps | default([]) }}"
+          when:
+            - ACTION == 'Apply'
+            - tomcat_update_needed | bool
+
+        - name: "Write webapps_migrated.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/webapps_migrated.txt"
+            mode: '0640'
+            content: |
+              {% if ACTION == 'Apply' and tomcat_update_needed | default(false) %}
+              {% for app in tomcat_custom_webapps | default([]) %}
+              {{ app }}
+              {% endfor %}
+              {% else %}
+              not_applicable
+              {% endif %}
+
+        # ---- migrate extra jars under lib/ not already shipped by the new
+        # version (e.g. JDBC drivers added by an operator) ------------------
+        - name: "Patch :: list jars in the current install's lib/"
+          ansible.builtin.find:
+            paths: "{{ tomcat_current_dir }}/lib"
+            patterns: "*.jar"
+          register: tomcat_libs_before
+          when:
+            - ACTION == 'Apply'
+            - tomcat_update_needed | bool
+
+        - name: "Patch :: list jars already shipped by the new version's lib/"
+          ansible.builtin.find:
+            paths: "{{ tomcat_new_dir }}/lib"
+            patterns: "*.jar"
+          register: tomcat_libs_new
+          when:
+            - ACTION == 'Apply'
+            - tomcat_update_needed | bool
+
+        - name: "Patch :: identify extra jars (present before, not shipped by the new version)"
+          ansible.builtin.set_fact:
+            tomcat_extra_libs: >-
+              {{
+                (tomcat_libs_before.files | default([]) | map(attribute='path') | map('basename') | list)
+                | difference(tomcat_libs_new.files | default([]) | map(attribute='path') | map('basename') | list)
+              }}
+          when:
+            - ACTION == 'Apply'
+            - tomcat_update_needed | bool
+
+        - name: "Patch :: migrate each extra jar"
+          ansible.builtin.copy:
+            src: "{{ tomcat_current_dir }}/lib/{{ item }}"
+            dest: "{{ tomcat_new_dir }}/lib/{{ item }}"
+            remote_src: true
+            owner: "{{ tomcat_current_dir_stat.stat.pw_name }}"
+            group: "{{ tomcat_current_dir_stat.stat.gr_name }}"
+          loop: "{{ tomcat_extra_libs | default([]) }}"
+          when:
+            - ACTION == 'Apply'
+            - tomcat_update_needed | bool
+
+        - name: "Write libs_migrated.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/libs_migrated.txt"
+            mode: '0640'
+            content: |
+              {% if ACTION == 'Apply' and tomcat_update_needed | default(false) %}
+              {% for jar in tomcat_extra_libs | default([]) %}
+              {{ jar }}
+              {% endfor %}
+              {% else %}
+              not_applicable
+              {% endif %}
+
+        # ---- ownership of the whole new tree (conf/webapps/lib migration
+        # above may have been copied as the connecting user, not the service
+        # owner) -------------------------------------------------------------
+        - name: "Patch :: set ownership of the new install to match the current one"
+          ansible.builtin.file:
+            path: "{{ tomcat_new_dir }}"
+            owner: "{{ tomcat_current_dir_stat.stat.pw_name }}"
+            group: "{{ tomcat_current_dir_stat.stat.gr_name }}"
+            recurse: true
+          when:
+            - ACTION == 'Apply'
+            - tomcat_update_needed | bool
+
+        # ---- stop the service BEFORE the cutover (symlink flip while the
+        # JVM still holds the old path open is safe on Linux, but stopping
+        # first keeps the before/after service-check window unambiguous) ----
+        - name: "Patch :: stop the Tomcat service"
+          ansible.builtin.systemd:
+            name: "{{ SERVICE_NAME }}"
+            state: stopped
+          when:
+            - ACTION == 'Apply'
+            - tomcat_update_needed | bool
+
+        # ---- systemd drop-in: points CATALINA_HOME/CATALINA_BASE at the
+        # stable indirection path, never at a version-named directory.
+        # Idempotent: identical content on every Apply, so repeat runs do
+        # not report a change once the host has been adopted. -------------
+        - name: "Patch :: create the systemd drop-in directory"
+          ansible.builtin.file:
+            path: "/etc/systemd/system/{{ SERVICE_NAME }}.service.d"
+            state: directory
+            mode: '0755'
+          when:
+            - ACTION == 'Apply'
+            - tomcat_update_needed | bool
+
+        - name: "Patch :: write the CATALINA_HOME/CATALINA_BASE override"
+          ansible.builtin.copy:
+            dest: "/etc/systemd/system/{{ SERVICE_NAME }}.service.d/samurai-tomcat-home.conf"
+            mode: '0644'
+            content: |
+              [Service]
+              Environment=CATALINA_HOME={{ tomcat_link_path }}
+              Environment=CATALINA_BASE={{ tomcat_link_path }}
+          register: tomcat_dropin_write
+          when:
+            - ACTION == 'Apply'
+            - tomcat_update_needed | bool
+
+        - name: "Patch :: reload systemd when the drop-in changed"
+          ansible.builtin.systemd:
+            daemon_reload: true
+          when:
+            - ACTION == 'Apply'
+            - tomcat_update_needed | bool
+            - tomcat_dropin_write.changed | default(false)
+
+        - name: "Patch :: point the stable indirection path at the new version"
+          ansible.builtin.file:
+            src: "{{ tomcat_new_dir }}"
+            dest: "{{ tomcat_link_path }}"
+            state: link
+            force: true
+          when:
+            - ACTION == 'Apply'
+            - tomcat_update_needed | bool
+
+        - name: "Patch :: start the Tomcat service on the new version"
+          ansible.builtin.systemd:
+            name: "{{ SERVICE_NAME }}"
+            state: started
+          when:
+            - ACTION == 'Apply'
+            - tomcat_update_needed | bool
+
+        - name: "Patch :: wait for the Tomcat service to report active"
+          ansible.builtin.command:
+            argv: [systemctl, is-active, "{{ SERVICE_NAME }}"]
+          register: tomcat_service_wait
+          changed_when: false
+          failed_when: false
+          until: tomcat_service_wait.stdout | default('') | trim == 'active'
+          retries: "{{ svc_wait_retries }}"
+          delay: 10
+          when:
+            - ACTION == 'Apply'
+            - tomcat_update_needed | bool
+
+        - name: "Patch :: fail when the Tomcat service did not come up active"
+          ansible.builtin.fail:
+            msg: >-
+              {{ SERVICE_NAME }} did not reach 'active' on {{ inventory_hostname }} after the patch
+              (last state: {{ tomcat_service_wait.stdout | default('unknown') | trim }}).
+              The new version is staged at {{ tomcat_new_dir }}; rollback by pointing
+              {{ tomcat_link_path }} back at {{ tomcat_current_dir }} and restarting {{ SERVICE_NAME }}.
+          when:
+            - ACTION == 'Apply'
+            - tomcat_update_needed | bool
+            - (tomcat_service_wait.stdout | default('') | trim) != 'active'
+
+        # ---- Phase 4: Post-check (only meaningful after a real Apply) -----
+        - name: "Read Tomcat version after the patch"
+          ansible.builtin.shell: |
+            set -o pipefail
+            {{ tomcat_link_path | quote }}/bin/version.sh 2>/dev/null | grep -i '^Server version' | sed 's#.*/##' | tr -d '[:space:]'
+          args:
+            executable: /bin/bash
+          register: tomcat_version_after_raw
+          changed_when: false
+          failed_when: false
+          when:
+            - ACTION == 'Apply'
+            - tomcat_update_needed | bool
+
+        - name: "Record version after the patch"
+          ansible.builtin.set_fact:
+            tomcat_version_after: "{{ (tomcat_version_after_raw.stdout | default('') | trim) if (ACTION == 'Apply' and tomcat_update_needed | bool) else tomcat_version_before }}"
+
+        - name: "Fail when the installed version did not converge on TARGET_VERSION"
+          ansible.builtin.fail:
+            msg: >-
+              After the patch, {{ inventory_hostname }} reports version
+              '{{ tomcat_version_after }}', expected '{{ TARGET_VERSION }}'.
+          when:
+            - ACTION == 'Apply'
+            - tomcat_update_needed | bool
+            - tomcat_version_after != TARGET_VERSION
+
+        - name: "Write version_after.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/version_after.txt"
+            mode: '0640'
+            content: |
+              {% if ACTION == 'Apply' %}
+              indirection_path: {{ tomcat_link_path }}
+              new_install_dir: {{ tomcat_new_dir | default('not_applicable_already_current') }}
+              installed_version: {{ tomcat_version_after }}
+              patch_applied: {{ tomcat_update_needed | bool }}
+              {% else %}
+              not_applicable_check_mode
+              {% endif %}
+
+        # ---- #86-style serviços e portas em escuta (depois do restart) ----
+        # Mesmo bloco de comparação do linux_yum_update_with_evidence.yml,
+        # só troca o "wait" específico do serviço aplicado pelo wait do
+        # SERVICE_NAME do Tomcat (já feito acima) — esta seção audita TODO o
+        # host, não só o Tomcat, igual ao padrão dos outros playbooks.
+        - name: "Service check :: compare with the pre-change baseline"
+          when:
+            - ACTION == 'Apply'
+            - svc_check_enabled | bool
+            - svc_running_before is defined
+            - (svc_check_result.status | default('')) != 'error'
+          block:
+            - name: "Service check :: wait for the services that were running before"
+              ansible.builtin.command:
+                argv: "{{ ['systemctl', 'is-active'] + svc_running_before }}"
+              register: svc_wait
+              changed_when: false
+              failed_when: false
+              until: >-
+                (svc_wait.stdout_lines | default([]) | reject('equalto', 'active') | list | length == 0)
+                or ((svc_wait.attempts | default(1) | int) >= (svc_wait_retries | int))
+              retries: "{{ svc_wait_retries }}"
+              delay: 10
+              when: svc_running_before | length > 0
+
+            - name: "Service check :: collect services (after the wait)"
+              ansible.builtin.service_facts:
+              register: svc_facts_wait
+              ignore_errors: true
+
+            - name: "Service check :: select the post-change source"
+              ansible.builtin.set_fact:
+                svc_src: "{{ svc_facts_wait }}"
+
+            - name: "Service check :: list services that did not come back"
+              ansible.builtin.set_fact:
+                svc_down: "{{ svc_running_before | difference(svc_running_from_facts) }}"
+
+            - name: "Service check :: try to start the services that did not come back"
+              ansible.builtin.service:
+                name: "{{ item }}"
+                state: started
+              loop: "{{ svc_down | default([]) }}"
+              register: svc_restart
+              failed_when: false
+
+            - name: "Service check :: wait for the services the playbook started"
+              ansible.builtin.command:
+                argv: "{{ ['systemctl', 'is-active'] + svc_down }}"
+              register: svc_wait_started
+              changed_when: false
+              failed_when: false
+              until: >-
+                (svc_wait_started.stdout_lines | default([]) | reject('equalto', 'active') | list | length == 0)
+                or ((svc_wait_started.attempts | default(1) | int) >= 3)
+              retries: 3
+              delay: 5
+              when: svc_down | default([]) | length > 0
+
+            - name: "Service check :: collect services (after)"
+              ansible.builtin.service_facts:
+              register: svc_facts_final
+              ignore_errors: true
+              when: svc_down | default([]) | length > 0
+
+            - name: "Service check :: collect TCP listeners (after)"
+              ansible.builtin.command:
+                argv: [ss, -ltnp]
+              register: svc_ss_after
+              changed_when: false
+              failed_when: false
+
+            - name: "Service check :: select the post-change sources"
+              ansible.builtin.set_fact:
+                svc_src: "{{ svc_facts_wait if (svc_facts_final is skipped) else svc_facts_final }}"
+                svc_ss_src: "{{ svc_ss_after }}"
+
+            - name: "Service check :: record the post-change state"
+              ansible.builtin.set_fact:
+                svc_running_after: "{{ svc_running_from_facts }}"
+                svc_failed_after: "{{ svc_failed_from_facts }}"
+                svc_listeners_after: "{{ svc_listeners_from_ss }}"
+
+            - name: "Service check :: compute what changed"
+              ansible.builtin.set_fact:
+                svc_still_down: >-
+                  {%- set ns = namespace(out=[]) -%}
+                  {%- for s in (svc_running_before | difference(svc_running_after)) -%}
+                  {%- set r = (svc_restart.results | default([]) | selectattr('item', 'defined') | selectattr('item', 'equalto', s) | list) -%}
+                  {%- set err = ((r[0].msg | default('')) if r else '') | string | trim -%}
+                  {%- if not r -%}
+                  {%- set err = 'não houve tentativa de inicialização (o serviço caiu depois da checagem)' -%}
+                  {%- elif not err -%}
+                  {%- set err = 'o start foi aceito, mas o serviço não ficou em execução; veja journalctl -u ' ~ s -%}
+                  {%- endif -%}
+                  {%- set ns.out = ns.out + [{'service': s, 'error': err}] -%}
+                  {%- endfor -%}
+                  {{ ns.out }}
+                svc_restored: "{{ (svc_down | default([])) | intersect(svc_running_after) }}"
+                svc_listeners_lost: >-
+                  {%- set ports = svc_listeners_after | map(attribute='port') | list -%}
+                  {%- set ns = namespace(out=[]) -%}
+                  {%- for l in svc_listeners_before -%}
+                  {%- set n_before = svc_listeners_before | selectattr('process', 'equalto', l.process) | list | length -%}
+                  {%- set n_after = svc_listeners_after | selectattr('process', 'equalto', l.process) | list | length -%}
+                  {%- if l.port not in ports and (l.process == 'unknown' or n_after < n_before) -%}
+                  {%- set ns.out = ns.out + [l] -%}
+                  {%- endif -%}
+                  {%- endfor -%}
+                  {{ ns.out }}
+                svc_failed_new: "{{ svc_failed_after | difference(svc_failed_before) | difference(svc_running_before) }}"
+
+            - name: "Service check :: build the result and the message"
+              ansible.builtin.set_fact:
+                svc_check_result:
+                  status: "{{ 'ok' if (svc_still_down | length == 0 and svc_listeners_lost | length == 0 and svc_failed_new | length == 0) else 'warning' }}"
+                  running_services_before: "{{ svc_running_before }}"
+                  tcp_listeners_before: "{{ svc_listeners_before }}"
+                  services_restored_by_playbook: "{{ svc_restored }}"
+                  services_still_down: "{{ svc_still_down }}"
+                  tcp_listeners_lost: "{{ svc_listeners_lost }}"
+                  failed_services_before: "{{ svc_failed_before }}"
+                  failed_services_after: "{{ svc_failed_after }}"
+                  services_newly_failed: "{{ svc_failed_new }}"
+                svc_check_message: >-
+                  {%- set ns = namespace(issues=[]) -%}
+                  {%- for s in svc_still_down -%}
+                  {%- set ns.issues = ns.issues + ['serviço ' ~ s.service ~ ': estava em execução antes da mudança e não subiu, nem após a tentativa de inicialização pelo playbook. Erro da tentativa: ' ~ s.error] -%}
+                  {%- endfor -%}
+                  {%- for l in svc_listeners_lost -%}
+                  {%- set ns.issues = ns.issues + ['porta TCP ' ~ l.port ~ ' (processo ' ~ l.process ~ '): estava em escuta antes da mudança e não está mais. Se a porta é de um serviço citado acima, é consequência dele; se não, é uma aplicação fora do gerenciador de serviços, que o playbook não reinicia. Valide a aplicação.'] -%}
+                  {%- endfor -%}
+                  {%- for s in svc_failed_new -%}
+                  {%- set ns.issues = ns.issues + ['serviço ' ~ s ~ ': passou a falhar depois da mudança (não estava em falha antes).'] -%}
+                  {%- endfor -%}
+                  {%- set restored = ['Iniciados pelo playbook porque não voltaram sozinhos (estão em execução agora): ' ~ (svc_restored | join(', '))] if svc_restored else [] -%}
+                  {%- if ns.issues -%}
+                  {{ ['ATENÇÃO: SERVIÇOS NÃO CONFORMES COM O CENÁRIO PRÉ-MUDANÇA em ' ~ inventory_hostname ~ '. O job NÃO foi marcado como falho por isso. Valide no host o motivo de cada item abaixo:'] + ns.issues + restored }}
+                  {%- else -%}
+                  {{ ['SERVIÇOS VALIDADOS em ' ~ inventory_hostname ~ ': os ' ~ (svc_running_before | length) ~ ' serviço(s) e as ' ~ (svc_listeners_before | length) ~ ' porta(s) TCP em escuta que estavam ativos antes da mudança estão ativos novamente, conforme o cenário pré-mudança.'] + restored }}
+                  {%- endif -%}
+
+            - name: "Service check :: record the warning in the summary"
+              ansible.builtin.set_fact:
+                samurai_warnings: "{{ samurai_warnings + svc_check_message[1:] | reject('match', '^Iniciados pelo playbook') | list }}"
+              when: svc_check_result.status == 'warning'
+
+            - name: "Service check :: result"
+              ansible.builtin.debug:
+                msg: "{{ svc_check_message }}"
+
+            - name: "Write services_check.json"
+              ansible.builtin.copy:
+                dest: "{{ evidence_dir }}/services_check.json"
+                mode: '0640'
+                content: "{{ svc_check_result | to_nice_json }}"
+          rescue:
+            - name: "Service check :: record that the check could not be completed (after)"
+              ansible.builtin.set_fact:
+                svc_check_result:
+                  status: error
+                  phase: after
+                  error: "{{ ansible_failed_result.msg | default('erro desconhecido') }}"
+                svc_check_message:
+                  - >-
+                    ATENÇÃO: a validação de serviços não pôde ser concluída em {{ inventory_hostname }}
+                    (comparação depois da mudança). O job NÃO foi marcado como falho por isso; valide manualmente os
+                    serviços do host. Erro: {{ ansible_failed_result.msg | default('erro desconhecido') }}
+
+            - name: "Service check :: record the warning in the summary (after)"
+              ansible.builtin.set_fact:
+                samurai_warnings: "{{ samurai_warnings + svc_check_message }}"
+
+            - name: "Service check :: result (after)"
+              ansible.builtin.debug:
+                msg: "{{ svc_check_message }}"
+
+      rescue:
+        - name: "Capture rescue error"
+          ansible.builtin.set_fact:
+            samurai_errors: "{{ samurai_errors + [ansible_failed_result.msg | default('unknown failure')] }}"
+
+        - name: "Mark execution status as failed"
+          ansible.builtin.set_fact:
+            execution_status: "failed"
+
+      always:
+        - name: "Compute final execution status"
+          ansible.builtin.set_fact:
+            execution_status: >-
+              {{
+                execution_status | default(
+                  'check_completed' if ACTION == 'Check'
+                  else ('patched' if (tomcat_update_needed | default(false) | bool)
+                        else 'already_current')
+                )
+              }}
+
+        - name: "Capture finished_at timestamp"
+          ansible.builtin.set_fact:
+            execution_finished_at: "{{ '%Y-%m-%dT%H:%M:%SZ' | strftime(utc=true) }}"
+
+        - name: "Build per-host summary"
+          ansible.builtin.set_fact:
+            host_summary:
+              tool: "SamurAI Shield"
+              playbook: "tomcat_update_with_evidence"
+              host: "{{ inventory_hostname }}"
+              fqdn: "{{ ansible_fqdn | default(inventory_hostname) }}"
+              primary_ip: "{{ ansible_default_ipv4.address | default('unknown') }}"
+              catalina_home: "{{ CATALINA_HOME | default('unknown') }}"
+              service_name: "{{ SERVICE_NAME | default('unknown') }}"
+              action: "{{ ACTION }}"
+              version_before: "{{ tomcat_version_before | default('unknown') }}"
+              version_after: "{{ tomcat_version_after | default('not_applicable_check_mode') }}"
+              target_version: "{{ TARGET_VERSION | default('unknown') }}"
+              patch_needed: "{{ tomcat_update_needed | default(false) | bool }}"
+              patch_applied: "{{ (ACTION == 'Apply' and (tomcat_update_needed | default(false) | bool)) }}"
+              custom_webapps_migrated: "{{ tomcat_custom_webapps | default([]) }}"
+              extra_libs_migrated: "{{ tomcat_extra_libs | default([]) }}"
+              service_check: "{{ svc_check_result | default({'status': ('disabled' if not (svc_check_enabled | bool) else 'not_run')}) }}"
+              evidence_dir: "{{ evidence_dir if (evidence_dir_ready | default(false)) else 'not_created' }}"
+              unreachable: "{{ samurai_unreachable | default(false) | bool }}"
+              started_at: "{{ execution_started_at }}"
+              finished_at: "{{ execution_finished_at }}"
+              status: "{{ execution_status }}"
+              warnings: "{{ samurai_warnings }}"
+              errors: "{{ samurai_errors }}"
+
+        - name: "Write summary.json"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/summary.json"
+            mode: '0640'
+            content: "{{ host_summary | to_nice_json }}\n"
+          register: samurai_summary_write
+          ignore_errors: true
+          ignore_unreachable: true
+          when:
+            - evidence_dir_ready | default(false)
+            - not (samurai_unreachable | default(false) | bool)
+
+        - name: "Record that summary.json could not be written"
+          ansible.builtin.set_fact:
+            execution_status: "failed"
+            samurai_unreachable: "{{ ((samurai_unreachable | default(false) | bool) or (samurai_summary_write.unreachable | default(false))) | bool }}"
+            samurai_errors: >-
+              {{ samurai_errors + ['summary.json could not be written to ' + evidence_dir + ': '
+                 + (samurai_summary_write.msg | default('unknown error'))] }}
+          when: samurai_summary_write is failed or (samurai_summary_write.unreachable | default(false))
+
+        - name: "Reflect the summary.json write failure in the published summary"
+          ansible.builtin.set_fact:
+            host_summary: >-
+              {{ host_summary | combine({'status': execution_status, 'errors': samurai_errors,
+                                         'unreachable': samurai_unreachable | bool}) }}
+          when: samurai_summary_write is failed or (samurai_summary_write.unreachable | default(false))
+
+        - name: "Publish per-host summary as run stat"
+          ansible.builtin.set_stats:
+            data:
+              samurai_tomcat_update_summary: "{{ host_summary }}"
+            per_host: true
+            aggregate: false
+
+
+- name: "SamurAI :: tomcat-update :: emit consolidated stdout JSON"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: "Collect per-host summaries"
+      ansible.builtin.set_fact:
+        all_host_summaries: >-
+          {{
+            groups['samurai_tomcat_targets'] | default([])
+            | map('extract', hostvars, 'host_summary')
+            | select('defined') | list
+          }}
+
+    - name: "Compute consolidated status"
+      ansible.builtin.set_fact:
+        consolidated_status: >-
+          {{
+            'failed' if (all_host_summaries | selectattr('status', 'equalto', 'failed') | list | length) > 0
+            else 'completed'
+          }}
+
+    - name: "Build consolidated samurai_shield_result block"
+      ansible.builtin.set_fact:
+        samurai_shield_result:
+          playbook: "tomcat_update_with_evidence"
+          action: "{{ samurai_action | default('Check') }}"
+          target_version: "{{ samurai_target_version | default('unknown') }}"
+          status: "{{ consolidated_status }}"
+          host_count: "{{ all_host_summaries | length }}"
+          hosts: "{{ all_host_summaries }}"
+
+    - name: "Print consolidated SamurAI Shield JSON to stdout"
+      ansible.builtin.debug:
+        msg: "{{ {'samurai_shield_result': samurai_shield_result} | to_nice_json }}"
+
+    - name: "Service check :: consolidated result"
+      ansible.builtin.debug:
+        msg: >-
+          {%- set ns = namespace(out=[]) -%}
+          {%- for h in all_host_summaries -%}
+          {%- set sc = h.service_check | default({}) -%}
+          {%- set st = sc.status | default('not_run') -%}
+          {%- if st == 'ok' -%}
+          {%- set line = h.host ~ ': SERVIÇOS VALIDADOS (conforme o cenário pré-mudança)' -%}
+          {%- elif st == 'warning' -%}
+          {%- set line = h.host ~ ': ATENÇÃO, serviços não conformes com o cenário pré-mudança (veja os avisos do host); o job não falhou por isso' -%}
+          {%- elif st == 'baseline_only' -%}
+          {%- set line = h.host ~ ': baseline de serviços registrada (ACTION=Check)' -%}
+          {%- elif st == 'error' -%}
+          {%- set line = h.host ~ ': ATENÇÃO, a validação de serviços não pôde ser concluída (veja os avisos do host); o job não falhou por isso' -%}
+          {%- elif st == 'disabled' -%}
+          {%- set line = h.host ~ ': validação de serviços desligada (SERVICE_CHECK=off)' -%}
+          {%- else -%}
+          {%- set line = h.host ~ ': validação de serviços não executada (a execução do host terminou antes)' -%}
+          {%- endif -%}
+          {%- set ns.out = ns.out + [line] -%}
+          {%- endfor -%}
+          {{ ns.out }}
+
+    - name: "Publish consolidated result as workflow stat"
+      ansible.builtin.set_stats:
+        data:
+          samurai_shield_result: "{{ samurai_shield_result }}"
+        aggregate: false
+        per_host: false
+
+
+- name: "SamurAI :: tomcat-update :: fail hosts whose execution ended failed"
+  hosts: samurai_tomcat_targets
+  gather_facts: false
+  tasks:
+    - name: "Re-check hosts that were unreachable in play 2"
+      ansible.builtin.ping:
+      when: samurai_unreachable | default(false) | bool
+
+    - name: "Fail the host when execution ended failed (structured evidence already published)"
+      ansible.builtin.fail:
+        msg: >-
+          Tomcat patch failed on {{ inventory_hostname }}:
+          {{ (samurai_errors | join(' | ')) if (samurai_errors | default([]) | length) > 0 else 'see summary.json' }}
+      when: (execution_status | default('')) == 'failed'

@@ -1,0 +1,79 @@
+{
+  "name": "SamurAI Shield :: Apache Tomcat update",
+  "description": "Input contract for playbooks/tomcat_update_with_evidence.yml (repo: prfsouto/samurai-aap-playbooks). Patches a self-managed Apache Tomcat install (not an rpm/dpkg package) via a sibling-directory build + stable-symlink cutover, migrating conf/custom-webapps/extra-jars from the current install. HOSTNAMES is auto-filled by SamurAI Shield from the governed asset and hidden from the operator form. IMPORTANT: enable 'Prompt on launch -> Extra variables' (ask_variables_on_launch) on the Job Template so the engine's governed HOSTNAMES overrides the survey's blank default instead of being discarded.",
+  "spec": [
+    {
+      "question_name": "Target host(s)",
+      "question_description": "Single host, IP, or space/comma-separated list. Filled automatically by SamurAI Shield from the selected asset — do not type it by hand.",
+      "variable": "HOSTNAMES",
+      "type": "text",
+      "required": true,
+      "default": "",
+      "new_question": true
+    },
+    {
+      "question_name": "CATALINA_HOME",
+      "question_description": "Absolute path the target's systemd service references today (a symlink, or a real version-named directory — the playbook detects which).",
+      "variable": "CATALINA_HOME",
+      "type": "text",
+      "required": true,
+      "default": "",
+      "new_question": true
+    },
+    {
+      "question_name": "Service name",
+      "question_description": "The systemd unit that fronts this Tomcat (e.g. tomcat).",
+      "variable": "SERVICE_NAME",
+      "type": "text",
+      "required": true,
+      "default": "",
+      "new_question": true
+    },
+    {
+      "question_name": "Target version",
+      "question_description": "Exact version to converge on, e.g. 9.0.121. Never \"latest\" — the scope can never be guessed.",
+      "variable": "TARGET_VERSION",
+      "type": "text",
+      "required": true,
+      "default": "",
+      "new_question": true
+    },
+    {
+      "question_name": "Action",
+      "question_description": "Check reports the installed version vs the target and a services/ports baseline, read-only. Apply downloads, verifies, stages, migrates and cuts over.",
+      "variable": "ACTION",
+      "type": "multiplechoice",
+      "choices": "Check\nApply",
+      "required": true,
+      "default": "Check",
+      "new_question": true
+    },
+    {
+      "question_name": "Tomcat artifact URL",
+      "question_description": "Required when ACTION=Apply: the exact tar.gz for TARGET_VERSION.",
+      "variable": "TOMCAT_ARTIFACT_URL",
+      "type": "text",
+      "required": false,
+      "default": "",
+      "new_question": true
+    },
+    {
+      "question_name": "Tomcat artifact SHA-512",
+      "question_description": "Required when ACTION=Apply: the artifact is never installed without a matching checksum.",
+      "variable": "TOMCAT_ARTIFACT_SHA512",
+      "type": "text",
+      "required": false,
+      "default": "",
+      "new_question": true
+    },
+    {
+      "question_name": "Evidence base directory",
+      "question_description": "Base directory on the target where the structured evidence files are written.",
+      "variable": "EVIDENCE_BASE_DIR",
+      "type": "text",
+      "required": false,
+      "default": "/var/tmp/samurai-shield/tomcat-update",
+      "new_question": true
+    }
+  ]
+}
