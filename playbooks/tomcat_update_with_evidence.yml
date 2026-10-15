@@ -242,16 +242,27 @@
       {%- set ns.r = ns.r + [((e[:-1] | regex_escape) if e.endswith('*') else ((e | regex_escape) ~ '([.]service)?$'))] -%}
       {%- endfor -%}
       ^({{ ns.r | join('|') }})
-    svc_all_facts: "{{ svc_src.ansible_facts.services | default({}) | dict2items | map(attribute='value') | list }}"
-    svc_facts_list: "{{ (svc_all_facts | selectattr('source', 'defined') | selectattr('source', 'equalto', 'systemd') | list) or svc_all_facts }}"
+    # Leitura de svc_src (saída de svc_units_cmd) e svc_ss_src (`ss -ltnp`).
+    # Não usa ansible.builtin.service_facts: ele procura 'failed'/'masked'/
+    # 'not-found' na linha INTEIRA do list-units, descrição incluída, e quando
+    # acha numa unit sem o marcador ● descarta o nome — a unit vira 'loaded'
+    # (mesmo bug real encontrado pelo Paulo na vm5, #91: "GRUB failed boot
+    # detection"), e um serviço rodando com uma dessas palavras na descrição
+    # sumia da foto de antes. Aqui o nome é sempre a 1ª coluna do `--plain`
+    # (mesmo padrão de linux_yum_update_with_evidence.yml pós-#91). Units
+    # `static` ficam de fora: são as ativadas sob demanda (dbus, socket).
+    svc_units_cmd: |
+      systemctl list-units --type=service --state=running --plain --no-legend --no-pager | awk 'NF {print "running " $1}'
+      systemctl list-units --type=service --state=failed --plain --no-legend --no-pager | awk 'NF {print "failed " $1}'
+      systemctl list-unit-files --type=service --state=static --no-legend --no-pager | awk 'NF {print "static " $1}'
+    svc_unit_lines: "{{ svc_src.stdout_lines | default([]) }}"
+    svc_static_units: "{{ svc_unit_lines | select('match', '^static ') | map('regex_replace', '^static ', '') | list }}"
     svc_running_from_facts: >-
-      {{ ((svc_facts_list | selectattr('status', 'defined') | rejectattr('status', 'equalto', 'static') | list)
-          + (svc_facts_list | selectattr('status', 'undefined') | list))
-         | selectattr('state', 'equalto', 'running')
-         | map(attribute='name') | reject('match', svc_ignore_regex, true) | sort }}
+      {{ svc_unit_lines | select('match', '^running ') | map('regex_replace', '^running ', '')
+         | reject('in', svc_static_units) | reject('match', svc_ignore_regex, true) | unique | sort }}
     svc_failed_from_facts: >-
-      {{ svc_facts_list | selectattr('status', 'defined') | selectattr('status', 'equalto', 'failed')
-         | map(attribute='name') | reject('match', svc_ignore_regex, true) | sort }}
+      {{ svc_unit_lines | select('match', '^failed ') | map('regex_replace', '^failed ', '')
+         | reject('match', svc_ignore_regex, true) | unique | sort }}
     svc_listeners_from_ss: >-
       {%- set ns = namespace(out=[]) -%}
       {%- for l in (svc_ss_src.stdout_lines | default([])) -%}
@@ -380,25 +391,55 @@
             content: "{{ df_out.stdout }}\n"
 
         # ---- resolve the stable indirection path (deterministic — never
-        # read from state, just derived from CATALINA_HOME's own parent) ----
+        # read from state, just derived from CATALINA_HOME's own parent).
+        # Named by SERVICE_NAME (bedin #89 B7, 2nd round): a generic
+        # "<parent>/current" could already belong to an unrelated product or
+        # Tomcat instance sharing that parent directory. -------------------
         - name: "Compute the stable indirection path"
           ansible.builtin.set_fact:
-            tc_link_path: "{{ (tc_catalina_home | dirname) }}/current"
+            tc_link_path: "{{ (tc_catalina_home | dirname) }}/current-{{ tc_service_name }}"
 
         # ---- resolve the EFFECTIVE install (bedin #89 B7): once a host has
         # been adopted, the indirection symlink — not the raw CATALINA_HOME
         # extra-var the caller keeps sending — is the source of truth. A
         # caller that never updates its stored CATALINA_HOME after the first
         # Apply would otherwise read/patch a permanently frozen old
-        # directory forever. ----------------------------------------------
+        # directory forever. The link is trusted only when THIS SERVICE_NAME's
+        # own systemd drop-in exists and references it (bedin #89 B7, 2nd
+        # round) — a symlink merely existing at that path does not prove
+        # this service created it. ------------------------------------------
         - name: "Stat the stable indirection path"
           ansible.builtin.stat:
             path: "{{ tc_link_path }}"
           register: tc_link_stat
 
+        - name: "Stat this service's own systemd drop-in"
+          ansible.builtin.stat:
+            path: "/etc/systemd/system/{{ tc_service_name }}.service.d/samurai-tomcat-home.conf"
+          register: tc_dropin_stat
+
+        - name: "Read this service's own systemd drop-in, when present"
+          ansible.builtin.slurp:
+            src: "/etc/systemd/system/{{ tc_service_name }}.service.d/samurai-tomcat-home.conf"
+          register: tc_dropin_slurp
+          when: tc_dropin_stat.stat.exists
+
+        - name: "Resolve whether this host was adopted by THIS service"
+          ansible.builtin.set_fact:
+            tc_adopted_by_this_service: >-
+              {{
+                tc_dropin_stat.stat.exists
+                and (tc_dropin_slurp.content | b64decode).find('CATALINA_HOME=' ~ tc_link_path) != -1
+              }}
+
         - name: "Resolve the effective CATALINA_HOME for this run"
           ansible.builtin.set_fact:
-            tc_effective_home: "{{ tc_link_path if (tc_link_stat.stat.exists and tc_link_stat.stat.islnk | default(false)) else tc_catalina_home }}"
+            tc_effective_home: >-
+              {{
+                tc_link_path if (tc_link_stat.stat.exists and (tc_link_stat.stat.islnk | default(false))
+                                 and tc_adopted_by_this_service)
+                else tc_catalina_home
+              }}
 
         - name: "Stat the effective CATALINA_HOME"
           ansible.builtin.stat:
@@ -418,7 +459,7 @@
         - name: "Record install topology"
           ansible.builtin.set_fact:
             tomcat_current_dir: "{{ catalina_realpath.stdout | trim }}"
-            tomcat_adopted: "{{ tc_link_stat.stat.exists and (tc_link_stat.stat.islnk | default(false)) }}"
+            tomcat_adopted: "{{ tc_link_stat.stat.exists and (tc_link_stat.stat.islnk | default(false)) and tc_adopted_by_this_service }}"
 
         # ---- installed version (before) — read-only, parses the jar
         # manifest directly: never executes bin/version.sh (bedin #89 B9,
@@ -483,6 +524,22 @@
             - tc_version_before_parts > tc_target_version_parts
             - not (tc_allow_downgrade | bool)
 
+        # ---- refuse a cross-major.minor jump (bedin #89 B6, 2nd round): the
+        # downgrade guard above only compares magnitude, not line — nothing
+        # stopped e.g. 9.0.x -> 10.1.y. The conf/webapps migration here is
+        # only validated within the same major.minor line; a real line
+        # change needs a manual conf review first (see the header comment).
+        - name: "Fail when TARGET_VERSION changes the major.minor line"
+          ansible.builtin.fail:
+            msg: >-
+              {{ inventory_hostname }} has {{ tomcat_version_before }} installed; TARGET_VERSION
+              {{ tc_target_version }} is a different major.minor line. This playbook only migrates
+              conf/webapps within the same line (e.g. 9.0.x to 9.0.y) — a cross-line upgrade needs
+              a manual conf/webapps review first, out of this playbook's scope.
+          when:
+            - tomcat_update_needed | bool
+            - tc_version_before_parts[0:2] != tc_target_version_parts[0:2]
+
         # ---- #86-style serviços e portas em escuta (antes) — TODO o host,
         # não só a unit do Tomcat, pelo mesmo motivo do yum/apt: uma
         # dependência colateral (ex. um proxy na frente) também é pega. ------
@@ -491,9 +548,10 @@
             - svc_check_enabled | bool
           block:
             - name: "Service check :: collect services (before)"
-              ansible.builtin.service_facts:
+              ansible.builtin.shell: "{{ svc_units_cmd }}"
               register: svc_facts_before
-              ignore_errors: true
+              changed_when: false
+              failed_when: false
 
             - name: "Service check :: collect TCP listeners (before)"
               ansible.builtin.command:
@@ -530,10 +588,10 @@
                   failed_services_before: "{{ svc_failed_before }}"
                 svc_check_message:
                   - >-
-                    BASELINE DE SERVIÇOS REGISTRADA (ACTION=Check) em {{ inventory_hostname }}:
-                    {{ svc_running_before | length }} serviço(s) em execução e
-                    {{ svc_listeners_before | length }} porta(s) TCP em escuta.
-                    A validação pós-mudança roda no ACTION=Apply.
+                    SERVICE BASELINE RECORDED (ACTION=Check) on {{ inventory_hostname }}:
+                    {{ svc_running_before | length }} running service(s) and
+                    {{ svc_listeners_before | length }} listening TCP port(s).
+                    The post-change check runs on ACTION=Apply.
               when: tc_action == 'Check'
 
             - name: "Service check :: result"
@@ -546,12 +604,12 @@
                 svc_check_result:
                   status: error
                   phase: before
-                  error: "{{ ansible_failed_result.msg | default('erro desconhecido') }}"
+                  error: "{{ ansible_failed_result.msg | default('unknown error') }}"
                 svc_check_message:
                   - >-
-                    ATENÇÃO: a validação de serviços não pôde ser concluída em {{ inventory_hostname }}
-                    (foto de antes da mudança). O job NÃO foi marcado como falho por isso; valide manualmente os
-                    serviços do host. Erro: {{ ansible_failed_result.msg | default('erro desconhecido') }}
+                    WARNING: the service check could not be completed on {{ inventory_hostname }}
+                    (pre-change snapshot). The job was NOT marked as failed because of this; check the host's
+                    services manually. Error: {{ ansible_failed_result.msg | default('unknown error') }}
 
             - name: "Service check :: record the warning in the summary (before)"
               ansible.builtin.set_fact:
@@ -596,7 +654,17 @@
             - tomcat_update_needed | bool
             - tomcat_new_dir_stat.stat.exists
 
-        - name: "Patch :: stage, migrate and cut over"
+        # Stage + migrate (download, extract, migrate conf/webapps/libs) is
+        # its OWN block/rescue, separate from the cutover below (bedin #89
+        # N1): nothing here has touched the running service yet, so a
+        # failure in this part — a bad URL, a checksum mismatch, a disk-full
+        # extraction — must NOT trigger the cutover rescue's rollback (which
+        # repoints the link and unconditionally RESTARTS the service). The
+        # first version of this fix wrapped the whole stage+cutover
+        # sequence in one block, so a download failure forced an unplanned
+        # restart of a Tomcat that had never been stopped, on every host in
+        # the wave.
+        - name: "Patch :: stage and migrate"
           when:
             - tc_action == 'Apply'
             - tomcat_update_needed | bool
@@ -649,33 +717,27 @@
                   (the official Apache Tomcat release layout).
               when: not tomcat_new_dir_after_extract.stat.exists
 
-            # ---- migrate conf/ (full copy — safe within the same 9.0.x
-            # line; a cross-major upgrade needs a manual conf review, out of
-            # scope). Only the migrated paths get their ownership touched
-            # (bedin #89 B3 — a previous blanket recursive chown of the
-            # whole new tree flattened Apache's recommended root:tomcat
-            # split, where only logs/temp/work belong to the service user). -
-            - name: "Patch :: capture the owner/group of the current install"
-              ansible.builtin.stat:
-                path: "{{ tomcat_current_dir }}"
-              register: tomcat_current_dir_stat
-
+            # ---- migrate conf/ (full copy — safe within the same major.minor
+            # line; a cross-line upgrade is refused below, bedin #89 B6) ---
             - name: "Patch :: migrate conf/ from the current install"
               ansible.builtin.copy:
                 src: "{{ tomcat_current_dir }}/conf/"
                 dest: "{{ tomcat_new_dir }}/conf/"
                 remote_src: true
-                owner: "{{ tomcat_current_dir_stat.stat.pw_name }}"
-                group: "{{ tomcat_current_dir_stat.stat.gr_name }}"
 
             # ---- migrate custom webapps (anything not in the stock set).
             # ROOT is NEVER stock (bedin #89 B4): it is the single most
             # common thing an operator customizes, and re-copying a
             # genuinely vendor-stock ROOT over itself is a harmless no-op —
-            # silently losing a customized one is not. Any stock ROOT.war
-            # the new version shipped is removed first, so there is never a
-            # WAR-vs-directory ambiguity for Tomcat's own deployer to
-            # resolve. ---------------------------------------------------
+            # silently losing a customized one is not. Each destination is
+            # removed first, whether the new version shipped it as a
+            # directory or a .war: ansible.builtin.copy with remote_src into
+            # an EXISTING directory merges files in rather than replacing it
+            # (ansible-core copy.py), so without this a stock index.jsp
+            # could survive next to the customized app's own content and,
+            # per Tomcat's Mapper precedence (a physical welcome file wins
+            # before the default servlet), end up answering "/" instead of
+            # the customized app (bedin #89 B4, 2nd round). -----------------
             - name: "Patch :: list webapps in the current install"
               ansible.builtin.find:
                 paths: "{{ tomcat_current_dir }}/webapps"
@@ -691,19 +753,23 @@
                     | difference(tc_stock_webapps)
                   }}
 
-            - name: "Patch :: remove the new version's own stock ROOT.war when ROOT is being migrated"
+            - name: "Patch :: remove any pre-existing destination directory before migrating each custom webapp"
               ansible.builtin.file:
-                path: "{{ tomcat_new_dir }}/webapps/ROOT.war"
+                path: "{{ tomcat_new_dir }}/webapps/{{ item }}"
                 state: absent
-              when: "'ROOT' in tomcat_custom_webapps"
+              loop: "{{ tomcat_custom_webapps }}"
+
+            - name: "Patch :: remove any pre-existing destination .war before migrating each custom webapp"
+              ansible.builtin.file:
+                path: "{{ tomcat_new_dir }}/webapps/{{ item }}.war"
+                state: absent
+              loop: "{{ tomcat_custom_webapps }}"
 
             - name: "Patch :: migrate each custom webapp"
               ansible.builtin.copy:
                 src: "{{ tomcat_current_dir }}/webapps/{{ item }}"
                 dest: "{{ tomcat_new_dir }}/webapps/"
                 remote_src: true
-                owner: "{{ tomcat_current_dir_stat.stat.pw_name }}"
-                group: "{{ tomcat_current_dir_stat.stat.gr_name }}"
               loop: "{{ tomcat_custom_webapps }}"
 
             - name: "Write webapps_migrated.txt"
@@ -742,8 +808,6 @@
                 src: "{{ tomcat_current_dir }}/lib/{{ item }}"
                 dest: "{{ tomcat_new_dir }}/lib/{{ item }}"
                 remote_src: true
-                owner: "{{ tomcat_current_dir_stat.stat.pw_name }}"
-                group: "{{ tomcat_current_dir_stat.stat.gr_name }}"
               loop: "{{ tomcat_extra_libs }}"
 
             - name: "Write libs_migrated.txt"
@@ -755,6 +819,74 @@
                   {{ jar }}
                   {% endfor %}
 
+            # ---- reproduce the CURRENT install's real ownership/mode on
+            # every top-level entry of the new tree (bedin #89 B3, 2nd
+            # round): removing the earlier blanket single-owner chown left
+            # the new tree exactly as extracted — root:root, since the
+            # official tarball ships that way and extraction runs as root
+            # (tar's default --same-owner behaviour for the superuser). Any
+            # non-root Tomcat (the layout Apache itself recommends) could
+            # not read its own bin/lib/conf or write logs/temp/work, and the
+            # start below would fail on every host. Each top-level entry
+            # (bin, conf, lib, logs, temp, webapps, work, ...) gets exactly
+            # the owner/group/mode its own counterpart has on the CURRENT
+            # install, recursively — reproducing whatever split layout is
+            # actually in use (including a uniform one), not assuming any
+            # particular convention. -----------------------------------
+            - name: "Patch :: list top-level entries in the current install"
+              ansible.builtin.find:
+                paths: "{{ tomcat_current_dir }}"
+                file_type: any
+                depth: 1
+              register: tomcat_top_entries
+
+            - name: "Patch :: list top-level entry names in the current install"
+              ansible.builtin.set_fact:
+                tomcat_top_names: "{{ tomcat_top_entries.files | map(attribute='path') | map('basename') | list }}"
+
+            - name: "Patch :: stat each top-level entry of the current install"
+              ansible.builtin.stat:
+                path: "{{ tomcat_current_dir }}/{{ item }}"
+              loop: "{{ tomcat_top_names }}"
+              register: tomcat_top_entry_stats
+
+            - name: "Patch :: reproduce ownership/mode of each top-level entry on the new install"
+              ansible.builtin.file:
+                path: "{{ tomcat_new_dir }}/{{ tomcat_top_names[idx] }}"
+                owner: "{{ item.stat.pw_name }}"
+                group: "{{ item.stat.gr_name }}"
+                mode: "{{ item.stat.mode }}"
+                # recurse requires state=directory; a plain top-level file
+                # (RELEASE-NOTES, LICENSE, ...) has no state=directory to
+                # recurse into, and the module rejects recurse=true on one
+                # (confirmed by running this exact task against a real
+                # Tomcat tarball during validation).
+                recurse: "{{ item.stat.isdir | default(false) }}"
+              loop: "{{ tomcat_top_entry_stats.results }}"
+              loop_control:
+                index_var: idx
+                label: "{{ tomcat_top_names[idx] }}"
+              when: item.stat.exists
+          rescue:
+            # ---- the service was never touched here: no rollback needed,
+            # just clean up the partial new directory before re-raising to
+            # the outer block's rescue (bedin #89 N1). -------------------
+            - name: "Stage/migrate failed :: remove the partial new install directory"
+              ansible.builtin.file:
+                path: "{{ tomcat_new_dir }}"
+                state: absent
+              ignore_errors: true
+              when: tomcat_new_dir is defined
+
+            - name: "Re-raise the stage/migrate failure"
+              ansible.builtin.fail:
+                msg: "{{ ansible_failed_result.msg | default('unknown failure during stage/migrate') }}"
+
+        - name: "Patch :: cut over"
+          when:
+            - tc_action == 'Apply'
+            - tomcat_update_needed | bool
+          block:
             # ---- stop the service BEFORE the cutover — anything that goes
             # wrong from here on triggers the rescue's rollback below. -----
             - name: "Patch :: stop the Tomcat service"
@@ -978,9 +1110,10 @@
               when: svc_running_before | length > 0
 
             - name: "Service check :: collect services (after the wait)"
-              ansible.builtin.service_facts:
+              ansible.builtin.shell: "{{ svc_units_cmd }}"
               register: svc_facts_wait
-              ignore_errors: true
+              changed_when: false
+              failed_when: false
 
             - name: "Service check :: select the post-change source"
               ansible.builtin.set_fact:
@@ -1012,9 +1145,10 @@
               when: svc_down | default([]) | length > 0
 
             - name: "Service check :: collect services (after)"
-              ansible.builtin.service_facts:
+              ansible.builtin.shell: "{{ svc_units_cmd }}"
               register: svc_facts_final
-              ignore_errors: true
+              changed_when: false
+              failed_when: false
               when: svc_down | default([]) | length > 0
 
             - name: "Service check :: collect TCP listeners (after)"
@@ -1043,9 +1177,9 @@
                   {%- set r = (svc_restart.results | default([]) | selectattr('item', 'defined') | selectattr('item', 'equalto', s) | list) -%}
                   {%- set err = ((r[0].msg | default('')) if r else '') | string | trim -%}
                   {%- if not r -%}
-                  {%- set err = 'não houve tentativa de inicialização (o serviço caiu depois da checagem)' -%}
+                  {%- set err = 'no start was attempted (the service went down after the check)' -%}
                   {%- elif not err -%}
-                  {%- set err = 'o start foi aceito, mas o serviço não ficou em execução; veja journalctl -u ' ~ s -%}
+                  {%- set err = 'the start was accepted, but the service did not stay running; see journalctl -u ' ~ s -%}
                   {%- endif -%}
                   {%- set ns.out = ns.out + [{'service': s, 'error': err}] -%}
                   {%- endfor -%}
@@ -1079,24 +1213,24 @@
                 svc_check_message: >-
                   {%- set ns = namespace(issues=[]) -%}
                   {%- for s in svc_still_down -%}
-                  {%- set ns.issues = ns.issues + ['serviço ' ~ s.service ~ ': estava em execução antes da mudança e não subiu, nem após a tentativa de inicialização pelo playbook. Erro da tentativa: ' ~ s.error] -%}
+                  {%- set ns.issues = ns.issues + ['service ' ~ s.service ~ ': was running before the change and did not come back, not even after the playbook tried to start it. Start attempt error: ' ~ s.error] -%}
                   {%- endfor -%}
                   {%- for l in svc_listeners_lost -%}
-                  {%- set ns.issues = ns.issues + ['porta TCP ' ~ l.port ~ ' (processo ' ~ l.process ~ '): estava em escuta antes da mudança e não está mais. Se a porta é de um serviço citado acima, é consequência dele; se não, é uma aplicação fora do gerenciador de serviços, que o playbook não reinicia. Valide a aplicação.'] -%}
+                  {%- set ns.issues = ns.issues + ['TCP port ' ~ l.port ~ ' (process ' ~ l.process ~ '): was listening before the change and is not anymore. If the port belongs to a service listed above, it follows from it; otherwise it is an application outside the service manager, which the playbook does not restart. Check the application.'] -%}
                   {%- endfor -%}
                   {%- for s in svc_failed_new -%}
-                  {%- set ns.issues = ns.issues + ['serviço ' ~ s ~ ': passou a falhar depois da mudança (não estava em falha antes).'] -%}
+                  {%- set ns.issues = ns.issues + ['service ' ~ s ~ ': started failing after the change (it was not failed before).'] -%}
                   {%- endfor -%}
-                  {%- set restored = ['Iniciados pelo playbook porque não voltaram sozinhos (estão em execução agora): ' ~ (svc_restored | join(', '))] if svc_restored else [] -%}
+                  {%- set restored = ['Started by the playbook because they did not come back on their own (running now): ' ~ (svc_restored | join(', '))] if svc_restored else [] -%}
                   {%- if ns.issues -%}
-                  {{ ['ATENÇÃO: SERVIÇOS NÃO CONFORMES COM O CENÁRIO PRÉ-MUDANÇA em ' ~ inventory_hostname ~ '. O job NÃO foi marcado como falho por isso. Valide no host o motivo de cada item abaixo:'] + ns.issues + restored }}
+                  {{ ['WARNING: SERVICES NOT AS BEFORE THE CHANGE on ' ~ inventory_hostname ~ '. The job was NOT marked as failed because of this. Check on the host why each item below happened:'] + ns.issues + restored }}
                   {%- else -%}
-                  {{ ['SERVIÇOS VALIDADOS em ' ~ inventory_hostname ~ ': os ' ~ (svc_running_before | length) ~ ' serviço(s) e as ' ~ (svc_listeners_before | length) ~ ' porta(s) TCP em escuta que estavam ativos antes da mudança estão ativos novamente, conforme o cenário pré-mudança.'] + restored }}
+                  {{ ['SERVICES VALIDATED on ' ~ inventory_hostname ~ ': the ' ~ (svc_running_before | length) ~ ' service(s) and ' ~ (svc_listeners_before | length) ~ ' listening TCP port(s) that were active before the change are active again, as before the change.'] + restored }}
                   {%- endif -%}
 
             - name: "Service check :: record the warning in the summary"
               ansible.builtin.set_fact:
-                samurai_warnings: "{{ samurai_warnings + svc_check_message[1:] | reject('match', '^Iniciados pelo playbook') | list }}"
+                samurai_warnings: "{{ samurai_warnings + svc_check_message[1:] | reject('match', '^Started by the playbook') | list }}"
               when: svc_check_result.status == 'warning'
 
             - name: "Service check :: result"
@@ -1114,12 +1248,12 @@
                 svc_check_result:
                   status: error
                   phase: after
-                  error: "{{ ansible_failed_result.msg | default('erro desconhecido') }}"
+                  error: "{{ ansible_failed_result.msg | default('unknown error') }}"
                 svc_check_message:
                   - >-
-                    ATENÇÃO: a validação de serviços não pôde ser concluída em {{ inventory_hostname }}
-                    (comparação depois da mudança). O job NÃO foi marcado como falho por isso; valide manualmente os
-                    serviços do host. Erro: {{ ansible_failed_result.msg | default('erro desconhecido') }}
+                    WARNING: the service check could not be completed on {{ inventory_hostname }}
+                    (post-change comparison). The job was NOT marked as failed because of this; check the host's
+                    services manually. Error: {{ ansible_failed_result.msg | default('unknown error') }}
 
             - name: "Service check :: record the warning in the summary (after)"
               ansible.builtin.set_fact:
@@ -1261,17 +1395,17 @@
           {%- set sc = h.service_check | default({}) -%}
           {%- set st = sc.status | default('not_run') -%}
           {%- if st == 'ok' -%}
-          {%- set line = h.host ~ ': SERVIÇOS VALIDADOS (conforme o cenário pré-mudança)' -%}
+          {%- set line = h.host ~ ': SERVICES VALIDATED (as before the change)' -%}
           {%- elif st == 'warning' -%}
-          {%- set line = h.host ~ ': ATENÇÃO, serviços não conformes com o cenário pré-mudança (veja os avisos do host); o job não falhou por isso' -%}
+          {%- set line = h.host ~ ': WARNING, services not as before the change (see the host warnings); the job did not fail because of it' -%}
           {%- elif st == 'baseline_only' -%}
-          {%- set line = h.host ~ ': baseline de serviços registrada (ACTION=Check)' -%}
+          {%- set line = h.host ~ ': service baseline recorded (ACTION=Check)' -%}
           {%- elif st == 'error' -%}
-          {%- set line = h.host ~ ': ATENÇÃO, a validação de serviços não pôde ser concluída (veja os avisos do host); o job não falhou por isso' -%}
+          {%- set line = h.host ~ ': WARNING, the service check could not be completed (see the host warnings); the job did not fail because of it' -%}
           {%- elif st == 'disabled' -%}
-          {%- set line = h.host ~ ': validação de serviços desligada (SERVICE_CHECK=off)' -%}
+          {%- set line = h.host ~ ': service check disabled (SERVICE_CHECK=off)' -%}
           {%- else -%}
-          {%- set line = h.host ~ ': validação de serviços não executada (a execução do host terminou antes)' -%}
+          {%- set line = h.host ~ ': service check not executed (the host execution ended before this point)' -%}
           {%- endif -%}
           {%- set ns.out = ns.out + [line] -%}
           {%- endfor -%}

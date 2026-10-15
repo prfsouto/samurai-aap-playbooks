@@ -403,14 +403,21 @@ was found", same philosophy as `oracle_rac_patch_with_evidence.yml`):
    keeps the new version's own stock ownership/permissions.
 4. A systemd drop-in (`<service>.service.d/samurai-tomcat-home.conf`) points
    `CATALINA_HOME`/`CATALINA_BASE` at a stable indirection path
-   (`<parent>/current`), created once and re-pointed via `ln -sfn` on every
-   later Apply — the **first** Apply against a host "adopts" its unmanaged
-   install into this convention; every later Apply is a pure symlink flip.
-   The old version directory is left on disk untouched. If the cutover
-   fails at any point from the service stop onward, the playbook
-   **automatically rolls back**: repoints the link at the old version and
-   restarts it, before failing the host — a stuck "service down" is never
-   an acceptable outcome of a failed patch.
+   (`<parent>/current-<SERVICE_NAME>` — named by service, not a bare
+   `current`, so it can never be confused with an unrelated product or
+   Tomcat instance sharing that parent directory), created once and
+   re-pointed via `ln -sfn` on every later Apply — the **first** Apply
+   against a host "adopts" its unmanaged install into this convention, and
+   only when THIS service's own drop-in confirms the link is really its
+   own; every later Apply is a pure symlink flip. The old version directory
+   is left on disk untouched. The stage (download/extract/migrate) and the
+   cutover (stop/link/start/verify) run as two separate steps: a failure
+   while staging — before anything in the running service was touched —
+   never triggers a restart. If the cutover itself fails at any point from
+   the service stop onward, the playbook **automatically rolls back**:
+   repoints the link at the old version and restarts it, before failing the
+   host — a stuck "service down" is never an acceptable outcome of a failed
+   patch.
 5. After the restart, the playbook confirms the **live process** — not just
    the files on disk — is actually serving the new version, by reading the
    running PID's `-Dcatalina.base` straight out of `/proc`. Version reads
@@ -429,8 +436,10 @@ Supported actions:
 Extra-vars contract — `HOSTNAMES`, `CATALINA_HOME`, `SERVICE_NAME` and
 `TARGET_VERSION` are always required (never guessed, including the version —
 no "latest"); `TOMCAT_ARTIFACT_URL` + `TOMCAT_ARTIFACT_SHA512` are required
-only when `ACTION=Apply`; a `TARGET_VERSION` older than what is installed is
-refused unless `ALLOW_DOWNGRADE=true`. See
+only when `ACTION=Apply`; a `TARGET_VERSION` older than what is installed, or
+on a different major.minor line, is refused unless `ALLOW_DOWNGRADE=true`
+(downgrade only — a cross-line jump is always refused, conf/webapps
+migration is only validated within one line). See
 [tomcat_update.sample_extra_vars.yml](playbooks/tomcat_update.sample_extra_vars.yml)
 for the full contract and
 [tomcat_update.survey_spec.json](playbooks/tomcat_update.survey_spec.json)
