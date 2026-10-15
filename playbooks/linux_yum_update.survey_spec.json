@@ -72,6 +72,36 @@
       "new_question": true
     },
     {
+      "question_name": "Service check",
+      "question_description": "on: records the running services and listening TCP ports before the change and, after Apply (and the reboot), starts again whatever did not come back. Anything still down becomes a warning with the start error; the job does not fail because of it. off: skips the check.",
+      "variable": "SERVICE_CHECK",
+      "type": "multiplechoice",
+      "choices": "on\noff",
+      "required": false,
+      "default": "on",
+      "new_question": true
+    },
+    {
+      "question_name": "Service settle time (seconds)",
+      "question_description": "Maximum time to wait for the services that were running before to come back by themselves after the update/reboot, before the playbook starts them.",
+      "variable": "SERVICE_SETTLE_SECONDS",
+      "type": "integer",
+      "min": 0,
+      "max": 1800,
+      "required": false,
+      "default": 120,
+      "new_question": true
+    },
+    {
+      "question_name": "Services/ports to ignore",
+      "question_description": "Comma-separated service names (a trailing * matches a prefix) or TCP port numbers left out of the comparison, e.g. services that stop by design.",
+      "variable": "SERVICE_IGNORE",
+      "type": "text",
+      "required": false,
+      "default": "",
+      "new_question": true
+    },
+    {
       "question_name": "Evidence base directory",
       "question_description": "Base directory on the target where the structured evidence files are written.",
       "variable": "EVIDENCE_BASE_DIR",

@@ -102,6 +102,64 @@
     samurai_warnings: []
     samurai_errors: []
 
+    # #86 — serviços e portas em escuta antes/depois da mudança. O que estava
+    # de pé e não voltou é iniciado de novo; se não subir, vira aviso (o job
+    # não falha). SERVICE_CHECK=off desliga; SERVICE_IGNORE aceita nomes
+    # (sufixo * = prefixo) e portas; SERVICE_SETTLE_SECONDS é a espera máxima
+    # para os serviços voltarem sozinhos depois do update/reboot.
+    svc_check_enabled: "{{ ((SERVICE_CHECK | default('') | string | trim) or 'on') | lower not in ['off', 'false', 'no', '0', 'disabled'] }}"
+    svc_settle_seconds: "{{ ((SERVICE_SETTLE_SECONDS | default('') | string | trim) or '120') | int }}"
+    svc_wait_retries: "{{ [((svc_settle_seconds | int) / 10) | round(0, 'ceil') | int, 1] | max + 1 }}"
+    # Units que sobem/descem sozinhas (sob demanda, timers, sessão do próprio
+    # Ansible) — comparar essas só gera ruído.
+    svc_ignore_default:
+      - "user@*"
+      - "user-runtime-dir@*"
+      - "session-*"
+      - "apt-daily*"
+      - "packagekit*"
+      - "dnf-makecache*"
+      - "fwupd*"
+      - "man-db*"
+      - "systemd-hostnamed"
+      - "systemd-timedated"
+      - "systemd-localed"
+      - "systemd-fsckd"
+    svc_ignore_list: "{{ svc_ignore_default + ((SERVICE_IGNORE | default('') | string).split(',') | map('trim') | reject('equalto', '') | list) }}"
+    svc_ignore_ports: "{{ svc_ignore_list | select('match', '^[0-9]+$') | list }}"
+    svc_ignore_regex: >-
+      {%- set ns = namespace(r=[]) -%}
+      {%- for e in svc_ignore_list | reject('match', '^[0-9]+$') -%}
+      {%- set ns.r = ns.r + [((e[:-1] | regex_escape) if e.endswith('*') else ((e | regex_escape) ~ '([.]service)?$'))] -%}
+      {%- endfor -%}
+      ^({{ ns.r | join('|') }})
+    # Leitura de svc_src (resultado do service_facts) e svc_ss_src (`ss -ltnp`).
+    # Com systemd, só as entradas do systemd (o service_facts também lista os
+    # scripts SysV, repetidos e sem `status`). Units `static` ficam de fora:
+    # são as ativadas sob demanda (dbus, socket).
+    svc_all_facts: "{{ svc_src.ansible_facts.services | default({}) | dict2items | map(attribute='value') | list }}"
+    svc_facts_list: "{{ (svc_all_facts | selectattr('source', 'defined') | selectattr('source', 'equalto', 'systemd') | list) or svc_all_facts }}"
+    svc_running_from_facts: >-
+      {{ ((svc_facts_list | selectattr('status', 'defined') | rejectattr('status', 'equalto', 'static') | list)
+          + (svc_facts_list | selectattr('status', 'undefined') | list))
+         | selectattr('state', 'equalto', 'running')
+         | map(attribute='name') | reject('match', svc_ignore_regex, true) | sort }}
+    svc_failed_from_facts: >-
+      {{ svc_facts_list | selectattr('status', 'defined') | selectattr('status', 'equalto', 'failed')
+         | map(attribute='name') | reject('match', svc_ignore_regex, true) | sort }}
+    svc_listeners_from_ss: >-
+      {%- set ns = namespace(out=[]) -%}
+      {%- for l in (svc_ss_src.stdout_lines | default([])) -%}
+      {%- set f = l.split() -%}
+      {%- if f | length >= 4 and f[0] != 'State' -%}
+      {%- set item = {'port': f[3].split(':')[-1], 'process': (l.split('"')[1] if '"' in l else 'unknown')} -%}
+      {%- if item not in ns.out and item.port not in svc_ignore_ports and not (item.process is match(svc_ignore_regex, true)) -%}
+      {%- set ns.out = ns.out + [item] -%}
+      {%- endif -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ ns.out | sort(attribute='port') }}
+
   tasks:
 
     # #54 — controller clock (strftime sem epoch = agora, UTC), como o
@@ -412,6 +470,94 @@
               needs_restarting_available: {{ needs_restarting_stat.stat.exists }}
               ---
               {{ (reboot_before.stdout | default('') ) if needs_restarting_stat.stat.exists else 'needs-restarting not installed' }}
+        # ---- #86 serviços e portas em escuta (antes) ----------------------
+        # Foto do que está de pé antes da mudança, em Check e Apply. No Apply a
+        # mesma foto é tirada depois do reboot e comparada com esta.
+        - name: "Service check :: pre-change baseline"
+          when:
+            - svc_check_enabled | bool
+          block:
+            - name: "Service check :: collect services (before)"
+              ansible.builtin.service_facts:
+              register: svc_facts_before
+              ignore_errors: true
+              when: svc_check_enabled | bool
+
+            - name: "Service check :: collect TCP listeners (before)"
+              ansible.builtin.command:
+                argv: [ss, -ltnp]
+              register: svc_ss_before
+              changed_when: false
+              failed_when: false
+              when: svc_check_enabled | bool
+
+            - name: "Service check :: select the pre-change sources"
+              ansible.builtin.set_fact:
+                svc_src: "{{ svc_facts_before }}"
+                svc_ss_src: "{{ svc_ss_before }}"
+              when: svc_check_enabled | bool
+
+            - name: "Service check :: record the pre-change baseline"
+              ansible.builtin.set_fact:
+                svc_running_before: "{{ svc_running_from_facts }}"
+                svc_failed_before: "{{ svc_failed_from_facts }}"
+                svc_listeners_before: "{{ svc_listeners_from_ss }}"
+              when: svc_check_enabled | bool
+
+            - name: "Write services_before.json"
+              ansible.builtin.copy:
+                dest: "{{ evidence_dir }}/services_before.json"
+                mode: '0640'
+                content: >-
+                  {{ {'running_services': svc_running_before, 'failed_services': svc_failed_before,
+                      'tcp_listeners': svc_listeners_before} | to_nice_json }}
+              when: svc_check_enabled | bool
+
+            - name: "Service check :: baseline result (Check)"
+              ansible.builtin.set_fact:
+                svc_check_result:
+                  status: baseline_only
+                  running_services_before: "{{ svc_running_before }}"
+                  tcp_listeners_before: "{{ svc_listeners_before }}"
+                  failed_services_before: "{{ svc_failed_before }}"
+                svc_check_message:
+                  - >-
+                    BASELINE DE SERVIÇOS REGISTRADA (ACTION=Check) em {{ inventory_hostname }}:
+                    {{ svc_running_before | length }} serviço(s) em execução e
+                    {{ svc_listeners_before | length }} porta(s) TCP em escuta.
+                    A validação pós-mudança roda no ACTION=Apply.
+              when:
+                - svc_check_enabled | bool
+                - ACTION == 'Check'
+
+            - name: "Service check :: result"
+              ansible.builtin.debug:
+                msg: "{{ svc_check_message }}"
+              when:
+                - svc_check_enabled | bool
+                - ACTION == 'Check'
+          rescue:
+            # Nada da validação de serviços pode falhar o host (#86): um erro
+            # inesperado aqui vira aviso, e a execução segue.
+            - name: "Service check :: record that the check could not be completed (before)"
+              ansible.builtin.set_fact:
+                svc_check_result:
+                  status: error
+                  phase: before
+                  error: "{{ ansible_failed_result.msg | default('erro desconhecido') }}"
+                svc_check_message:
+                  - >-
+                    ATENÇÃO: a validação de serviços não pôde ser concluída em {{ inventory_hostname }}
+                    (foto de antes da mudança). O job NÃO foi marcado como falho por isso; valide manualmente os
+                    serviços do host. Erro: {{ ansible_failed_result.msg | default('erro desconhecido') }}
+
+            - name: "Service check :: record the warning in the summary (before)"
+              ansible.builtin.set_fact:
+                samurai_warnings: "{{ samurai_warnings + svc_check_message }}"
+
+            - name: "Service check :: result (before)"
+              ansible.builtin.debug:
+                msg: "{{ svc_check_message }}"
 
         # ------------------------------------------------------------------
         # Phase 3/4: Apply update (skipped in Check mode)
@@ -530,45 +676,6 @@
               not_applicable_check_mode
               {% endif %}
 
-        # ---- failed services --------------------------------------------
-        - name: "Detect systemctl"
-          ansible.builtin.stat:
-            path: /usr/bin/systemctl
-          register: systemctl_stat
-          when: ACTION == 'Apply'
-
-        - name: "List failed systemd units"
-          ansible.builtin.command: systemctl --failed --no-pager --no-legend
-          register: failed_units
-          changed_when: false
-          failed_when: false
-          when:
-            - ACTION == 'Apply'
-            - systemctl_stat.stat.exists | default(false)
-
-        - name: "Build failed services list"
-          ansible.builtin.set_fact:
-            failed_services_list: >-
-              {{
-                (failed_units.stdout_lines | default([]))
-                | map('trim') | reject('equalto', '')
-                | map('split') | map('first') | list
-              }}
-          when: ACTION == 'Apply'
-
-        - name: "Write failed_services_after.txt"
-          ansible.builtin.copy:
-            dest: "{{ evidence_dir }}/failed_services_after.txt"
-            mode: '0640'
-            content: |
-              {% if ACTION != 'Apply' %}
-              not_applicable_check_mode
-              {% elif not (systemctl_stat.stat.exists | default(false)) %}
-              not_applicable
-              {% else %}
-              {{ failed_units.stdout | default('') }}
-              {% endif %}
-
         # ---- reboot required after --------------------------------------
         - name: "Check reboot required (after)"
           ansible.builtin.command: needs-restarting -r
@@ -633,6 +740,276 @@
             - reboot_required_after == 'required'
           register: reboot_action
 
+        # ---- failed services (after the reboot) ---------------------------
+        # #86 — coletado DEPOIS do reboot (antes, uma unit que não voltava do
+        # reboot nunca era vista). --plain: sem ele o systemd imprime um
+        # marcador antes do nome e a lista saía como ['●'].
+        - name: "Detect systemctl"
+          ansible.builtin.stat:
+            path: /usr/bin/systemctl
+          register: systemctl_stat
+          when: ACTION == 'Apply'
+
+        - name: "List failed systemd units"
+          ansible.builtin.command: systemctl --failed --no-pager --no-legend --plain
+          register: failed_units
+          changed_when: false
+          failed_when: false
+          when:
+            - ACTION == 'Apply'
+            - systemctl_stat.stat.exists | default(false)
+
+        - name: "Build failed services list"
+          ansible.builtin.set_fact:
+            failed_services_list: >-
+              {{
+                (failed_units.stdout_lines | default([]))
+                | map('trim') | reject('equalto', '')
+                | map('split') | map('first') | list
+              }}
+          when: ACTION == 'Apply'
+
+        - name: "Write failed_services_after.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/failed_services_after.txt"
+            mode: '0640'
+            content: |
+              {% if ACTION != 'Apply' %}
+              not_applicable_check_mode
+              {% elif not (systemctl_stat.stat.exists | default(false)) %}
+              not_applicable
+              {% else %}
+              {{ failed_units.stdout | default('') }}
+              {% endif %}
+        # ---- #86 serviços e portas em escuta (depois do reboot) -----------
+        # Compara com a foto de antes. O que caiu é iniciado de novo; o que não
+        # subir vira aviso com o erro da tentativa. Nada aqui falha o host.
+        # Espera até SERVICE_SETTLE_SECONDS os serviços voltarem sozinhos. A
+        # espera termina sem erro na última tentativa (attempts), em vez de
+        # esgotar os retries e sair como falha ignorada.
+        - name: "Service check :: compare with the pre-change baseline"
+          when:
+            - ACTION == 'Apply'
+            - svc_check_enabled | bool
+            - svc_running_before is defined
+            - (svc_check_result.status | default('')) != 'error'
+          block:
+            - name: "Service check :: wait for the services that were running before"
+              ansible.builtin.command:
+                argv: "{{ ['systemctl', 'is-active'] + svc_running_before }}"
+              register: svc_wait
+              changed_when: false
+              failed_when: false
+              until: >-
+                (svc_wait.stdout_lines | default([]) | reject('equalto', 'active') | list | length == 0)
+                or ((svc_wait.attempts | default(1) | int) >= (svc_wait_retries | int))
+              retries: "{{ svc_wait_retries }}"
+              delay: 10
+              when:
+                - ACTION == 'Apply'
+                - svc_check_enabled | bool
+                - svc_running_before | length > 0
+
+            - name: "Service check :: collect services (after the wait)"
+              ansible.builtin.service_facts:
+              register: svc_facts_wait
+              ignore_errors: true
+              when:
+                - ACTION == 'Apply'
+                - svc_check_enabled | bool
+
+            - name: "Service check :: select the post-reboot source"
+              ansible.builtin.set_fact:
+                svc_src: "{{ svc_facts_wait }}"
+              when:
+                - ACTION == 'Apply'
+                - svc_check_enabled | bool
+
+            - name: "Service check :: list services that did not come back"
+              ansible.builtin.set_fact:
+                svc_down: "{{ svc_running_before | difference(svc_running_from_facts) }}"
+              when:
+                - ACTION == 'Apply'
+                - svc_check_enabled | bool
+
+            - name: "Service check :: try to start the services that did not come back"
+              ansible.builtin.service:
+                name: "{{ item }}"
+                state: started
+              loop: "{{ svc_down | default([]) }}"
+              register: svc_restart
+              failed_when: false
+              when:
+                - ACTION == 'Apply'
+                - svc_check_enabled | bool
+
+            - name: "Service check :: wait for the services the playbook started"
+              ansible.builtin.command:
+                argv: "{{ ['systemctl', 'is-active'] + svc_down }}"
+              register: svc_wait_started
+              changed_when: false
+              failed_when: false
+              until: >-
+                (svc_wait_started.stdout_lines | default([]) | reject('equalto', 'active') | list | length == 0)
+                or ((svc_wait_started.attempts | default(1) | int) >= 3)
+              retries: 3
+              delay: 5
+              when:
+                - ACTION == 'Apply'
+                - svc_check_enabled | bool
+                - svc_down | default([]) | length > 0
+
+            - name: "Service check :: collect services (after)"
+              ansible.builtin.service_facts:
+              register: svc_facts_final
+              ignore_errors: true
+              when:
+                - ACTION == 'Apply'
+                - svc_check_enabled | bool
+                - svc_down | default([]) | length > 0
+
+            - name: "Service check :: collect TCP listeners (after)"
+              ansible.builtin.command:
+                argv: [ss, -ltnp]
+              register: svc_ss_after
+              changed_when: false
+              failed_when: false
+              when:
+                - ACTION == 'Apply'
+                - svc_check_enabled | bool
+
+            - name: "Service check :: select the post-change sources"
+              ansible.builtin.set_fact:
+                svc_src: "{{ svc_facts_wait if (svc_facts_final is skipped) else svc_facts_final }}"
+                svc_ss_src: "{{ svc_ss_after }}"
+              when:
+                - ACTION == 'Apply'
+                - svc_check_enabled | bool
+
+            - name: "Service check :: record the post-change state"
+              ansible.builtin.set_fact:
+                svc_running_after: "{{ svc_running_from_facts }}"
+                svc_failed_after: "{{ svc_failed_from_facts }}"
+                svc_listeners_after: "{{ svc_listeners_from_ss }}"
+              when:
+                - ACTION == 'Apply'
+                - svc_check_enabled | bool
+
+            - name: "Service check :: compute what changed"
+              ansible.builtin.set_fact:
+                svc_still_down: >-
+                  {%- set ns = namespace(out=[]) -%}
+                  {%- for s in (svc_running_before | difference(svc_running_after)) -%}
+                  {%- set r = (svc_restart.results | default([]) | selectattr('item', 'defined') | selectattr('item', 'equalto', s) | list) -%}
+                  {%- set err = ((r[0].msg | default('')) if r else '') | string | trim -%}
+                  {%- if not r -%}
+                  {%- set err = 'não houve tentativa de inicialização (o serviço caiu depois da checagem)' -%}
+                  {%- elif not err -%}
+                  {%- set err = 'o start foi aceito, mas o serviço não ficou em execução; veja journalctl -u ' ~ s -%}
+                  {%- endif -%}
+                  {%- set ns.out = ns.out + [{'service': s, 'error': err}] -%}
+                  {%- endfor -%}
+                  {{ ns.out }}
+                svc_restored: "{{ (svc_down | default([])) | intersect(svc_running_after) }}"
+                # Porta perdida = sumiu E o processo dono passou a escutar em menos
+                # portas que antes. Tolera portas dinâmicas (RPC, rpc.statd: o
+                # processo troca de porta, mas mantém a quantidade) e ainda pega
+                # uma de duas aplicações com o mesmo nome de processo (java).
+                svc_listeners_lost: >-
+                  {%- set ports = svc_listeners_after | map(attribute='port') | list -%}
+                  {%- set ns = namespace(out=[]) -%}
+                  {%- for l in svc_listeners_before -%}
+                  {%- set n_before = svc_listeners_before | selectattr('process', 'equalto', l.process) | list | length -%}
+                  {%- set n_after = svc_listeners_after | selectattr('process', 'equalto', l.process) | list | length -%}
+                  {%- if l.port not in ports and (l.process == 'unknown' or n_after < n_before) -%}
+                  {%- set ns.out = ns.out + [l] -%}
+                  {%- endif -%}
+                  {%- endfor -%}
+                  {{ ns.out }}
+                svc_failed_new: "{{ svc_failed_after | difference(svc_failed_before) | difference(svc_running_before) }}"
+              when:
+                - ACTION == 'Apply'
+                - svc_check_enabled | bool
+
+            - name: "Service check :: build the result and the message"
+              ansible.builtin.set_fact:
+                svc_check_result:
+                  status: "{{ 'ok' if (svc_still_down | length == 0 and svc_listeners_lost | length == 0 and svc_failed_new | length == 0) else 'warning' }}"
+                  running_services_before: "{{ svc_running_before }}"
+                  tcp_listeners_before: "{{ svc_listeners_before }}"
+                  services_restored_by_playbook: "{{ svc_restored }}"
+                  services_still_down: "{{ svc_still_down }}"
+                  tcp_listeners_lost: "{{ svc_listeners_lost }}"
+                  failed_services_before: "{{ svc_failed_before }}"
+                  failed_services_after: "{{ svc_failed_after }}"
+                  services_newly_failed: "{{ svc_failed_new }}"
+                svc_check_message: >-
+                  {%- set ns = namespace(issues=[]) -%}
+                  {%- for s in svc_still_down -%}
+                  {%- set ns.issues = ns.issues + ['serviço ' ~ s.service ~ ': estava em execução antes da mudança e não subiu, nem após a tentativa de inicialização pelo playbook. Erro da tentativa: ' ~ s.error] -%}
+                  {%- endfor -%}
+                  {%- for l in svc_listeners_lost -%}
+                  {%- set ns.issues = ns.issues + ['porta TCP ' ~ l.port ~ ' (processo ' ~ l.process ~ '): estava em escuta antes da mudança e não está mais. Se a porta é de um serviço citado acima, é consequência dele; se não, é uma aplicação fora do gerenciador de serviços, que o playbook não reinicia. Valide a aplicação.'] -%}
+                  {%- endfor -%}
+                  {%- for s in svc_failed_new -%}
+                  {%- set ns.issues = ns.issues + ['serviço ' ~ s ~ ': passou a falhar depois da mudança (não estava em falha antes).'] -%}
+                  {%- endfor -%}
+                  {%- set restored = ['Iniciados pelo playbook porque não voltaram sozinhos (estão em execução agora): ' ~ (svc_restored | join(', '))] if svc_restored else [] -%}
+                  {%- if ns.issues -%}
+                  {{ ['ATENÇÃO: SERVIÇOS NÃO CONFORMES COM O CENÁRIO PRÉ-MUDANÇA em ' ~ inventory_hostname ~ '. O job NÃO foi marcado como falho por isso. Valide no host o motivo de cada item abaixo:'] + ns.issues + restored }}
+                  {%- else -%}
+                  {{ ['SERVIÇOS VALIDADOS em ' ~ inventory_hostname ~ ': os ' ~ (svc_running_before | length) ~ ' serviço(s) e as ' ~ (svc_listeners_before | length) ~ ' porta(s) TCP em escuta que estavam ativos antes da mudança estão ativos novamente, conforme o cenário pré-mudança.'] + restored }}
+                  {%- endif -%}
+              when:
+                - ACTION == 'Apply'
+                - svc_check_enabled | bool
+
+            - name: "Service check :: record the warning in the summary"
+              ansible.builtin.set_fact:
+                samurai_warnings: "{{ samurai_warnings + svc_check_message[1:] | reject('match', '^Iniciados pelo playbook') | list }}"
+              when:
+                - ACTION == 'Apply'
+                - svc_check_enabled | bool
+                - svc_check_result.status == 'warning'
+
+            - name: "Service check :: result"
+              ansible.builtin.debug:
+                msg: "{{ svc_check_message }}"
+              when:
+                - ACTION == 'Apply'
+                - svc_check_enabled | bool
+
+            - name: "Write services_check.json"
+              ansible.builtin.copy:
+                dest: "{{ evidence_dir }}/services_check.json"
+                mode: '0640'
+                content: "{{ svc_check_result | to_nice_json }}"
+              when:
+                - ACTION == 'Apply'
+                - svc_check_enabled | bool
+          rescue:
+            # Nada da validação de serviços pode falhar o host (#86): um erro
+            # inesperado aqui vira aviso, e a execução segue.
+            - name: "Service check :: record that the check could not be completed (after)"
+              ansible.builtin.set_fact:
+                svc_check_result:
+                  status: error
+                  phase: after
+                  error: "{{ ansible_failed_result.msg | default('erro desconhecido') }}"
+                svc_check_message:
+                  - >-
+                    ATENÇÃO: a validação de serviços não pôde ser concluída em {{ inventory_hostname }}
+                    (comparação depois da mudança). O job NÃO foi marcado como falho por isso; valide manualmente os
+                    serviços do host. Erro: {{ ansible_failed_result.msg | default('erro desconhecido') }}
+
+            - name: "Service check :: record the warning in the summary (after)"
+              ansible.builtin.set_fact:
+                samurai_warnings: "{{ samurai_warnings + svc_check_message }}"
+
+            - name: "Service check :: result (after)"
+              ansible.builtin.debug:
+                msg: "{{ svc_check_message }}"
+
       rescue:
         - name: "Capture rescue error"
           ansible.builtin.set_fact:
@@ -688,6 +1065,7 @@
               reboot_required_after: "{{ reboot_required_after | default('not_applicable_check_mode') }}"
               rebooted: "{{ (reboot_action.rebooted | default(false)) | bool }}"
               failed_services_after: "{{ failed_services_list | default([]) }}"
+              service_check: "{{ svc_check_result | default({'status': ('disabled' if not (svc_check_enabled | bool) else 'not_run')}) }}"
               evidence_dir: "{{ evidence_dir if (evidence_dir_ready | default(false)) else 'not_created' }}"
               unreachable: "{{ samurai_unreachable | default(false) | bool }}"
               started_at: "{{ execution_started_at }}"
@@ -776,6 +1154,31 @@
     - name: "Print consolidated SamurAI Shield JSON to stdout"
       ansible.builtin.debug:
         msg: "{{ {'samurai_shield_result': samurai_shield_result} | to_nice_json }}"
+
+    # #86 — uma linha por host com o resultado da validação de serviços.
+    - name: "Service check :: consolidated result"
+      ansible.builtin.debug:
+        msg: >-
+          {%- set ns = namespace(out=[]) -%}
+          {%- for h in all_host_summaries -%}
+          {%- set sc = h.service_check | default({}) -%}
+          {%- set st = sc.status | default('not_run') -%}
+          {%- if st == 'ok' -%}
+          {%- set line = h.host ~ ': SERVIÇOS VALIDADOS (conforme o cenário pré-mudança)' -%}
+          {%- elif st == 'warning' -%}
+          {%- set line = h.host ~ ': ATENÇÃO, serviços não conformes com o cenário pré-mudança (veja os avisos do host); o job não falhou por isso' -%}
+          {%- elif st == 'baseline_only' -%}
+          {%- set line = h.host ~ ': baseline de serviços registrada (ACTION=Check)' -%}
+          {%- elif st == 'error' -%}
+          {%- set line = h.host ~ ': ATENÇÃO, a validação de serviços não pôde ser concluída (veja os avisos do host); o job não falhou por isso' -%}
+          {%- elif st == 'disabled' -%}
+          {%- set line = h.host ~ ': validação de serviços desligada (SERVICE_CHECK=off)' -%}
+          {%- else -%}
+          {%- set line = h.host ~ ': validação de serviços não executada (a execução do host terminou antes)' -%}
+          {%- endif -%}
+          {%- set ns.out = ns.out + [line] -%}
+          {%- endfor -%}
+          {{ ns.out }}
 
     - name: "Publish consolidated result as workflow stat"
       ansible.builtin.set_stats:
