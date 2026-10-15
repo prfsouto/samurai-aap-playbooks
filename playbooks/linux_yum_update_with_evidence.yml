@@ -34,6 +34,14 @@
     samurai_hostnames_raw: "{{ HOSTNAMES | default('') | string | trim }}"
     samurai_action_raw: "{{ (ACTION | default('') | string | trim) or 'Check' }}"
     samurai_update_mode_raw: "{{ (UPDATE_MODE | default('') | string | trim) or 'all' }}"
+    # Reboot has two sources. The SamurAI engine injects lowercase
+    # `allow_reboot` (from job.allow_reboot) ONLY on the governed path, so
+    # its presence means "the governed job decided this" and it WINS. The
+    # uppercase ALLOW_REBOOT is the survey/manual knob — and on the
+    # governed path AAP also injects the survey default (false), which
+    # must not override the governed decision.
+    samurai_reboot_governed: "{{ allow_reboot | default('') | string | trim }}"
+    samurai_reboot_survey: "{{ ALLOW_REBOOT | default('') | string | trim }}"
   tasks:
     - name: "Validate HOSTNAMES is provided"
       ansible.builtin.fail:
@@ -49,6 +57,21 @@
       ansible.builtin.fail:
         msg: "Invalid UPDATE_MODE '{{ samurai_update_mode_raw }}'. Allowed values: all, security."
       when: samurai_update_mode_raw not in ['all', 'security']
+
+    - name: "Resolve ALLOW_REBOOT (governed lowercase allow_reboot wins over survey ALLOW_REBOOT)"
+      ansible.builtin.set_fact:
+        # Coalesce on "defined and non-blank", NOT with `or`: a governed
+        # allow_reboot=false is a legitimate explicit "no" and is falsy.
+        samurai_allow_reboot: >-
+          {{
+            (samurai_reboot_governed if samurai_reboot_governed != ''
+             else (samurai_reboot_survey if samurai_reboot_survey != '' else 'false')) | bool
+          }}
+        samurai_allow_reboot_source: >-
+          {{
+            'governed' if samurai_reboot_governed != ''
+            else ('survey' if samurai_reboot_survey != '' else 'default')
+          }}
 
     - name: "Publish resolved run parameters as localhost facts"
       ansible.builtin.set_fact:
@@ -71,7 +94,10 @@
 
     - name: "Show resolved target hosts"
       ansible.builtin.debug:
-        msg: "Targets: {{ samurai_target_hosts | join(', ') }} | ACTION={{ samurai_action }} | UPDATE_MODE={{ samurai_update_mode }}"
+        msg: >-
+          Targets: {{ samurai_target_hosts | join(', ') }} | ACTION={{ samurai_action }} |
+          UPDATE_MODE={{ samurai_update_mode }} |
+          ALLOW_REBOOT={{ samurai_allow_reboot }} ({{ samurai_allow_reboot_source }})
 
 
 - name: "SamurAI :: yum-update :: pre-check, update and post-check"
@@ -90,7 +116,11 @@
     ACTION: "{{ hostvars['localhost']['samurai_action'] | default('Check') }}"
     UPDATE_MODE: "{{ hostvars['localhost']['samurai_update_mode'] | default('all') }}"
     EXCLUDE_PACKAGES_RAW: "{{ hostvars['localhost']['EXCLUDE_PACKAGES'] | default('') }}"
-    ALLOW_REBOOT: "{{ hostvars['localhost']['ALLOW_REBOOT'] | default(false) | bool }}"
+    # Resolved in play 1 (governed lowercase allow_reboot wins). Distinct
+    # names: a play var called ALLOW_REBOOT is outranked by the extra var
+    # of the same name, so it never took effect.
+    upd_allow_reboot: "{{ hostvars['localhost']['samurai_allow_reboot'] | default(false) | bool }}"
+    upd_allow_reboot_source: "{{ hostvars['localhost']['samurai_allow_reboot_source'] | default('default') }}"
     EVIDENCE_BASE_DIR: "{{ hostvars['localhost']['EVIDENCE_BASE_DIR'] | default('/var/tmp/samurai-shield/yum-update') }}"
 
     exclude_packages_list: >-
@@ -736,7 +766,7 @@
             reboot_timeout: 600
           when:
             - ACTION == 'Apply'
-            - ALLOW_REBOOT | bool
+            - upd_allow_reboot | bool
             - reboot_required_after == 'required'
           register: reboot_action
 
@@ -1063,6 +1093,8 @@
               packages_updated: "{{ packages_updated | default([]) }}"
               reboot_required_before: "{{ reboot_required_before | default('unknown') }}"
               reboot_required_after: "{{ reboot_required_after | default('not_applicable_check_mode') }}"
+              allow_reboot: "{{ upd_allow_reboot | bool }}"
+              allow_reboot_source: "{{ upd_allow_reboot_source }}"
               rebooted: "{{ (reboot_action.rebooted | default(false)) | bool }}"
               failed_services_after: "{{ failed_services_list | default([]) }}"
               service_check: "{{ svc_check_result | default({'status': ('disabled' if not (svc_check_enabled | bool) else 'not_run')}) }}"
