@@ -31,18 +31,22 @@ playbook does the same, for its index refreshes and the upgrade.
 
 **Service check (`SERVICE_CHECK`, default `on`).** Before the change (in
 `Check` and `Apply`), the playbook records the running services (systemd units,
-except `static` ones activated on demand) and the listening TCP ports with the
+read with `systemctl --plain`, except `static` ones activated on demand) and the
+listening TCP ports with the
 process that owns each one. That second list also covers applications that are
 not services, such as a `java -jar` started by a script. After `Apply` and the
 reboot, it waits up to `SERVICE_SETTLE_SECONDS` (default 120) for those
 services to come back, starts again whatever did not, and compares:
 
-- everything back: `SERVIÇOS VALIDADOS ... conforme o cenário pré-mudança` in
-  the job output, plus a note listing the services the playbook had to start;
-- something still down: `ATENÇÃO: SERVIÇOS NÃO CONFORMES COM O CENÁRIO
-  PRÉ-MUDANÇA`, one line per service (with the error from the start attempt) or
-  port, asking the operator to check why. **The job does not fail because of
-  it**: the items also go to `warnings` in the summary.
+- everything back: `SERVICES VALIDATED ... as before the change` in the job
+  output, plus a note listing the services the playbook had to start;
+- something still down: `WARNING: SERVICES NOT AS BEFORE THE CHANGE`, one line
+  per service (with the error from the start attempt) or port, asking the
+  operator to check why. **The job does not fail because of it**: the items also
+  go to `warnings` in the summary.
+
+The messages are plain ASCII English, so they read the same in the AAP job
+output and in any log viewer that decodes it.
 
 The result goes to `service_check` in `summary.json` and in the consolidated
 JSON, to `services_before.json` / `services_check.json` in the evidence

@@ -78,7 +78,7 @@
         samurai_action: "{{ samurai_action_raw }}"
         samurai_update_mode: "{{ samurai_update_mode_raw }}"
 
-    - name: "Parse HOSTNAMES into a list (tolerant: space OR comma) — #1418"
+    - name: "Parse HOSTNAMES into a list (tolerant: space OR comma) - #1418"
       ansible.builtin.set_fact:
         # The engine now sends HOSTNAMES space-separated (Oraex fleet convention);
         # accept both delimiters so a comma-joined caller never collapses to 1 host.
@@ -163,20 +163,26 @@
       {%- set ns.r = ns.r + [((e[:-1] | regex_escape) if e.endswith('*') else ((e | regex_escape) ~ '([.]service)?$'))] -%}
       {%- endfor -%}
       ^({{ ns.r | join('|') }})
-    # Leitura de svc_src (resultado do service_facts) e svc_ss_src (`ss -ltnp`).
-    # Com systemd, só as entradas do systemd (o service_facts também lista os
-    # scripts SysV, repetidos e sem `status`). Units `static` ficam de fora:
-    # são as ativadas sob demanda (dbus, socket).
-    svc_all_facts: "{{ svc_src.ansible_facts.services | default({}) | dict2items | map(attribute='value') | list }}"
-    svc_facts_list: "{{ (svc_all_facts | selectattr('source', 'defined') | selectattr('source', 'equalto', 'systemd') | list) or svc_all_facts }}"
+    # Leitura de svc_src (saída de svc_units_cmd) e svc_ss_src (`ss -ltnp`).
+    # Não usa ansible.builtin.service_facts: ele procura 'failed'/'masked'/
+    # 'not-found' na linha INTEIRA do list-units, descrição incluída, e quando
+    # acha numa unit sem o marcador ● descarta o nome — a unit vira 'loaded'
+    # (visto na vm5: "GRUB failed boot detection"), e um serviço rodando com uma
+    # dessas palavras na descrição sumia da foto de antes. Aqui o nome é sempre
+    # a 1ª coluna do `--plain`. Units `static` ficam de fora: são as ativadas
+    # sob demanda (dbus, socket).
+    svc_units_cmd: |
+      systemctl list-units --type=service --state=running --plain --no-legend --no-pager | awk 'NF {print "running " $1}'
+      systemctl list-units --type=service --state=failed --plain --no-legend --no-pager | awk 'NF {print "failed " $1}'
+      systemctl list-unit-files --type=service --state=static --no-legend --no-pager | awk 'NF {print "static " $1}'
+    svc_unit_lines: "{{ svc_src.stdout_lines | default([]) }}"
+    svc_static_units: "{{ svc_unit_lines | select('match', '^static ') | map('regex_replace', '^static ', '') | list }}"
     svc_running_from_facts: >-
-      {{ ((svc_facts_list | selectattr('status', 'defined') | rejectattr('status', 'equalto', 'static') | list)
-          + (svc_facts_list | selectattr('status', 'undefined') | list))
-         | selectattr('state', 'equalto', 'running')
-         | map(attribute='name') | reject('match', svc_ignore_regex, true) | sort }}
+      {{ svc_unit_lines | select('match', '^running ') | map('regex_replace', '^running ', '')
+         | reject('in', svc_static_units) | reject('match', svc_ignore_regex, true) | unique | sort }}
     svc_failed_from_facts: >-
-      {{ svc_facts_list | selectattr('status', 'defined') | selectattr('status', 'equalto', 'failed')
-         | map(attribute='name') | reject('match', svc_ignore_regex, true) | sort }}
+      {{ svc_unit_lines | select('match', '^failed ') | map('regex_replace', '^failed ', '')
+         | reject('match', svc_ignore_regex, true) | unique | sort }}
     svc_listeners_from_ss: >-
       {%- set ns = namespace(out=[]) -%}
       {%- for l in (svc_ss_src.stdout_lines | default([])) -%}
@@ -345,12 +351,12 @@
 
         - name: "Fail when /var usage exceeds 90%"
           ansible.builtin.fail:
-            msg: "/var is at {{ fs_usage.var }}% — refusing to update (threshold 90%)."
+            msg: "/var is at {{ fs_usage.var }}% - refusing to update (threshold 90%)."
           when: fs_usage.var | int > 90
 
         - name: "Fail when /boot usage exceeds 85%"
           ansible.builtin.fail:
-            msg: "/boot is at {{ fs_usage.boot }}% — refusing to update (threshold 85%)."
+            msg: "/boot is at {{ fs_usage.boot }}% - refusing to update (threshold 85%)."
           when: fs_usage.boot | int > 85
 
         - name: "Warn when / usage exceeds 85%"
@@ -508,9 +514,10 @@
             - svc_check_enabled | bool
           block:
             - name: "Service check :: collect services (before)"
-              ansible.builtin.service_facts:
+              ansible.builtin.shell: "{{ svc_units_cmd }}"
               register: svc_facts_before
-              ignore_errors: true
+              changed_when: false
+              failed_when: false
               when: svc_check_enabled | bool
 
             - name: "Service check :: collect TCP listeners (before)"
@@ -552,10 +559,10 @@
                   failed_services_before: "{{ svc_failed_before }}"
                 svc_check_message:
                   - >-
-                    BASELINE DE SERVIÇOS REGISTRADA (ACTION=Check) em {{ inventory_hostname }}:
-                    {{ svc_running_before | length }} serviço(s) em execução e
-                    {{ svc_listeners_before | length }} porta(s) TCP em escuta.
-                    A validação pós-mudança roda no ACTION=Apply.
+                    SERVICE BASELINE RECORDED (ACTION=Check) on {{ inventory_hostname }}:
+                    {{ svc_running_before | length }} running service(s) and
+                    {{ svc_listeners_before | length }} listening TCP port(s).
+                    The post-change check runs on ACTION=Apply.
               when:
                 - svc_check_enabled | bool
                 - ACTION == 'Check'
@@ -574,12 +581,12 @@
                 svc_check_result:
                   status: error
                   phase: before
-                  error: "{{ ansible_failed_result.msg | default('erro desconhecido') }}"
+                  error: "{{ ansible_failed_result.msg | default('unknown error') }}"
                 svc_check_message:
                   - >-
-                    ATENÇÃO: a validação de serviços não pôde ser concluída em {{ inventory_hostname }}
-                    (foto de antes da mudança). O job NÃO foi marcado como falho por isso; valide manualmente os
-                    serviços do host. Erro: {{ ansible_failed_result.msg | default('erro desconhecido') }}
+                    WARNING: the service check could not be completed on {{ inventory_hostname }}
+                    (pre-change snapshot). The job was NOT marked as failed because of this; check the host's
+                    services manually. Error: {{ ansible_failed_result.msg | default('unknown error') }}
 
             - name: "Service check :: record the warning in the summary (before)"
               ansible.builtin.set_fact:
@@ -841,9 +848,10 @@
                 - svc_running_before | length > 0
 
             - name: "Service check :: collect services (after the wait)"
-              ansible.builtin.service_facts:
+              ansible.builtin.shell: "{{ svc_units_cmd }}"
               register: svc_facts_wait
-              ignore_errors: true
+              changed_when: false
+              failed_when: false
               when:
                 - ACTION == 'Apply'
                 - svc_check_enabled | bool
@@ -890,9 +898,10 @@
                 - svc_down | default([]) | length > 0
 
             - name: "Service check :: collect services (after)"
-              ansible.builtin.service_facts:
+              ansible.builtin.shell: "{{ svc_units_cmd }}"
               register: svc_facts_final
-              ignore_errors: true
+              changed_when: false
+              failed_when: false
               when:
                 - ACTION == 'Apply'
                 - svc_check_enabled | bool
@@ -933,9 +942,9 @@
                   {%- set r = (svc_restart.results | default([]) | selectattr('item', 'defined') | selectattr('item', 'equalto', s) | list) -%}
                   {%- set err = ((r[0].msg | default('')) if r else '') | string | trim -%}
                   {%- if not r -%}
-                  {%- set err = 'não houve tentativa de inicialização (o serviço caiu depois da checagem)' -%}
+                  {%- set err = 'no start was attempted (the service went down after the check)' -%}
                   {%- elif not err -%}
-                  {%- set err = 'o start foi aceito, mas o serviço não ficou em execução; veja journalctl -u ' ~ s -%}
+                  {%- set err = 'the start was accepted, but the service did not stay running; see journalctl -u ' ~ s -%}
                   {%- endif -%}
                   {%- set ns.out = ns.out + [{'service': s, 'error': err}] -%}
                   {%- endfor -%}
@@ -976,19 +985,19 @@
                 svc_check_message: >-
                   {%- set ns = namespace(issues=[]) -%}
                   {%- for s in svc_still_down -%}
-                  {%- set ns.issues = ns.issues + ['serviço ' ~ s.service ~ ': estava em execução antes da mudança e não subiu, nem após a tentativa de inicialização pelo playbook. Erro da tentativa: ' ~ s.error] -%}
+                  {%- set ns.issues = ns.issues + ['service ' ~ s.service ~ ': was running before the change and did not come back, not even after the playbook tried to start it. Start attempt error: ' ~ s.error] -%}
                   {%- endfor -%}
                   {%- for l in svc_listeners_lost -%}
-                  {%- set ns.issues = ns.issues + ['porta TCP ' ~ l.port ~ ' (processo ' ~ l.process ~ '): estava em escuta antes da mudança e não está mais. Se a porta é de um serviço citado acima, é consequência dele; se não, é uma aplicação fora do gerenciador de serviços, que o playbook não reinicia. Valide a aplicação.'] -%}
+                  {%- set ns.issues = ns.issues + ['TCP port ' ~ l.port ~ ' (process ' ~ l.process ~ '): was listening before the change and is not anymore. If the port belongs to a service listed above, it follows from it; otherwise it is an application outside the service manager, which the playbook does not restart. Check the application.'] -%}
                   {%- endfor -%}
                   {%- for s in svc_failed_new -%}
-                  {%- set ns.issues = ns.issues + ['serviço ' ~ s ~ ': passou a falhar depois da mudança (não estava em falha antes).'] -%}
+                  {%- set ns.issues = ns.issues + ['service ' ~ s ~ ': started failing after the change (it was not failed before).'] -%}
                   {%- endfor -%}
-                  {%- set restored = ['Iniciados pelo playbook porque não voltaram sozinhos (estão em execução agora): ' ~ (svc_restored | join(', '))] if svc_restored else [] -%}
+                  {%- set restored = ['Started by the playbook because they did not come back on their own (running now): ' ~ (svc_restored | join(', '))] if svc_restored else [] -%}
                   {%- if ns.issues -%}
-                  {{ ['ATENÇÃO: SERVIÇOS NÃO CONFORMES COM O CENÁRIO PRÉ-MUDANÇA em ' ~ inventory_hostname ~ '. O job NÃO foi marcado como falho por isso. Valide no host o motivo de cada item abaixo:'] + ns.issues + restored }}
+                  {{ ['WARNING: SERVICES NOT AS BEFORE THE CHANGE on ' ~ inventory_hostname ~ '. The job was NOT marked as failed because of this. Check on the host why each item below happened:'] + ns.issues + restored }}
                   {%- else -%}
-                  {{ ['SERVIÇOS VALIDADOS em ' ~ inventory_hostname ~ ': os ' ~ (svc_running_before | length) ~ ' serviço(s) e as ' ~ (svc_listeners_before | length) ~ ' porta(s) TCP em escuta que estavam ativos antes da mudança estão ativos novamente, conforme o cenário pré-mudança.'] + restored }}
+                  {{ ['SERVICES VALIDATED on ' ~ inventory_hostname ~ ': the ' ~ (svc_running_before | length) ~ ' service(s) and ' ~ (svc_listeners_before | length) ~ ' listening TCP port(s) that were active before the change are active again, as before the change.'] + restored }}
                   {%- endif -%}
               when:
                 - ACTION == 'Apply'
@@ -996,7 +1005,7 @@
 
             - name: "Service check :: record the warning in the summary"
               ansible.builtin.set_fact:
-                samurai_warnings: "{{ samurai_warnings + svc_check_message[1:] | reject('match', '^Iniciados pelo playbook') | list }}"
+                samurai_warnings: "{{ samurai_warnings + svc_check_message[1:] | reject('match', '^Started by the playbook') | list }}"
               when:
                 - ACTION == 'Apply'
                 - svc_check_enabled | bool
@@ -1025,12 +1034,12 @@
                 svc_check_result:
                   status: error
                   phase: after
-                  error: "{{ ansible_failed_result.msg | default('erro desconhecido') }}"
+                  error: "{{ ansible_failed_result.msg | default('unknown error') }}"
                 svc_check_message:
                   - >-
-                    ATENÇÃO: a validação de serviços não pôde ser concluída em {{ inventory_hostname }}
-                    (comparação depois da mudança). O job NÃO foi marcado como falho por isso; valide manualmente os
-                    serviços do host. Erro: {{ ansible_failed_result.msg | default('erro desconhecido') }}
+                    WARNING: the service check could not be completed on {{ inventory_hostname }}
+                    (post-change comparison). The job was NOT marked as failed because of this; check the host's
+                    services manually. Error: {{ ansible_failed_result.msg | default('unknown error') }}
 
             - name: "Service check :: record the warning in the summary (after)"
               ansible.builtin.set_fact:
@@ -1196,17 +1205,17 @@
           {%- set sc = h.service_check | default({}) -%}
           {%- set st = sc.status | default('not_run') -%}
           {%- if st == 'ok' -%}
-          {%- set line = h.host ~ ': SERVIÇOS VALIDADOS (conforme o cenário pré-mudança)' -%}
+          {%- set line = h.host ~ ': SERVICES VALIDATED (as before the change)' -%}
           {%- elif st == 'warning' -%}
-          {%- set line = h.host ~ ': ATENÇÃO, serviços não conformes com o cenário pré-mudança (veja os avisos do host); o job não falhou por isso' -%}
+          {%- set line = h.host ~ ': WARNING, services not as before the change (see the host warnings); the job did not fail because of it' -%}
           {%- elif st == 'baseline_only' -%}
-          {%- set line = h.host ~ ': baseline de serviços registrada (ACTION=Check)' -%}
+          {%- set line = h.host ~ ': service baseline recorded (ACTION=Check)' -%}
           {%- elif st == 'error' -%}
-          {%- set line = h.host ~ ': ATENÇÃO, a validação de serviços não pôde ser concluída (veja os avisos do host); o job não falhou por isso' -%}
+          {%- set line = h.host ~ ': WARNING, the service check could not be completed (see the host warnings); the job did not fail because of it' -%}
           {%- elif st == 'disabled' -%}
-          {%- set line = h.host ~ ': validação de serviços desligada (SERVICE_CHECK=off)' -%}
+          {%- set line = h.host ~ ': service check disabled (SERVICE_CHECK=off)' -%}
           {%- else -%}
-          {%- set line = h.host ~ ': validação de serviços não executada (a execução do host terminou antes)' -%}
+          {%- set line = h.host ~ ': service check not run (the host run ended before it)' -%}
           {%- endif -%}
           {%- set ns.out = ns.out + [line] -%}
           {%- endfor -%}
