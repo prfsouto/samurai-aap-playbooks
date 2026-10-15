@@ -1,0 +1,68 @@
+---
+# ============================================================================
+# Sample extra-vars for tomcat_update_with_evidence.yml
+# ----------------------------------------------------------------------------
+# Pass these through an AAP Job Template survey or --extra-vars.
+#
+# What the SamurAI Shield engine actually sends today (bedin #89 B10 — an
+# earlier version of this file overstated this): only HOSTNAMES is derived
+# automatically from the governed asset. CATALINA_HOME, SERVICE_NAME,
+# TARGET_VERSION and the artifact URL/checksum are NOT auto-injected — they
+# come from the Playbook Mapping's extra_vars_template, which holds ONE
+# static value applied to every host in a wave. A mapping that targets this
+# playbook is therefore scoped to hosts that share the same CATALINA_HOME /
+# SERVICE_NAME / target version; a fleet with different Tomcat layouts needs
+# one mapping per shape.
+# ============================================================================
+
+# --- required (always) -------------------------------------------------------
+# Target hosts. The SamurAI Shield engine sends them space-separated;
+# commas are also accepted.
+HOSTNAMES: "vm1-samurai vm2-samurai"
+
+# The absolute path the target's systemd service references TODAY — a
+# symlink, or (the common case for a hand-installed Tomcat) a real,
+# version-named directory. The playbook detects which on its own; never
+# guessed, always required.
+CATALINA_HOME: "/opt/apache-tomcat-9.0.50"
+
+# The systemd unit that fronts this Tomcat.
+SERVICE_NAME: "tomcat"
+
+# The exact version to converge on (never "latest" — the scope can never be
+# guessed). Check reports whether this differs from what is installed;
+# Apply converges on it.
+TARGET_VERSION: "9.0.121"
+
+# --- action -------------------------------------------------------------------
+# Check = read-only. Reports the installed version vs TARGET_VERSION and a
+#         services/ports baseline. Nothing is downloaded, nothing changes.
+# Apply = downloads + verifies the artifact, stages the new version in a
+#         sibling directory, migrates conf/ + custom webapps + extra jars
+#         from the current install, cuts the stable indirection symlink
+#         over to it, and restarts the service.
+ACTION: "Check"
+
+# --- required only when ACTION=Apply -------------------------------------------
+# TOMCAT_ARTIFACT_URL: "https://archive.apache.org/dist/tomcat/tomcat-9/v9.0.121/bin/apache-tomcat-9.0.121.tar.gz"
+# TOMCAT_ARTIFACT_SHA512: "<sha512 of the exact tar.gz above — never installed without it>"
+
+# --- optional (shown with their defaults) -----------------------------------
+# TOMCAT_STOCK_WEBAPPS: "docs,examples,host-manager,manager"
+#                                     # csv of Tomcat's own bundled webapps — never
+#                                     # treated as a customization to migrate. ROOT is
+#                                     # deliberately NOT in this list: it is the single
+#                                     # most common thing an operator customizes, and
+#                                     # migrating a genuinely vendor-stock ROOT over
+#                                     # itself is a harmless no-op.
+# ALLOW_DOWNGRADE: false              # TARGET_VERSION older than what is installed is
+#                                     # refused unless this is explicitly true.
+# SERIAL_BATCH: 1                     # hosts patched at a time
+# SERVICE_CHECK: "on"                 # on | off. Records running services + listening TCP
+#                                     # ports before the change; after Apply (and the Tomcat
+#                                     # restart) starts again whatever did not come back. What
+#                                     # stays down is a warning with the start error (job not
+#                                     # failed). Same contract as the OS update playbooks.
+# SERVICE_SETTLE_SECONDS: 120         # max wait for services to come back by themselves
+# SERVICE_IGNORE: ""                  # csv of service names (trailing * = prefix) or TCP ports
+# EVIDENCE_BASE_DIR: "/var/tmp/samurai-shield/tomcat-update"

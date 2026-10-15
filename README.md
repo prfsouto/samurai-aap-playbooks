@@ -368,6 +368,99 @@ otherwise) and enough free space on the system drive.
 derives it from the governed asset and the merge only fills keys it has not already
 set, so the value is silently discarded.
 
+### tomcat_update_with_evidence.yml
+
+Controlled patch of a **self-managed Apache Tomcat** installation — not an
+rpm/dpkg package. This is the real shape found in the SamurAI Shield lab
+hosts (`vm1-samurai`/`vm2-samurai` run Tomcat 9.0.50 at
+`/opt/apache-tomcat-9.0.50`, outside any package manager), so none of the
+yum/apt playbooks above can touch it. Same evidence/service-check discipline
+as those playbooks — explicit template requested by the product owner: the
+`SERVICE_CHECK` block (running services + listening TCP ports, before vs.
+after, auto-restart of what did not come back, warning instead of job
+failure) is reused with the identical contract names
+(`SERVICE_CHECK`/`SERVICE_IGNORE`/`SERVICE_SETTLE_SECONDS`).
+
+**Patch strategy — symlink cutover** ("deliver the environment exactly as it
+was found", same philosophy as `oracle_rac_patch_with_evidence.yml`):
+
+1. `CATALINA_HOME` is whatever the systemd service references **today** — a
+   symlink, or (the common case) a real version-named directory. The
+   playbook detects which; it is never assumed. Once a host has been
+   patched once, the **stable indirection path** (below) — not the raw
+   `CATALINA_HOME` value the caller keeps sending — becomes the source of
+   truth, so a caller that never updates its stored value does not read a
+   permanently frozen old directory on every later run.
+2. The new version is downloaded (checksum-verified, never installed
+   without one, to a per-run random temp path that is removed afterwards)
+   and extracted into a **sibling** directory
+   (`apache-tomcat-<TARGET_VERSION>`), never on top of the old one.
+3. `conf/`, custom webapps (anything not in the stock Tomcat set — `ROOT`
+   is never stock: it is the single most common thing an operator
+   customizes) and any extra jars under `lib/` (e.g. a JDBC driver an
+   operator added) are migrated from the old install into the new one.
+   Only the migrated paths get their ownership touched — everything else
+   keeps the new version's own stock ownership/permissions.
+4. A systemd drop-in (`<service>.service.d/samurai-tomcat-home.conf`) points
+   `CATALINA_HOME`/`CATALINA_BASE` at a stable indirection path
+   (`<parent>/current-<SERVICE_NAME>` — named by service, not a bare
+   `current`, so it can never be confused with an unrelated product or
+   Tomcat instance sharing that parent directory), created once and
+   re-pointed via `ln -sfn` on every later Apply — the **first** Apply
+   against a host "adopts" its unmanaged install into this convention, and
+   only when THIS service's own drop-in confirms the link is really its
+   own; every later Apply is a pure symlink flip. The old version directory
+   is left on disk untouched. The stage (download/extract/migrate) and the
+   cutover (stop/link/start/verify) run as two separate steps: a failure
+   while staging — before anything in the running service was touched —
+   never triggers a restart. If the cutover itself fails at any point from
+   the service stop onward, the playbook **automatically rolls back**:
+   repoints the link at the old version and restarts it, before failing the
+   host — a stuck "service down" is never an acceptable outcome of a failed
+   patch.
+5. After the restart, the playbook confirms the **live process** — not just
+   the files on disk — is actually serving the new version, by reading the
+   running PID's `-Dcatalina.base` straight out of `/proc`. Version reads
+   (Check included) never execute any vendor script: they parse
+   `ServerInfo.properties` directly out of `lib/catalina.jar`, read-only.
+
+Supported actions:
+
+- `Check`: read-only. Reports the installed version vs `TARGET_VERSION` and
+  a services/ports baseline. Nothing is downloaded, nothing changes.
+- `Apply`: downloads + verifies the artifact, stages it, migrates
+  conf/webapps/libs, cuts the symlink over, restarts the service, confirms
+  the **live process** converged on `TARGET_VERSION`, and rolls back
+  automatically if any of that fails.
+
+Extra-vars contract — `HOSTNAMES`, `CATALINA_HOME`, `SERVICE_NAME` and
+`TARGET_VERSION` are always required (never guessed, including the version —
+no "latest"); `TOMCAT_ARTIFACT_URL` + `TOMCAT_ARTIFACT_SHA512` are required
+only when `ACTION=Apply`; a `TARGET_VERSION` older than what is installed, or
+on a different major.minor line, is refused unless `ALLOW_DOWNGRADE=true`
+(downgrade only — a cross-line jump is always refused, conf/webapps
+migration is only validated within one line). See
+[tomcat_update.sample_extra_vars.yml](playbooks/tomcat_update.sample_extra_vars.yml)
+for the full contract and
+[tomcat_update.survey_spec.json](playbooks/tomcat_update.survey_spec.json)
+for the Job Template survey.
+
+Validated against real Apache Tomcat 9.0.100 → 9.0.106 artifacts (extraction
+naming, conf/webapps/libs migration, ROOT handling, symlink resolution),
+against the full extra-vars/unreachable-host pipeline with
+`ansible-playbook`, and with a real `ACTION=Check` run against the actual
+lab hosts (`vm1-samurai`/`vm2-samurai`) through a disposable AAP Job
+Template. A live `ACTION=Apply` run (service stop/start, automatic rollback,
+live-process verification) is still pending — it mutates a shared lab host
+and needs a change window.
+
+> [!NOTE]
+> Scope boundary: this playbook patches the **Tomcat server component**
+> (the binary, bundled libraries, container config). It does **not** patch a
+> vulnerable Java library embedded inside a deployed webapp's own
+> `WEB-INF/lib` (e.g. an app-bundled log4j jar) — that is a separate,
+> per-app/per-jar operation, tracked as a follow-up.
+
 ### vulnerability_validation/linux_rpm_package.yml
 
 Read-only **package version collector** for SamurAI Shield vulnerability
