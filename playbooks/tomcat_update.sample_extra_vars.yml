@@ -3,9 +3,16 @@
 # Sample extra-vars for tomcat_update_with_evidence.yml
 # ----------------------------------------------------------------------------
 # Pass these through an AAP Job Template survey or --extra-vars.
-# In the normal remediation flow HOSTNAMES + ACTION + CATALINA_HOME +
-# SERVICE_NAME + TARGET_VERSION are sent (and TOMCAT_ARTIFACT_URL +
-# TOMCAT_ARTIFACT_SHA512 when ACTION=Apply).
+#
+# What the SamurAI Shield engine actually sends today (bedin #89 B10 — an
+# earlier version of this file overstated this): only HOSTNAMES is derived
+# automatically from the governed asset. CATALINA_HOME, SERVICE_NAME,
+# TARGET_VERSION and the artifact URL/checksum are NOT auto-injected — they
+# come from the Playbook Mapping's extra_vars_template, which holds ONE
+# static value applied to every host in a wave. A mapping that targets this
+# playbook is therefore scoped to hosts that share the same CATALINA_HOME /
+# SERVICE_NAME / target version; a fleet with different Tomcat layouts needs
+# one mapping per shape.
 # ============================================================================
 
 # --- required (always) -------------------------------------------------------
@@ -41,9 +48,15 @@ ACTION: "Check"
 # TOMCAT_ARTIFACT_SHA512: "<sha512 of the exact tar.gz above — never installed without it>"
 
 # --- optional (shown with their defaults) -----------------------------------
-# TOMCAT_STOCK_WEBAPPS: "ROOT,docs,examples,host-manager,manager"
+# TOMCAT_STOCK_WEBAPPS: "docs,examples,host-manager,manager"
 #                                     # csv of Tomcat's own bundled webapps — never
-#                                     # treated as a customization to migrate.
+#                                     # treated as a customization to migrate. ROOT is
+#                                     # deliberately NOT in this list: it is the single
+#                                     # most common thing an operator customizes, and
+#                                     # migrating a genuinely vendor-stock ROOT over
+#                                     # itself is a harmless no-op.
+# ALLOW_DOWNGRADE: false              # TARGET_VERSION older than what is installed is
+#                                     # refused unless this is explicitly true.
 # SERIAL_BATCH: 1                     # hosts patched at a time
 # SERVICE_CHECK: "on"                 # on | off. Records running services + listening TCP
 #                                     # ports before the change; after Apply (and the Tomcat

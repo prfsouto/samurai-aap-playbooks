@@ -386,43 +386,64 @@ was found", same philosophy as `oracle_rac_patch_with_evidence.yml`):
 
 1. `CATALINA_HOME` is whatever the systemd service references **today** — a
    symlink, or (the common case) a real version-named directory. The
-   playbook detects which; it is never assumed.
+   playbook detects which; it is never assumed. Once a host has been
+   patched once, the **stable indirection path** (below) — not the raw
+   `CATALINA_HOME` value the caller keeps sending — becomes the source of
+   truth, so a caller that never updates its stored value does not read a
+   permanently frozen old directory on every later run.
 2. The new version is downloaded (checksum-verified, never installed
-   without one) and extracted into a **sibling** directory
+   without one, to a per-run random temp path that is removed afterwards)
+   and extracted into a **sibling** directory
    (`apache-tomcat-<TARGET_VERSION>`), never on top of the old one.
-3. `conf/`, custom webapps (anything not in the stock Tomcat set) and any
-   extra jars under `lib/` (e.g. a JDBC driver an operator added) are
-   migrated from the old install into the new one.
+3. `conf/`, custom webapps (anything not in the stock Tomcat set — `ROOT`
+   is never stock: it is the single most common thing an operator
+   customizes) and any extra jars under `lib/` (e.g. a JDBC driver an
+   operator added) are migrated from the old install into the new one.
+   Only the migrated paths get their ownership touched — everything else
+   keeps the new version's own stock ownership/permissions.
 4. A systemd drop-in (`<service>.service.d/samurai-tomcat-home.conf`) points
    `CATALINA_HOME`/`CATALINA_BASE` at a stable indirection path
    (`<parent>/current`), created once and re-pointed via `ln -sfn` on every
    later Apply — the **first** Apply against a host "adopts" its unmanaged
    install into this convention; every later Apply is a pure symlink flip.
-   The old version directory is left on disk untouched: rollback is
-   pointing the symlink back and restarting the service.
+   The old version directory is left on disk untouched. If the cutover
+   fails at any point from the service stop onward, the playbook
+   **automatically rolls back**: repoints the link at the old version and
+   restarts it, before failing the host — a stuck "service down" is never
+   an acceptable outcome of a failed patch.
+5. After the restart, the playbook confirms the **live process** — not just
+   the files on disk — is actually serving the new version, by reading the
+   running PID's `-Dcatalina.base` straight out of `/proc`. Version reads
+   (Check included) never execute any vendor script: they parse
+   `ServerInfo.properties` directly out of `lib/catalina.jar`, read-only.
 
 Supported actions:
 
 - `Check`: read-only. Reports the installed version vs `TARGET_VERSION` and
   a services/ports baseline. Nothing is downloaded, nothing changes.
 - `Apply`: downloads + verifies the artifact, stages it, migrates
-  conf/webapps/libs, cuts the symlink over, restarts the service, and
-  confirms the installed version converged on `TARGET_VERSION`.
+  conf/webapps/libs, cuts the symlink over, restarts the service, confirms
+  the **live process** converged on `TARGET_VERSION`, and rolls back
+  automatically if any of that fails.
 
 Extra-vars contract — `HOSTNAMES`, `CATALINA_HOME`, `SERVICE_NAME` and
 `TARGET_VERSION` are always required (never guessed, including the version —
 no "latest"); `TOMCAT_ARTIFACT_URL` + `TOMCAT_ARTIFACT_SHA512` are required
-only when `ACTION=Apply`. See
+only when `ACTION=Apply`; a `TARGET_VERSION` older than what is installed is
+refused unless `ALLOW_DOWNGRADE=true`. See
 [tomcat_update.sample_extra_vars.yml](playbooks/tomcat_update.sample_extra_vars.yml)
 for the full contract and
 [tomcat_update.survey_spec.json](playbooks/tomcat_update.survey_spec.json)
 for the Job Template survey.
 
 Validated against real Apache Tomcat 9.0.100 → 9.0.106 artifacts (extraction
-naming, conf/webapps/libs migration, symlink resolution) and against the
-full extra-vars/unreachable-host pipeline with `ansible-playbook`; a live
-run against the lab hosts (systemd stop/start, service-check comparison)
-is still pending real network access to them.
+naming, conf/webapps/libs migration, ROOT handling, symlink resolution),
+against the full extra-vars/unreachable-host pipeline with
+`ansible-playbook`, and with a real `ACTION=Check` run against the actual
+lab hosts (`vm1-samurai`/`vm2-samurai`) through a disposable AAP Job
+Template. A live `ACTION=Apply` run (service stop/start, automatic rollback,
+live-process verification) is still pending — it mutates a shared lab host
+and needs a change window.
 
 > [!NOTE]
 > Scope boundary: this playbook patches the **Tomcat server component**
