@@ -31,7 +31,7 @@
 # tomcat_update_with_evidence.yml / oracle_rac_patch_with_evidence.yml —
 # "deliver the environment exactly as it was found, minus the vulnerability"):
 #   1. Check (read-only): finds every file under SEARCH_ROOT whose basename
-#      matches JAR_NAME_PATTERN and lists each one (path, size, sha256).
+#      matches JAR_NAME_PATTERN and lists each one (path, size, sha512).
 #      Nothing changes.
 #   2. Apply :: stage (service untouched): downloads NEW_JAR_URL to a per-run
 #      random temp path (ansible.builtin.tempfile — a predictable /tmp name
@@ -117,6 +117,14 @@
           application's root). This playbook does not guess it.
       when: samurai_search_root_raw == '' or samurai_search_root_raw is not match('^/')
 
+    # bedin #94 B6 — `/` is a syntactically valid absolute path but turns a
+    # single run into a full-filesystem scan (and, on Apply, a full-filesystem
+    # rename/replace of every match); it is never a sane SEARCH_ROOT.
+    - name: "Reject SEARCH_ROOT = / (never a sane search root)"
+      ansible.builtin.fail:
+        msg: "SEARCH_ROOT cannot be '/' — point it at the specific application tree to search."
+      when: samurai_search_root_raw == '/'
+
     - name: "Validate JAR_NAME_PATTERN is provided"
       ansible.builtin.fail:
         msg: >-
@@ -124,6 +132,25 @@
           — never a single path, because the same jar can exist in more than one
           place (a server's own lib/ AND WEB-INF/lib of N webapps).
       when: samurai_jar_pattern_raw == ''
+
+    # bedin #94 B6 — the `find` module's `patterns` splits on comma, so a
+    # pattern containing one silently becomes TWO independent globs (e.g.
+    # "log4j-core-*.jar,log4j-api-*.jar" would match and replace BOTH jars
+    # with the same NEW_JAR_* — never the intent of a single JAR_NAME_PATTERN
+    # value). A pattern not ending in ".jar" also matches this playbook's own
+    # "<name>.bak-<timestamp>" backups on the very next run, since they keep
+    # the old basename as a prefix. A pattern with a path separator makes no
+    # sense either — `find` matches patterns against the basename only.
+    - name: "Validate JAR_NAME_PATTERN is a single, well-formed .jar glob"
+      ansible.builtin.fail:
+        msg: >-
+          JAR_NAME_PATTERN must be a single glob ending in ".jar", with no comma
+          (one pattern only — "find" would silently split a CSV into several)
+          and no "/" (patterns match the basename only). Got: '{{ samurai_jar_pattern_raw }}'.
+      when: >-
+        ',' in samurai_jar_pattern_raw
+        or '/' in samurai_jar_pattern_raw
+        or samurai_jar_pattern_raw is not match('.*\.jar$')
 
     - name: "Validate SERVICE_NAME is provided"
       ansible.builtin.fail:
@@ -148,6 +175,18 @@
         - samurai_action_raw == 'Apply'
         - samurai_new_jar_sha512_raw == ''
 
+    # bedin #94 B6/B1 — a syntactically-valid-looking but malformed checksum
+    # (wrong length, stray characters) must be rejected HERE, before it is
+    # trusted both as the get_url checksum gate AND as the convergence
+    # comparison value (B1) that decides whether a location still needs the
+    # patch at all.
+    - name: "Validate NEW_JAR_SHA512 looks like a real sha512 (128 hex chars)"
+      ansible.builtin.fail:
+        msg: "NEW_JAR_SHA512 must be exactly 128 hexadecimal characters. Got: '{{ samurai_new_jar_sha512_raw }}'."
+      when:
+        - samurai_action_raw == 'Apply'
+        - samurai_new_jar_sha512_raw is not match('^[0-9a-fA-F]{128}$')
+
     - name: "Validate NEW_JAR_FILENAME is provided for Apply"
       ansible.builtin.fail:
         msg: >-
@@ -158,6 +197,22 @@
       when:
         - samurai_action_raw == 'Apply'
         - samurai_new_jar_filename_raw == ''
+
+    # bedin #94 B6 — NEW_JAR_FILENAME is a bare filename, never a path: a
+    # value like "../../../etc/cron.d/x" would make the cutover's own `copy`
+    # (dest: "{{ dirname }}/{{ jl_new_jar_filename }}") write OUTSIDE the
+    # matched directory, as root. No "/" and no ".." anywhere in the value.
+    - name: "Validate NEW_JAR_FILENAME is a bare .jar filename (no path traversal)"
+      ansible.builtin.fail:
+        msg: >-
+          NEW_JAR_FILENAME must be a bare filename ending in ".jar" — no "/" and
+          no "..". Got: '{{ samurai_new_jar_filename_raw }}'.
+      when:
+        - samurai_action_raw == 'Apply'
+        - >-
+          '/' in samurai_new_jar_filename_raw
+          or '..' in samurai_new_jar_filename_raw
+          or samurai_new_jar_filename_raw is not match('^[A-Za-z0-9._-]+\.jar$')
 
     - name: "Publish resolved run parameters as localhost facts"
       ansible.builtin.set_fact:
@@ -371,6 +426,27 @@
         # runs for BOTH Check and Apply: Check lists everything found;
         # Apply additionally filters out locations already carrying
         # NEW_JAR_FILENAME (the idempotency rule — see header comment). -----
+
+        # bedin #94 B5 — `find` only WARNS (`skipped_paths`) when a path does
+        # not exist; it never fails the task. A wrong SEARCH_ROOT (typo, a
+        # mapping pointing at a stale CATALINA_HOME) would silently return
+        # zero matches, which reads identically to "already patched" —
+        # `already_current` on Apply, `patch_needed: false` on Check. Stat it
+        # explicitly first so a non-existent root is a loud failure, never a
+        # quiet false negative.
+        - name: "Stat SEARCH_ROOT"
+          ansible.builtin.stat:
+            path: "{{ jl_search_root }}"
+          register: jl_search_root_stat
+
+        - name: "Fail when SEARCH_ROOT does not exist or is not a directory"
+          ansible.builtin.fail:
+            msg: >-
+              SEARCH_ROOT '{{ jl_search_root }}' does not exist (or is not a directory)
+              on {{ inventory_hostname }} — refusing to report zero matches as if the
+              tree had been searched and found clean.
+          when: not jl_search_root_stat.stat.exists or not (jl_search_root_stat.stat.isdir | default(false))
+
         - name: "Find every jar matching JAR_NAME_PATTERN under SEARCH_ROOT"
           ansible.builtin.find:
             paths: "{{ jl_search_root }}"
@@ -378,7 +454,7 @@
             recurse: true
             file_type: file
             get_checksum: true
-            checksum_algorithm: sha256
+            checksum_algorithm: sha512
           register: jl_matches_found
 
         - name: "Reset matches_before to an explicit structured list"
@@ -399,21 +475,40 @@
             mode: '0640'
             content: "{{ jl_matches_before | to_nice_json }}\n"
 
-        # ---- idempotency filter for Apply: a location whose basename ALREADY
-        # equals NEW_JAR_FILENAME is treated as already converged, so a broad
-        # JAR_NAME_PATTERN (e.g. "log4j-core-*.jar") does not re-match the
-        # jar this same playbook just installed on a previous run. ----------
+        # ---- idempotency filter (bedin #94 B1 — fixes a real security bug):
+        # a location is treated as already converged ONLY when its basename
+        # equals NEW_JAR_FILENAME **and** its checksum equals NEW_JAR_SHA512.
+        # Name alone is not proof of content: the first version of this
+        # filter excluded any match merely NAMED like the target (e.g. a
+        # vulnerable "log4j-core.jar" sitting where the fix is also named
+        # "log4j-core.jar") from `jl_locations_to_patch` — the job reported
+        # `already_current` and the vulnerable jar was never touched. Applied
+        # identically on Check and Apply (not gated on `jl_action`) so a
+        # Check run after a successful Apply reports the newly-installed jar
+        # as converged too, instead of re-flagging it via the same broad
+        # JAR_NAME_PATTERN that matched the version it just replaced. A
+        # same-name match with the WRONG checksum is NOT in `jl_converged_
+        # paths`, so it stays in `jl_locations_to_patch` and gets patched. --
+        - name: "Identify the exact, verified-converged locations (name AND checksum match)"
+          ansible.builtin.set_fact:
+            jl_converged_paths: >-
+              {{
+                jl_matches_before
+                | selectattr('path', 'match', '^.*/' ~ (jl_new_jar_filename | regex_escape) ~ '$')
+                | selectattr('checksum', 'equalto', jl_new_jar_sha512 | lower)
+                | map(attribute='path') | list
+              }}
+          when:
+            - jl_new_jar_filename != ''
+            - jl_new_jar_sha512 != ''
+
         - name: "Identify locations still needing the patch"
           ansible.builtin.set_fact:
             jl_locations_to_patch: >-
-              {{ jl_matches_before | rejectattr('path', 'equalto', '') | list
-                 | selectattr('path', 'defined') | list
-                 | rejectattr('path', 'match', '^.*/' ~ (jl_new_jar_filename | regex_escape) ~ '$') | list }}
-          when:
-            - jl_action == 'Apply'
-            - jl_new_jar_filename != ''
+              {{ jl_matches_before | rejectattr('path', 'in', jl_converged_paths) | list }}
+          when: jl_converged_paths is defined
 
-        - name: "Default locations-to-patch to every match (ACTION=Check has no NEW_JAR_FILENAME)"
+        - name: "Default locations-to-patch to every match (no NEW_JAR_FILENAME/SHA512 given)"
           ansible.builtin.set_fact:
             jl_locations_to_patch: "{{ jl_matches_before }}"
           when: jl_locations_to_patch is not defined
@@ -529,6 +624,84 @@
                 checksum: "sha512:{{ jl_new_jar_sha512 }}"
                 force: true
                 mode: '0600'
+
+            # ---- bedin #94 B3 — security pre-flight, still read-only, still
+            # before the service is stopped. The cutover below uses `mv -T`
+            # (never follows/enters a directory symlink at the target name),
+            # but a backup-name COLLISION or a destination that is ALREADY a
+            # symlink/directory must fail the run outright rather than let
+            # `mv -T` fail confusingly mid-cutover (with the service already
+            # stopped). Each location's own backup name is predictable
+            # ("<jar>.bak-<timestamp-to-the-second>"), and `WEB-INF/lib` is
+            # commonly writable by the service's own (non-root) user — a
+            # symlink planted there under either name would otherwise make
+            # root's `mv` write attacker-controlled content to an
+            # attacker-chosen path. -------------------------------------------
+            - name: "Patch :: stat each location's backup-name destination (lstat, do not follow)"
+              ansible.builtin.stat:
+                path: "{{ item['path'] }}.bak-{{ execution_timestamp }}"
+                follow: false
+              loop: "{{ jl_locations_to_patch }}"
+              loop_control:
+                label: "{{ item['path'] }}"
+              register: jl_backup_name_stats
+
+            - name: "Patch :: fail when a backup-name destination already exists (collision or planted symlink)"
+              ansible.builtin.fail:
+                msg: >-
+                  {{ item.item['path'] }}.bak-{{ execution_timestamp }} already exists on
+                  {{ inventory_hostname }} — refusing to rename onto it (possible stale backup
+                  or a planted symlink).
+              loop: "{{ jl_backup_name_stats.results }}"
+              loop_control:
+                label: "{{ item.item['path'] }}"
+              when: item.stat.exists
+
+            - name: "Patch :: stat each location's final destination (lstat, do not follow)"
+              ansible.builtin.stat:
+                path: "{{ (item['path'] | dirname) }}/{{ jl_new_jar_filename }}"
+                follow: false
+              loop: "{{ jl_locations_to_patch }}"
+              loop_control:
+                label: "{{ item['path'] }}"
+              register: jl_destination_stats
+
+            - name: "Patch :: fail when a destination already exists as a symlink or directory"
+              ansible.builtin.fail:
+                msg: >-
+                  {{ (item.item['path'] | dirname) }}/{{ jl_new_jar_filename }} on {{ inventory_hostname }}
+                  already exists and is not a regular file (symlink or directory) — refusing to
+                  write through it.
+              loop: "{{ jl_destination_stats.results }}"
+              loop_control:
+                label: "{{ item.item['path'] }}"
+              when:
+                - item.stat.exists
+                - not (item.stat.isreg | default(false))
+
+            # ---- bedin #94 B2 — a destination that ALREADY HELD A DIFFERENT
+            # FILE before this run (same directory, same target filename, but
+            # not the jar this run is about to replace — e.g. a leftover from
+            # an earlier partial attempt) must be backed up too, not silently
+            # overwritten: the rollback below restores THIS backup instead of
+            # deleting the file outright, so a pre-existing destination is
+            # never lost just because the cutover failed. A destination that
+            # IS the same path as the matched jar (the common case: no name
+            # change, or the B1 same-name-different-content case) is excluded
+            # here — the "rename old jar to backup" step already covers it. --
+            - name: "Patch :: reset the pre-existing-destinations list"
+              ansible.builtin.set_fact:
+                jl_preexisting_destinations: []
+
+            - name: "Patch :: record each destination that pre-exists and differs from the matched jar"
+              ansible.builtin.set_fact:
+                jl_preexisting_destinations: "{{ jl_preexisting_destinations + [item.stat.path] }}"
+              loop: "{{ jl_destination_stats.results }}"
+              loop_control:
+                label: "{{ item.item['path'] }}"
+              when:
+                - item.stat.exists
+                - item.stat.path != item.item['path']
           rescue:
             # ---- nothing here touched the service: no rollback needed, just
             # clean up the partial download before re-raising. ---------------
@@ -555,14 +728,29 @@
                 name: "{{ jl_service_name }}"
                 state: stopped
 
+            # ---- bedin #94 B2 — back up a PRE-EXISTING destination (a
+            # different file than the one being replaced, already sitting
+            # under the target filename before this run) BEFORE it gets
+            # overwritten by the copy below, so the rollback can restore it
+            # instead of deleting it. `-T --` (bedin #94 B3): `mv` never
+            # follows/enters a directory symlink at the target name, so a
+            # symlink planted at the backup name cannot redirect the move. ---
+            - name: "Patch :: back up each pre-existing destination that differs from the matched jar"
+              ansible.builtin.command:
+                argv: [mv, "-T", "--", "{{ item }}", "{{ item }}.bak-{{ execution_timestamp }}"]
+              loop: "{{ jl_preexisting_destinations }}"
+              loop_control:
+                label: "{{ item }}"
+
             # ---- rename (never delete) each old jar to a timestamped backup
             # in place, per issue #93's "deliver the environment exactly as
             # it was found" philosophy (same as
             # tomcat_update_with_evidence.yml's conf/webapps migration and
-            # oracle_rac_patch_with_evidence.yml). ---------------------------
+            # oracle_rac_patch_with_evidence.yml). `-T --` per bedin #94 B3,
+            # same rationale as above. ------------------------------------
             - name: "Patch :: rename each old jar to a timestamped backup"
               ansible.builtin.command:
-                argv: [mv, "{{ item['path'] }}", "{{ item['path'] }}.bak-{{ execution_timestamp }}"]
+                argv: [mv, "-T", "--", "{{ item['path'] }}", "{{ item['path'] }}.bak-{{ execution_timestamp }}"]
               loop: "{{ jl_locations_to_patch }}"
               loop_control:
                 label: "{{ item['path'] }}"
@@ -608,20 +796,23 @@
             # ---- automatic rollback (same contract as
             # tomcat_update_with_evidence.yml's bedin #89 B1): a host must
             # never be left with its service down just because the cutover
-            # failed. Restore every renamed backup and try to bring the
-            # service back up before re-raising — ignore_errors on each
-            # restore because not every location necessarily got as far as
-            # being renamed before the failure. ------------------------------
-            - name: "Rollback :: restore each backup to its original name"
+            # failed. ignore_errors on every restore/cleanup below because not
+            # every location necessarily got as far as being touched before
+            # the failure. `-T --` per bedin #94 B3 (never follow/enter a
+            # directory symlink). Order matters for bedin #94 B2: restore a
+            # pre-existing destination BEFORE touching anything at the SAME
+            # path via the old-jar restore, and never delete a destination
+            # that pre-existed before this run — only one that this run itself
+            # created. ----------------------------------------------------
+            - name: "Rollback :: restore each pre-existing destination that differed from the matched jar"
               ansible.builtin.command:
-                argv: [mv, "{{ item['path'] }}.bak-{{ execution_timestamp }}", "{{ item['path'] }}"]
-              loop: "{{ jl_locations_to_patch }}"
+                argv: [mv, "-T", "--", "{{ item }}.bak-{{ execution_timestamp }}", "{{ item }}"]
+              loop: "{{ jl_preexisting_destinations }}"
               loop_control:
-                label: "{{ item['path'] }}"
+                label: "{{ item }}"
               ignore_errors: true
-              register: jl_rollback_restores
 
-            - name: "Rollback :: remove any replacement jar left behind by a partial cutover"
+            - name: "Rollback :: remove the replacement jar this run created (destination did not pre-exist)"
               ansible.builtin.file:
                 path: "{{ (item['path'] | dirname) }}/{{ jl_new_jar_filename }}"
                 state: absent
@@ -629,7 +820,19 @@
               loop_control:
                 label: "{{ item['path'] }}"
               ignore_errors: true
-              when: jl_new_jar_filename != ''
+              when:
+                - jl_new_jar_filename != ''
+                - ((item['path'] | dirname) ~ '/' ~ jl_new_jar_filename) != item['path']
+                - ((item['path'] | dirname) ~ '/' ~ jl_new_jar_filename) not in jl_preexisting_destinations
+
+            - name: "Rollback :: restore each old jar backup to its original name"
+              ansible.builtin.command:
+                argv: [mv, "-T", "--", "{{ item['path'] }}.bak-{{ execution_timestamp }}", "{{ item['path'] }}"]
+              loop: "{{ jl_locations_to_patch }}"
+              loop_control:
+                label: "{{ item['path'] }}"
+              ignore_errors: true
+              register: jl_rollback_restores
 
             - name: "Rollback :: restart the service on the restored jars"
               ansible.builtin.systemd:
@@ -674,10 +877,18 @@
         # #93 names file-presence + checksum + service-health as the
         # practical substitute.
         # ------------------------------------------------------------------
-        - name: "Stat the replacement jar at every patched location"
+        # bedin #94 B4 — the post-check must PROVE content, not just presence:
+        # `follow: false` so a symlink at the target name is caught (never
+        # trusted as "the file"), `checksum_algorithm: sha512` so the result
+        # is directly comparable to NEW_JAR_SHA512 (the contract's own
+        # algorithm — sha256 told us nothing about whether THIS is the right
+        # jar), and the fail condition below checks the checksum too, not
+        # only existence.
+        - name: "Stat the replacement jar at every patched location (lstat, do not follow)"
           ansible.builtin.stat:
             path: "{{ (item['path'] | dirname) }}/{{ jl_new_jar_filename }}"
-            checksum_algorithm: sha256
+            follow: false
+            checksum_algorithm: sha512
           loop: "{{ jl_locations_to_patch }}"
           loop_control:
             label: "{{ item['path'] }}"
@@ -686,18 +897,24 @@
             - jl_action == 'Apply'
             - jl_update_needed | bool
 
-        - name: "Fail when the replacement jar is missing at a location it should have been installed"
+        - name: "Fail when the replacement jar is missing, not a regular file, or has the wrong checksum"
           ansible.builtin.fail:
             msg: >-
-              {{ jl_new_jar_filename }} is missing at {{ item['item']['path'] | dirname }} on
-              {{ inventory_hostname }} after the patch.
+              {{ jl_new_jar_filename }} at {{ item['item']['path'] | dirname }} on
+              {{ inventory_hostname }} is {{ 'missing' if not item.stat.exists
+                 else ('not a regular file' if not (item.stat.isreg | default(false))
+                 else 'present but its checksum does not match NEW_JAR_SHA512') }}
+              after the patch.
           loop: "{{ jl_post_stats.results | default([]) }}"
           loop_control:
             label: "{{ item['item']['path'] }}"
           when:
             - jl_action == 'Apply'
             - jl_update_needed | bool
-            - not item.stat.exists
+            - >-
+              not item.stat.exists
+              or not (item.stat.isreg | default(false))
+              or (item.stat.checksum | default('')) != (jl_new_jar_sha512 | lower)
 
         - name: "Record locations patched and their post-patch checksum"
           ansible.builtin.set_fact:
@@ -712,16 +929,20 @@
             - jl_action == 'Apply'
             - jl_update_needed | bool
 
+        # bedin #94 B4 — `matches_after.json` must be valid JSON in EVERY
+        # branch, including Check mode and "no patch needed": a bare string
+        # with no quotes is not JSON, and this file is evidence a human or a
+        # downstream tool is expected to parse.
         - name: "Write matches_after.json"
           ansible.builtin.copy:
             dest: "{{ evidence_dir }}/matches_after.json"
             mode: '0640'
-            content: |
-              {% if jl_action == 'Apply' and (jl_update_needed | bool) %}
-              {{ jl_locations_patched | default([]) | to_nice_json }}
-              {% else %}
-              not_applicable_check_mode_or_no_patch_needed
-              {% endif %}
+            content: >-
+              {{
+                (jl_locations_patched if (jl_action == 'Apply' and (jl_update_needed | bool))
+                 else {'status': 'not_applicable_check_mode_or_no_patch_needed'})
+                | to_nice_json
+              }}
 
         # ---- #86-style serviços e portas em escuta (depois do restart) ----
         # Mesmo bloco de comparação dos demais playbooks, reaproveitado tal e

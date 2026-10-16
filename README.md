@@ -491,7 +491,7 @@ as it was found" philosophy as `tomcat_update_with_evidence.yml` /
 `oracle_rac_patch_with_evidence.yml`):
 
 1. `Check` (read-only) finds every file under `SEARCH_ROOT` whose basename
-   matches `JAR_NAME_PATTERN` and lists each one (path, size, sha256).
+   matches `JAR_NAME_PATTERN` and lists each one (path, size, sha512).
    Nothing changes.
 2. `Apply :: stage` — service untouched: downloads `NEW_JAR_URL` to a per-run
    random temp path (checksum-verified against `NEW_JAR_SHA512`, never

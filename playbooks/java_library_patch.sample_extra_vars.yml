@@ -35,7 +35,7 @@ SERVICE_NAME: "tomcat"
 
 # --- action -------------------------------------------------------------------
 # Check = read-only. Lists every file under SEARCH_ROOT matching
-#         JAR_NAME_PATTERN (path, size, sha256). Nothing is downloaded,
+#         JAR_NAME_PATTERN (path, size, sha512). Nothing is downloaded,
 #         nothing changes.
 # Apply = downloads + verifies the replacement jar, renames (never deletes)
 #         every old match to a timestamped backup, copies the replacement to
