@@ -175,11 +175,13 @@ build {
     ]
   }
 
+  # /etc/os-release vai junto: sem ele o syft não identifica a distro e o grype
+  # mede zero advisories, como se o rootfs estivesse limpo.
   provisioner "shell" {
     environment_vars = ["SBOM_SCAN_TARGET=${var.sbom_scan_target}"]
     inline = [
       "test -d \"$SBOM_SCAN_TARGET\" || test -f \"$SBOM_SCAN_TARGET\"",
-      "SBOM_ARCHIVE_PATH=\"/tmp/samurai-sbom-source-${var.samurai_execution_id}.tar.gz\"; SBOM_SOURCE_DIR=\"$SBOM_SCAN_TARGET\"; if [ -f \"$SBOM_SOURCE_DIR\" ]; then SBOM_SOURCE_DIR=\"$(dirname \"$SBOM_SOURCE_DIR\")\"; fi; ( umask 077; set -C; sudo tar -C / -czf - -- \"$SBOM_SOURCE_DIR\" > \"$SBOM_ARCHIVE_PATH\" ) && test -s \"$SBOM_ARCHIVE_PATH\" || { echo 'SBOM archive path already exists or archive creation failed'; exit 1; }",
+      "SBOM_ARCHIVE_PATH=\"/tmp/samurai-sbom-source-${var.samurai_execution_id}.tar.gz\"; SBOM_SOURCE_DIR=\"$SBOM_SCAN_TARGET\"; if [ -f \"$SBOM_SOURCE_DIR\" ]; then SBOM_SOURCE_DIR=\"$(dirname \"$SBOM_SOURCE_DIR\")\"; fi; ( umask 077; set -C; sudo tar -C / -czf - -- \"$SBOM_SOURCE_DIR\" etc/os-release usr/lib/os-release > \"$SBOM_ARCHIVE_PATH\" ) && test -s \"$SBOM_ARCHIVE_PATH\" || { echo 'SBOM archive path already exists or archive creation failed'; exit 1; }",
     ]
   }
 
