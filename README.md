@@ -460,7 +460,7 @@ and needs a change window.
 > vulnerable Java library embedded inside a deployed webapp's own
 > `WEB-INF/lib` (e.g. an app-bundled log4j jar) — that is a separate,
 > per-app/per-jar operation, covered by
-> [java_library_patch_with_evidence.yml](#java_library_patch_with_evidencyml)
+> [java_library_patch_with_evidence.yml](#java_library_patch_with_evidenceyml)
 > below.
 
 ### java_library_patch_with_evidence.yml
