@@ -1,0 +1,60 @@
+---
+# ============================================================================
+# Sample extra-vars for java_library_patch_with_evidence.yml
+# ----------------------------------------------------------------------------
+# Pass these through an AAP Job Template survey or --extra-vars. See issue
+# #93 (prfsouto/samurai-aap-playbooks) for the full design rationale.
+#
+# This playbook carries NO CVE database: the product (scan + CVE + playbook
+# mapping) decides which jar is vulnerable and which version fixes it. This
+# file ONLY executes exactly what it is told — same model
+# tomcat_update_with_evidence.yml uses for TARGET_VERSION.
+# ============================================================================
+
+# --- required (always) -------------------------------------------------------
+# Target hosts. The SamurAI Shield engine sends them space-separated;
+# commas are also accepted.
+HOSTNAMES: "vm1-samurai"
+
+# Root of the directory tree to search — any Java application's root, not
+# Tomcat-specific. For a jar found inside Tomcat's own lib/ (the #92 case),
+# point this at the same stable indirection path
+# tomcat_update_with_evidence.yml maintains (<CATALINA_HOME's parent>/current-
+# <SERVICE_NAME>) so it always finds the CURRENTLY active install, not a
+# stale version-named directory.
+SEARCH_ROOT: "/opt/current-tomcat"
+
+# Glob of the jar to find. A broad pattern (any version) is safe: once a
+# location is patched, its filename equals NEW_JAR_FILENAME and the
+# idempotency rule in the playbook stops re-matching it as "needing a patch".
+JAR_NAME_PATTERN: "log4j-core-*.jar"
+
+# The systemd unit to restart after the jar swap (so the JVM's classloader
+# picks up the new jar).
+SERVICE_NAME: "tomcat"
+
+# --- action -------------------------------------------------------------------
+# Check = read-only. Lists every file under SEARCH_ROOT matching
+#         JAR_NAME_PATTERN (path, size, sha256). Nothing is downloaded,
+#         nothing changes.
+# Apply = downloads + verifies the replacement jar, renames (never deletes)
+#         every old match to a timestamped backup, copies the replacement to
+#         each location, and restarts SERVICE_NAME.
+ACTION: "Check"
+
+# --- required only when ACTION=Apply -------------------------------------------
+# NEW_JAR_URL: "https://repo1.maven.org/maven2/org/apache/logging/log4j/log4j-core/2.17.1/log4j-core-2.17.1.jar"
+# NEW_JAR_SHA512: "<sha512 of the exact jar above — never installed without it>"
+# NEW_JAR_FILENAME: "log4j-core-2.17.1.jar"
+
+# --- optional (shown with their defaults) -----------------------------------
+# SERIAL_BATCH: 1                     # hosts patched at a time
+# SERVICE_CHECK: "on"                 # on | off. Records running services + listening TCP
+#                                     # ports before the change; after Apply (and the
+#                                     # service restart) starts again whatever did not
+#                                     # come back. What stays down is a warning with the
+#                                     # start error (job not failed). Same contract as the
+#                                     # other evidence playbooks.
+# SERVICE_SETTLE_SECONDS: 120         # max wait for services to come back by themselves
+# SERVICE_IGNORE: ""                  # csv of service names (trailing * = prefix) or TCP ports
+# EVIDENCE_BASE_DIR: "/var/tmp/samurai-shield/java-library-patch"

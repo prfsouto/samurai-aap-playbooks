@@ -459,7 +459,93 @@ and needs a change window.
 > (the binary, bundled libraries, container config). It does **not** patch a
 > vulnerable Java library embedded inside a deployed webapp's own
 > `WEB-INF/lib` (e.g. an app-bundled log4j jar) — that is a separate,
-> per-app/per-jar operation, tracked as a follow-up.
+> per-app/per-jar operation, covered by
+> [java_library_patch_with_evidence.yml](#java_library_patch_with_evidencyml)
+> below.
+
+### java_library_patch_with_evidence.yml
+
+Replaces a vulnerable **Java library (`.jar`)** found anywhere inside a
+directory tree — a server's own `lib/` (e.g. `tomcat_update_with_evidence.yml`
+left a jar there untouched on purpose, see its scope boundary above) or a
+webapp's `WEB-INF/lib/` — **unified**: both are just paths under the same
+`SEARCH_ROOT`, with no separate logic for one or the other. Design doc:
+[issue #93](https://github.com/prfsouto/samurai-aap-playbooks/issues/93).
+Born from a real finding
+([issue #92](https://github.com/prfsouto/samurai-aap-playbooks/issues/92)):
+`log4j-core-2.14.1.jar` (Log4Shell, CVE-2021-44228) survived the Tomcat patch
+on `vm1-samurai` because it sat loose in Tomcat's own `lib/`, migrated as a
+"legitimate extra jar an operator added" — `tomcat_update_with_evidence.yml`
+has no way to tell a legitimate extra jar from a vulnerable one, by design.
+
+**This playbook carries no CVE database and never decides a jar is
+vulnerable.** It receives exactly what to find (`JAR_NAME_PATTERN`) and what
+to replace it with (`NEW_JAR_URL`/`NEW_JAR_SHA512`/`NEW_JAR_FILENAME`) — the
+same externally-supplied-target model `TARGET_VERSION` already uses in
+`tomcat_update_with_evidence.yml`. The product (scan + CVE + playbook
+mapping) decides what is vulnerable and which version is the fix; Ansible
+only executes.
+
+**Patch strategy — stage + cutover** (same "deliver the environment exactly
+as it was found" philosophy as `tomcat_update_with_evidence.yml` /
+`oracle_rac_patch_with_evidence.yml`):
+
+1. `Check` (read-only) finds every file under `SEARCH_ROOT` whose basename
+   matches `JAR_NAME_PATTERN` and lists each one (path, size, sha256).
+   Nothing changes.
+2. `Apply :: stage` — service untouched: downloads `NEW_JAR_URL` to a per-run
+   random temp path (checksum-verified against `NEW_JAR_SHA512`, never
+   installed without one) and locates every match whose basename is **not**
+   already `NEW_JAR_FILENAME` (the idempotency rule — a location already
+   carrying the target filename is treated as converged, so a broad
+   `JAR_NAME_PATTERN` like `log4j-core-*.jar` does not loop on the jar it
+   just installed on a previous run). A failure here — bad URL, checksum
+   mismatch — never touches the service.
+3. `Apply :: cutover` — stops `SERVICE_NAME`, **renames** (never deletes)
+   each old jar to `<name>.bak-<timestamp>` in place, copies the replacement
+   to every matched location, restarts the service, confirms it reports
+   active. If any step from the service stop onward fails, the rescue
+   restores every renamed backup and restarts the service before re-raising
+   — a host is never left with the service down just because the cutover
+   failed.
+4. Post-check confirms the replacement jar is present with the correct
+   checksum at every patched location, plus the reused `SERVICE_CHECK`
+   block. Unlike Tomcat (whose `-Dcatalina.base` proves which tree the live
+   JVM loaded), there is no generic equivalent of "which jar a JVM loaded"
+   without assuming a specific application server — file-presence +
+   checksum + service-health is the practical substitute.
+
+Supported actions:
+
+- `Check`: read-only. Lists every match of `JAR_NAME_PATTERN` under
+  `SEARCH_ROOT`. Nothing is downloaded, nothing changes.
+- `Apply`: downloads + verifies the replacement jar, backs up and replaces
+  every matched location, restarts the service, confirms the replacement is
+  in place, and rolls back automatically if any of that fails.
+
+Extra-vars contract — `HOSTNAMES`, `SEARCH_ROOT`, `JAR_NAME_PATTERN` and
+`SERVICE_NAME` are always required; `NEW_JAR_URL` + `NEW_JAR_SHA512` +
+`NEW_JAR_FILENAME` are required only when `ACTION=Apply`. See
+[java_library_patch.sample_extra_vars.yml](playbooks/java_library_patch.sample_extra_vars.yml)
+for the full contract and
+[java_library_patch.survey_spec.json](playbooks/java_library_patch.survey_spec.json)
+for the Job Template survey.
+
+Validated locally against real `log4j-core-2.14.1.jar` → `2.17.1.jar`
+artifacts downloaded from Maven Central, against a directory tree with the
+jar present in **both** a server `lib/`-style location and a webapp
+`WEB-INF/lib`-style location (proving the unification), through a real
+systemd service (`ansible.builtin.systemd`, user-scope locally): `Check`
+lists both locations; `Apply` patches both, restarts the service, and
+confirms it is active; a second `Apply` on an already-patched tree correctly
+reports `already_current` with no service restart (idempotency); a cutover
+failure (induced via a read-only target directory) triggers the automatic
+rollback, restoring both original jars and the service, which is confirmed
+active again; a stage failure (induced via a deliberately wrong checksum)
+never touches the service at all. A live `ACTION=Apply` run against
+`vm1-samurai`'s own surviving `log4j-core-2.14.1.jar` (the exact #92 finding)
+is still pending — it mutates the shared lab host's Tomcat installation and
+needs a change window.
 
 ### vulnerability_validation/linux_rpm_package.yml
 
