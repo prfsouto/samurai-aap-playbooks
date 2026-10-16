@@ -1,4 +1,8 @@
-"""Bounded read-only probes for an explicitly bound RHEL validation candidate."""
+"""Bounded read-only probes for an explicitly bound RHEL validation candidate.
+
+Única escrita: uma linha no journal marcada com o execution id, sem alterar serviço
+nem configuração. Serve só para provar que o journald grava e devolve o que recebe.
+"""
 import datetime
 import ipaddress
 import json
@@ -6,9 +10,15 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 LIMIT = 16384
-SUBJECTS = {"sshd.service", "chronyd.service", "NetworkManager.service", "dnf-automatic.service"}
+SUBJECTS = {"sshd.service", "chronyd.service", "NetworkManager.service", "dnf-automatic.service",
+            "systemd-journald.service"}
+
+JOURNAL_READ_ATTEMPTS = 3
+JOURNAL_RETRY_DELAY_S = 1
+JOURNAL_PAUSE = time.sleep
 
 
 def read(argv):
@@ -70,6 +80,20 @@ def network(connection):
         return {"observation_state": "unavailable"}
 
 
+def journal(execution):
+    since = int(time.time())
+    write = command(["/usr/bin/systemd-cat", "-t", "samurai-probe", "/usr/bin/printf", "%s\n", execution])
+    # O journald pode demorar a expor a linha: no máximo três leituras, parando na marca.
+    for attempt in range(JOURNAL_READ_ATTEMPTS):
+        if attempt:
+            JOURNAL_PAUSE(JOURNAL_RETRY_DELAY_S)
+        read = command(["/usr/bin/journalctl", "--no-pager", "-o", "cat", "-t", "samurai-probe",
+                        "--since", f"@{since}", "-n", "200"])
+        if read["rc"] == 0 and not read["truncated"] and execution in read["stdout"].splitlines():
+            break
+    return {"since": since, "write": write, "read": read, "read_attempts": attempt + 1}
+
+
 def collect(request):
     subjects = request.get("subjects")
     if not isinstance(subjects, list) or not subjects or any(subject not in SUBJECTS for subject in subjects):
@@ -88,6 +112,10 @@ def collect(request):
                            "tracking": command([*argv, "tracking"]), "sources": command([*argv, "sources"])}
     if "NetworkManager.service" in subjects:
         value["network_manager"] = network(connection)
+    # Unit inativa não recebe escrita: o probe não pode iniciar serviço por socket de ativação.
+    unit = value["services"].get("systemd-journald.service", {}).get("stdout", "")
+    if "systemd-journald.service" in subjects and "ActiveState=active" in unit.splitlines():
+        value["journal"] = journal(request["samurai_execution_id"])
     return value
 
 
