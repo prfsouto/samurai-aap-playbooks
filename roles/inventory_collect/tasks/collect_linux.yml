@@ -241,6 +241,15 @@
     - (inventory_collect_azure_imds.status | default(0)) == 200
   tags: [inventory_collect, collect]
 
+# Uso de pacote (sonda read-only, sem become). Desligada por padrão: só roda quando a
+# validação RHEL admitiu o request. Mesmo caminho da sonda de serviços.
+- name: "[inventory_collect] Read package usage admitted by the RHEL validation bind"
+  ansible.builtin.include_tasks: collect_package_usage.yml
+  when:
+    - inventory_collect_package_usage_request is defined
+    - inventory_collect_package_usage_request.enabled | default(false) | bool
+  tags: [inventory_collect, collect, package_usage]
+
 - name: "[inventory_collect] Initialize workload evidence as unavailable"
   ansible.builtin.set_fact:
     inventory_collect_manual_packages_status: unavailable
