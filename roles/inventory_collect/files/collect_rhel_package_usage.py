@@ -27,6 +27,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 
 SCHEMA = "samurai.rhel_package_usage_observation/v1"
@@ -41,23 +42,36 @@ UNIT_KINDS = ("service", "timer", "socket")
 
 UNIT_RE = re.compile(r"^[A-Za-z0-9@_.:-]{1,128}\.(service|timer|socket)$")
 SERVICE_RE = re.compile(r"^[A-Za-z0-9@_.:-]{1,128}\.service$")
+MODEL_RE = re.compile(r"^([A-Za-z0-9_.:-]{1,127})@\.service$")
+MODEL_INSTANCE = "samurai-probe-model"
 PATH_RE = re.compile(r"^/[A-Za-z0-9._/+@-]{1,255}$")
 EXEC_PATH_RE = re.compile(r"path=([^ ;}]+)")
 RELEASE_RE = re.compile(r"^[0-9][A-Za-z0-9_.+~-]{0,127}$")
+PACKAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
 SKIPPED_REQUIREMENTS = ("rpmlib(", "config(")
 
 
 def read(argv):
+    """Executa sem shell. stdout e stderr chegam separados; cada um é cortado em LIMIT bytes."""
     receipt = {"argv": argv, "rc": None, "stdout": "", "stderr": "", "truncated": False}
     try:
-        process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    env={**os.environ, "LC_ALL": "C"})
-        output = process.stdout.read(LIMIT + 1)
-        if len(output) > LIMIT:
-            process.kill()
-            receipt["truncated"] = True
+        captured = {}
+
+        def capture(stream_name):
+            data = getattr(process, stream_name).read(LIMIT + 1)
+            if len(data) > LIMIT:
+                receipt["truncated"] = True
+                process.kill()
+            captured[stream_name] = data[:LIMIT].decode("utf-8", "replace")
+
+        errors = threading.Thread(target=capture, args=("stderr",), daemon=True)
+        errors.start()
+        capture("stdout")
+        errors.join()
         process.wait(timeout=2)
-        receipt.update(rc=process.returncode, stdout=output[:LIMIT].decode("utf-8", "replace"))
+        receipt.update(rc=process.returncode, stdout=captured["stdout"], stderr=captured["stderr"])
     except (OSError, subprocess.TimeoutExpired) as exc:
         receipt["stderr"] = str(exc)[:1024]
     return receipt
@@ -88,8 +102,10 @@ def _inspect_unit(name, run):
     packages = set()
     for path in sorted(paths):
         owner = run(["rpm", "-qf", "--qf", "%{NAME}\n", path])
-        names = [line.strip() for line in owner["stdout"].splitlines() if line.strip()]
-        if owner["rc"] != 0 or owner["truncated"] or not names:
+        if owner["truncated"] or owner["rc"] not in (0, 1):
+            return _unit(name, "unresolved", "command_failed")
+        names = _package_names(owner["stdout"]) if owner["rc"] == 0 else []
+        if not names:
             return _unit(name, "unresolved", "unowned_binary")
         packages.update(names)
     return _unit(name, "resolved", None, paths, packages)
@@ -108,10 +124,45 @@ def _failure_reason(result):
     return "timeout" if result["rc"] == 124 else "command_failed"
 
 
+def _package_names(stdout):
+    """Nomes de pacote da saída do rpm, sem repetição. Linha que não é nome nunca entra."""
+    names = []
+    for line in stdout.splitlines():
+        name = line.strip()
+        if PACKAGE_RE.match(name) and name not in names:
+            names.append(name)
+    return names
+
+
+def _whatprovides(requirement, run):
+    """(provedores, None), ou (None, motivo) quando a leitura falhou.
+
+    rc 1 sem stderr é "ninguém provê". rc 1 com stderr é falha: tratar como ausência esconderia aresta.
+    """
+    result = run(["rpm", "-q", "--whatprovides", requirement, "--qf", "%{NAME}\n"])
+    if result["truncated"] or result["rc"] not in (0, 1) or (result["rc"] == 1 and result["stderr"]):
+        return None, _failure_reason(result)
+    if result["rc"] == 1:
+        return [], None
+    names = _package_names(result["stdout"])
+    if not names:
+        return None, "command_failed"
+    return names, None
+
+
 def _closure(seed, run, started):
-    """Dependências a partir dos pacotes donos, em largura, com limite de profundidade e nós."""
+    """Dependências a partir dos pacotes donos, em largura, com limite de profundidade e nós.
+
+    Aresta é o par (pacote, provedor): repetir o par só soma em ``duplicate_edges``. Requisito sem
+    provedor não gera aresta nem nó (``requirements_without_provider``). Cada requisito é consultado
+    uma vez na execução; resposta truncada ou com erro corta a medição e não entra no cache.
+    """
     edges, nodes = [], 0
     visited = set(seed)
+    recorded = set()
+    providers_of = {}
+    counts = {"requirement_queries": 0, "requirement_cache_hits": 0, "duplicate_edges": 0,
+              "requirements_without_provider": 0}
     queue = collections.deque((package, 0) for package in sorted(seed))
     truncated, reason = False, None
     while queue:
@@ -133,18 +184,27 @@ def _closure(seed, run, started):
             if time.monotonic() - started > TIME_BUDGET_S:
                 truncated, reason = True, "time_budget"
                 break
-            provided = run(["rpm", "-q", "--whatprovides", requirement, "--qf", "%{NAME}\n"])
-            if provided["truncated"] or provided["rc"] not in (0, 1):
-                truncated, reason = True, _failure_reason(provided)
-                break
-            for provider in dict.fromkeys(
-                line.strip() for line in provided["stdout"].splitlines() if line.strip()
-            ):
+            if requirement in providers_of:
+                counts["requirement_cache_hits"] += 1
+            else:
+                providers, failure = _whatprovides(requirement, run)
+                if failure:
+                    truncated, reason = True, failure
+                    break
+                if not providers:
+                    counts["requirements_without_provider"] += 1
+                providers_of[requirement] = providers
+                counts["requirement_queries"] += 1
+            for provider in providers_of[requirement]:
                 if provider == package:
+                    continue
+                if (package, provider) in recorded:
+                    counts["duplicate_edges"] += 1
                     continue
                 if len(edges) >= EDGE_CAP:
                     truncated, reason = True, "edge_budget"
                     break
+                recorded.add((package, provider))
                 edges.append({"from": package, "to": provider, "depth": depth + 1})
                 if provider not in visited:
                     visited.add(provider)
@@ -154,7 +214,7 @@ def _closure(seed, run, started):
         if truncated:
             break
     return {"max_depth": MAX_DEPTH, "max_nodes": MAX_NODES, "nodes": nodes,
-            "truncated": truncated, "reason": reason, "edges": edges}
+            "truncated": truncated, "reason": reason, "edges": edges, **counts}
 
 
 def _kernel(run):
@@ -173,7 +233,12 @@ def _kernel(run):
 
 
 def _inspect_trigger(name, run):
-    """Timer e socket disparam um serviço: o pacote que o serviço executa também os sustenta."""
+    """Timer e socket disparam um serviço: o pacote que o serviço executa também os sustenta.
+
+    Modelo ``x@.service`` é lido pela instância fictícia ``x@samurai-probe-model.service``, porque
+    ``systemctl show`` recusa o nome do modelo puro. A instância não é iniciada. A leitura não vê
+    drop-in específico de instância; a validação real fica para a N5.
+    """
     kind = "timer" if name.endswith(".timer") else "socket"
     prop = "Unit" if kind == "timer" else "Triggers"
     target = None
@@ -185,13 +250,15 @@ def _inspect_trigger(name, run):
         resolved = value.split("=", 1)[1].strip() if "=" in value else ""
         if not resolved:
             resolved = name.rsplit(".", 1)[0] + ".service"
-        if "@" in resolved:
+        if "@" in resolved and not MODEL_RE.match(resolved):
             entry = _unit(name, "unresolved", "template_unit")
         elif len(resolved.split()) != 1 or not UNIT_RE.match(resolved):
             entry = _unit(name, "unresolved", "unsupported_trigger")
         else:
             target = resolved
-            inspected = _inspect_unit(target, run)
+            model = MODEL_RE.match(resolved)
+            probed = f"{model.group(1)}@{MODEL_INSTANCE}.service" if model else resolved
+            inspected = _inspect_unit(probed, run)
             entry = _unit(name, inspected["status"], inspected["reason"],
                           inspected["binaries"], inspected["packages"])
     entry["kind"] = kind
