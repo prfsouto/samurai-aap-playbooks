@@ -36,13 +36,16 @@ MAX_UNITS = 64
 MAX_DEPTH = 2
 MAX_NODES = 300
 TIME_BUDGET_S = 60
-EDGE_CAP = 500
+# N5 #81: cap 500 cortou em 75 de 125 nós. Depth 2 estimado ~730 pares; 1200 cobre até 13 pares/nó nos restantes.
+EDGE_CAP = 1200
 KERNEL_NAMES = ("kernel", "kernel-core", "kernel-modules")
 UNIT_KINDS = ("service", "timer", "socket")
 
-UNIT_RE = re.compile(r"^[A-Za-z0-9@_.:-]{1,128}\.(service|timer|socket)$")
-SERVICE_RE = re.compile(r"^[A-Za-z0-9@_.:-]{1,128}\.service$")
-MODEL_RE = re.compile(r"^([A-Za-z0-9_.:-]{1,127})@\.service$")
+# Primeiro caractere alfanumérico: nome que começa com "-" nunca vira opção de systemctl.
+UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@_.:-]{0,127}\.(service|timer|socket)$")
+SERVICE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@_.:-]{0,127}\.service$")
+MODEL_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9_.:-]{0,126})@\.service$")
+INSTANCE_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9_.:-]{0,126})@[A-Za-z0-9][A-Za-z0-9_.:-]{0,126}\.service$")
 MODEL_INSTANCE = "samurai-probe-model"
 PATH_RE = re.compile(r"^/[A-Za-z0-9._/+@-]{1,255}$")
 EXEC_PATH_RE = re.compile(r"path=([^ ;}]+)")
@@ -86,21 +89,27 @@ def _unit(name, status, reason, binaries=(), packages=()):
             "binaries": sorted(binaries), "packages": sorted(packages)}
 
 
-def _inspect_unit(name, run):
-    show = run(["systemctl", "show", "--no-pager", "--property=ExecStart,FragmentPath", name])
+def _exec_paths(name, run):
+    """Caminhos de ExecStart lidos com ``systemctl show -- <nome>``: (caminhos, None) ou (None, motivo)."""
+    show = run(["systemctl", "show", "--no-pager", "--property=ExecStart,FragmentPath", "--", name])
     if show["rc"] != 0 or show["truncated"]:
-        return _unit(name, "unresolved", "command_failed")
+        return None, "command_failed"
     raw = set()
     for line in show["stdout"].splitlines():
         if line.startswith("ExecStart="):
             raw.update(EXEC_PATH_RE.findall(line))
     paths = {path for path in raw if PATH_RE.match(path)}
     if raw - paths:
-        return _unit(name, "unresolved", "unsupported_exec_path")
+        return None, "unsupported_exec_path"
     if not paths:
-        return _unit(name, "unresolved", "no_exec_start")
+        return None, "no_exec_start"
+    return sorted(paths), None
+
+
+def _owners(name, paths, run):
+    """Pacotes donos dos binários: resolved, ou unresolved com o motivo real."""
     packages = set()
-    for path in sorted(paths):
+    for path in paths:
         owner = run(["rpm", "-qf", "--qf", "%{NAME}\n", path])
         if owner["truncated"] or owner["rc"] not in (0, 1):
             return _unit(name, "unresolved", "command_failed")
@@ -109,6 +118,13 @@ def _inspect_unit(name, run):
             return _unit(name, "unresolved", "unowned_binary")
         packages.update(names)
     return _unit(name, "resolved", None, paths, packages)
+
+
+def _inspect_unit(name, run):
+    paths, reason = _exec_paths(name, run)
+    if reason:
+        return _unit(name, "unresolved", reason)
+    return _owners(name, paths, run)
 
 
 def _requirement_names(stdout):
@@ -150,6 +166,11 @@ def _whatprovides(requirement, run):
     return names, None
 
 
+def _elapsed_ms(since):
+    """Milissegundos inteiros desde ``since`` (relógio monotônico). Só mede; não decide corte."""
+    return int((time.monotonic() - since) * 1000)
+
+
 def _closure(seed, run, started):
     """Dependências a partir dos pacotes donos, em largura, com limite de profundidade e nós.
 
@@ -157,6 +178,7 @@ def _closure(seed, run, started):
     provedor não gera aresta nem nó (``requirements_without_provider``). Cada requisito é consultado
     uma vez na execução; resposta truncada ou com erro corta a medição e não entra no cache.
     """
+    begun = time.monotonic()
     edges, nodes = [], 0
     visited = set(seed)
     recorded = set()
@@ -214,7 +236,7 @@ def _closure(seed, run, started):
         if truncated:
             break
     return {"max_depth": MAX_DEPTH, "max_nodes": MAX_NODES, "nodes": nodes,
-            "truncated": truncated, "reason": reason, "edges": edges, **counts}
+            "truncated": truncated, "reason": reason, "edges": edges, "elapsed_ms": _elapsed_ms(begun), **counts}
 
 
 def _kernel(run):
@@ -233,16 +255,12 @@ def _kernel(run):
 
 
 def _inspect_trigger(name, run):
-    """Timer e socket disparam um serviço: o pacote que o serviço executa também os sustenta.
-
-    Modelo ``x@.service`` é lido pela instância fictícia ``x@samurai-probe-model.service``, porque
-    ``systemctl show`` recusa o nome do modelo puro. A instância não é iniciada. A leitura não vê
-    drop-in específico de instância; a validação real fica para a N5.
-    """
+    """Leitura pelo modelo ``x@samurai-probe-model.service`` não vê drop-in por instância; a instância vem primeiro."""
     kind = "timer" if name.endswith(".timer") else "socket"
     prop = "Unit" if kind == "timer" else "Triggers"
     target = None
-    shown = run(["systemctl", "show", "--no-pager", f"--property={prop}", name])
+    via_model = False
+    shown = run(["systemctl", "show", "--no-pager", f"--property={prop}", "--", name])
     if shown["rc"] != 0 or shown["truncated"]:
         entry = _unit(name, "unresolved", "command_failed")
     else:
@@ -250,19 +268,34 @@ def _inspect_trigger(name, run):
         resolved = value.split("=", 1)[1].strip() if "=" in value else ""
         if not resolved:
             resolved = name.rsplit(".", 1)[0] + ".service"
-        if "@" in resolved and not MODEL_RE.match(resolved):
-            entry = _unit(name, "unresolved", "template_unit")
-        elif len(resolved.split()) != 1 or not UNIT_RE.match(resolved):
+        model = MODEL_RE.match(resolved)
+        instance = INSTANCE_RE.match(resolved)
+        if len(resolved.split()) != 1 or not UNIT_RE.match(resolved):
             entry = _unit(name, "unresolved", "unsupported_trigger")
+        elif "@" in resolved and not (model or instance):
+            entry = _unit(name, "unresolved", "template_unit")
         else:
             target = resolved
-            model = MODEL_RE.match(resolved)
-            probed = f"{model.group(1)}@{MODEL_INSTANCE}.service" if model else resolved
-            inspected = _inspect_unit(probed, run)
+            if instance:
+                paths, reason = _exec_paths(resolved, run)
+                if reason is None:
+                    inspected = _owners(resolved, paths, run)
+                elif reason == "no_exec_start":
+                    # Só instância sem ExecStart cai no modelo, marcado; outra falha fica com o motivo dela.
+                    via_model = True
+                    inspected = _inspect_unit(f"{instance.group(1)}@{MODEL_INSTANCE}.service", run)
+                else:
+                    inspected = _unit(resolved, "unresolved", reason)
+            elif model:
+                via_model = True
+                inspected = _inspect_unit(f"{model.group(1)}@{MODEL_INSTANCE}.service", run)
+            else:
+                inspected = _inspect_unit(resolved, run)
             entry = _unit(name, inspected["status"], inspected["reason"],
                           inspected["binaries"], inspected["packages"])
     entry["kind"] = kind
     entry["target"] = target
+    entry["via_model"] = via_model
     return entry
 
 
@@ -285,7 +318,7 @@ def _trigger_units(run, started):
     entries = []
     for name in names:
         if time.monotonic() - started > TIME_BUDGET_S:
-            entries.append({**_unit(name, "unresolved", "time_budget"), "kind": "timer" if name.endswith(".timer") else "socket", "target": None})
+            entries.append({**_unit(name, "unresolved", "time_budget"), "kind": "timer" if name.endswith(".timer") else "socket", "target": None, "via_model": False})
         else:
             entries.append(_inspect_trigger(name, run))
     return entries, reasons
@@ -354,6 +387,7 @@ def collect(request, run=command):
         "observed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "service_mutations": 0,
         "configuration_writes": 0,
+        "elapsed_ms": _elapsed_ms(started),
         "running_kernel": running,
         "kernel_packages": kernel_packages,
         "units": units,
