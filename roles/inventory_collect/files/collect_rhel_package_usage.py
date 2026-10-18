@@ -6,9 +6,19 @@ Roda com o usuário de coleta, sem become. Fontes permitidas:
 - uname -r: kernel em execução.
 
 Não lê /proc/<pid>/exe nem /proc/<pid>/maps de outro usuário, não usa ldd (ele executa
-o loader) e não executa nenhum binário do produto. Cada comando tem tempo e bytes
-limitados. O fechamento de dependências tem profundidade, nós e orçamento de tempo, e
-qualquer corte aparece em ``coverage``: ausência de uso só vale com cobertura complete.
+o loader) e não executa nenhum binário do produto. Cada comando tem tempo e bytes limitados.
+
+Escopo declarado da medição (``coverage.scope``): unidades de serviço em execução, timers e
+sockets ativos (``service``, ``timer``, ``socket``) e dependências RPM até a profundidade
+``MAX_DEPTH`` a partir dos pacotes donos dessas unidades. A profundidade é o escopo, não um
+corte: pacote além dela não é medido, e isso não torna a cobertura ``partial``. Por isso
+``complete`` quer dizer "medido dentro deste escopo". Ausência de uso só vale dentro dele;
+fora dele a sonda não afirma nada. Não cobre processo sem unidade, script manual nem biblioteca
+carregada sem requisito declarado no RPM: é o risco de falso ``absent`` declarado no PR.
+
+Corte que compromete a medição (limite de arestas, de nós, de tempo, de saída; nome ou caminho
+que a sonda não representa; kernel sem pacote correspondente) aparece em ``coverage.reasons`` e
+torna a cobertura ``partial``. Nenhum corte descarta dado em silêncio.
 """
 import collections
 import datetime
@@ -27,6 +37,7 @@ MAX_NODES = 300
 TIME_BUDGET_S = 60
 EDGE_CAP = 500
 KERNEL_NAMES = ("kernel", "kernel-core", "kernel-modules")
+UNIT_KINDS = ("service", "timer", "socket")
 
 UNIT_RE = re.compile(r"^[A-Za-z0-9@_.:-]{1,128}\.(service|timer|socket)$")
 SERVICE_RE = re.compile(r"^[A-Za-z0-9@_.:-]{1,128}\.service$")
@@ -65,10 +76,13 @@ def _inspect_unit(name, run):
     show = run(["systemctl", "show", "--no-pager", "--property=ExecStart,FragmentPath", name])
     if show["rc"] != 0 or show["truncated"]:
         return _unit(name, "unresolved", "command_failed")
-    paths = set()
+    raw = set()
     for line in show["stdout"].splitlines():
         if line.startswith("ExecStart="):
-            paths.update(path for path in EXEC_PATH_RE.findall(line) if PATH_RE.match(path))
+            raw.update(EXEC_PATH_RE.findall(line))
+    paths = {path for path in raw if PATH_RE.match(path)}
+    if raw - paths:
+        return _unit(name, "unresolved", "unsupported_exec_path")
     if not paths:
         return _unit(name, "unresolved", "no_exec_start")
     packages = set()
@@ -128,11 +142,15 @@ def _closure(seed, run, started):
             ):
                 if provider == package:
                     continue
-                if len(edges) < EDGE_CAP:
-                    edges.append({"from": package, "to": provider, "depth": depth + 1})
+                if len(edges) >= EDGE_CAP:
+                    truncated, reason = True, "edge_budget"
+                    break
+                edges.append({"from": package, "to": provider, "depth": depth + 1})
                 if provider not in visited:
                     visited.add(provider)
                     queue.append((provider, depth + 1))
+            if truncated:
+                break
         if truncated:
             break
     return {"max_depth": MAX_DEPTH, "max_nodes": MAX_NODES, "nodes": nodes,
@@ -158,24 +176,26 @@ def _inspect_trigger(name, run):
     """Timer e socket disparam um serviço: o pacote que o serviço executa também os sustenta."""
     kind = "timer" if name.endswith(".timer") else "socket"
     prop = "Unit" if kind == "timer" else "Triggers"
+    target = None
     shown = run(["systemctl", "show", "--no-pager", f"--property={prop}", name])
     if shown["rc"] != 0 or shown["truncated"]:
         entry = _unit(name, "unresolved", "command_failed")
     else:
         value = shown["stdout"].strip()
-        target = value.split("=", 1)[1].strip() if "=" in value else ""
-        if not target:
-            target = name.rsplit(".", 1)[0] + ".service"
-        if "@" in target:
+        resolved = value.split("=", 1)[1].strip() if "=" in value else ""
+        if not resolved:
+            resolved = name.rsplit(".", 1)[0] + ".service"
+        if "@" in resolved:
             entry = _unit(name, "unresolved", "template_unit")
-        elif len(target.split()) != 1 or not UNIT_RE.match(target):
+        elif len(resolved.split()) != 1 or not UNIT_RE.match(resolved):
             entry = _unit(name, "unresolved", "unsupported_trigger")
         else:
+            target = resolved
             inspected = _inspect_unit(target, run)
             entry = _unit(name, inspected["status"], inspected["reason"],
                           inspected["binaries"], inspected["packages"])
     entry["kind"] = kind
-    entry["target"] = None if entry["reason"] in ("template_unit", "unsupported_trigger") else target
+    entry["target"] = target
     return entry
 
 
@@ -185,11 +205,13 @@ def _trigger_units(run, started):
     if listed["rc"] != 0 or listed["truncated"]:
         return [], ["trigger_list_unavailable"]
     names = []
+    reasons = []
     for line in listed["stdout"].splitlines():
         token = line.split()[0] if line.split() else ""
         if UNIT_RE.match(token) and token.endswith((".timer", ".socket")):
             names.append(token)
-    reasons = []
+        elif token and not UNIT_RE.match(token):
+            reasons.append("unit_name_unsupported")
     if len(names) > MAX_UNITS:
         reasons.append("triggers_over_limit")
         names = names[:MAX_UNITS]
@@ -200,6 +222,16 @@ def _trigger_units(run, started):
         else:
             entries.append(_inspect_trigger(name, run))
     return entries, reasons
+
+
+def _release_of(running):
+    """Versão-release do kernel em execução, sem o sufixo de arquitetura."""
+    return running.rsplit(".", 1)[0] if running.endswith((".x86_64", ".aarch64")) else running
+
+
+def _scope():
+    """Escopo declarado da medição: o que ``complete`` quer dizer. O controlador confere este valor."""
+    return {"dependency_depth": MAX_DEPTH, "unit_kinds": sorted(UNIT_KINDS)}
 
 
 def collect(request, run=command):
@@ -218,6 +250,8 @@ def collect(request, run=command):
             token = line.split()[0] if line.split() else ""
             if UNIT_RE.match(token):
                 names.append(token)
+            elif token:
+                reasons.append("unit_name_unsupported")
     if len(names) > MAX_UNITS:
         reasons.append("units_over_limit")
         names = names[:MAX_UNITS]
@@ -242,6 +276,9 @@ def collect(request, run=command):
         reasons.append("kernel_unknown")
     if kernel_failed:
         reasons.append("kernel_packages_unavailable")
+    if not (kernel_unknown or kernel_failed) and not any(
+            f"{pkg['version']}-{pkg['release']}" == _release_of(running) for pkg in kernel_packages):
+        reasons.append("running_kernel_unmatched")
     unresolved = [entry["unit"] for entry in units if entry["status"] != "resolved"]
     reasons = sorted(set(reasons))
     return {
@@ -258,6 +295,7 @@ def collect(request, run=command):
             "status": "partial" if reasons or unresolved else "complete",
             "reasons": reasons,
             "unresolved_units": unresolved,
+            "scope": _scope(),
         },
     }
 
