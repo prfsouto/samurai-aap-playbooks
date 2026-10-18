@@ -25,6 +25,7 @@ import datetime
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -36,6 +37,8 @@ MAX_UNITS = 64
 MAX_DEPTH = 2
 MAX_NODES = 300
 TIME_BUDGET_S = 60
+# Acima do timeout de 8 s de command(): o SIGKILL do grupo já cortou o que obedece ao sinal.
+JOIN_TIMEOUT_S = 10
 # N5 #81: cap 500 cortou em 75 de 125 nós. Depth 2 estimado ~730 pares; 1200 cobre até 13 pares/nó nos restantes.
 EDGE_CAP = 1200
 KERNEL_NAMES = ("kernel", "kernel-core", "kernel-modules")
@@ -52,31 +55,59 @@ EXEC_PATH_RE = re.compile(r"path=([^ ;}]+)")
 RELEASE_RE = re.compile(r"^[0-9][A-Za-z0-9_.+~-]{0,127}$")
 PACKAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
 SKIPPED_REQUIREMENTS = ("rpmlib(", "config(")
+# Mensagem do rpm -qf para binário sem dono. O rpmlog emite NOTICE no stdout por padrão; esta forma é defensiva.
+UNOWNED_RE = re.compile(r"file .+ is not owned by any package")
+
+
+def _kill_group(process):
+    """SIGKILL no grupo do processo. Com ``start_new_session`` o pid é o pgid: alcança o ``timeout`` e os netos."""
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except OSError:
+        pass  # o grupo já não existe
+
+
+def _capture(process, name, captured):
+    """Lê ``name`` até LIMIT+1 bytes. Acima do limite, mata o grupo para nenhum neto continuar escrevendo."""
+    data = getattr(process, name).read(LIMIT + 1)
+    cut = len(data) > LIMIT
+    if cut:
+        _kill_group(process)
+    captured[name] = (data[:LIMIT].decode("utf-8", "replace"), cut)
 
 
 def read(argv):
-    """Executa sem shell. stdout e stderr chegam separados; cada um é cortado em LIMIT bytes."""
+    """Executa sem shell, em grupo próprio. stdout e stderr chegam separados; cada um é cortado em LIMIT bytes.
+
+    Stream que não fecha em JOIN_TIMEOUT_S (neto que escapou do grupo e segura o pipe) não vira resultado:
+    o grupo morre, rc é 124 e ``truncated`` fica True. Stream sem captura nunca é lido como vazio.
+    """
     receipt = {"argv": argv, "rc": None, "stdout": "", "stderr": "", "truncated": False}
+    process = None
     try:
         process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                   env={**os.environ, "LC_ALL": "C"})
+                                   env={**os.environ, "LC_ALL": "C"}, start_new_session=True)
         captured = {}
-
-        def capture(stream_name):
-            data = getattr(process, stream_name).read(LIMIT + 1)
-            if len(data) > LIMIT:
-                receipt["truncated"] = True
-                process.kill()
-            captured[stream_name] = data[:LIMIT].decode("utf-8", "replace")
-
-        errors = threading.Thread(target=capture, args=("stderr",), daemon=True)
-        errors.start()
-        capture("stdout")
-        errors.join()
-        process.wait(timeout=2)
-        receipt.update(rc=process.returncode, stdout=captured["stdout"], stderr=captured["stderr"])
+        readers = [threading.Thread(target=_capture, args=(process, name, captured), daemon=True)
+                   for name in ("stdout", "stderr")]
+        for reader in readers:
+            reader.start()
+        deadline = time.monotonic() + JOIN_TIMEOUT_S
+        for reader in readers:
+            reader.join(max(0.0, deadline - time.monotonic()))
+        if {"stdout", "stderr"} <= captured.keys():
+            process.wait(timeout=2)
+            receipt.update(rc=process.returncode, stdout=captured["stdout"][0],
+                           stderr=captured["stderr"][0],
+                           truncated=captured["stdout"][1] or captured["stderr"][1])
+        else:
+            _kill_group(process)
+            process.wait(timeout=2)
+            receipt.update(rc=124, truncated=True)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        receipt["stderr"] = str(exc)[:1024]
+        if process is not None:
+            _kill_group(process)
+        receipt.update(stderr=str(exc)[:1024], truncated=True)
     return receipt
 
 
@@ -107,15 +138,23 @@ def _exec_paths(name, run):
 
 
 def _owners(name, paths, run):
-    """Pacotes donos dos binários: resolved, ou unresolved com o motivo real."""
+    """Pacotes donos dos binários: resolved, ou unresolved com o motivo real.
+
+    rc 1 sem stderr, ou com a mensagem «is not owned by any package», é sem dono. Outro rc 1 é falha
+    (rpmdb); rc 0 sem nome também é falha, nunca binário sem dono.
+    """
     packages = set()
     for path in paths:
         owner = run(["rpm", "-qf", "--qf", "%{NAME}\n", path])
         if owner["truncated"] or owner["rc"] not in (0, 1):
             return _unit(name, "unresolved", "command_failed")
-        names = _package_names(owner["stdout"]) if owner["rc"] == 0 else []
-        if not names:
+        if owner["rc"] == 1:
+            if owner["stderr"] and not UNOWNED_RE.fullmatch(owner["stderr"].strip()):
+                return _unit(name, "unresolved", "command_failed")
             return _unit(name, "unresolved", "unowned_binary")
+        names = _package_names(owner["stdout"])
+        if not names:
+            return _unit(name, "unresolved", "command_failed")
         packages.update(names)
     return _unit(name, "resolved", None, paths, packages)
 
@@ -153,12 +192,16 @@ def _package_names(stdout):
 def _whatprovides(requirement, run):
     """(provedores, None), ou (None, motivo) quando a leitura falhou.
 
-    rc 1 sem stderr é "ninguém provê". rc 1 com stderr é falha: tratar como ausência esconderia aresta.
+    rc 1 sem stderr é "ninguém provê", e rc 1 com stderr igual à mensagem do rpm para este requisito também.
+    Qualquer outro stderr com rc 1 é falha: tratar como ausência esconderia aresta.
     """
-    result = run(["rpm", "-q", "--whatprovides", requirement, "--qf", "%{NAME}\n"])
-    if result["truncated"] or result["rc"] not in (0, 1) or (result["rc"] == 1 and result["stderr"]):
+    # "--" antes do nome: requisito que começa com "-" nunca vira opção; --qf precisa vir antes dele.
+    result = run(["rpm", "-q", "--whatprovides", "--qf", "%{NAME}\n", "--", requirement])
+    if result["truncated"] or result["rc"] not in (0, 1):
         return None, _failure_reason(result)
     if result["rc"] == 1:
+        if result["stderr"] and result["stderr"].strip() != f"no package provides {requirement}":
+            return None, "command_failed"
         return [], None
     names = _package_names(result["stdout"])
     if not names:
@@ -198,7 +241,7 @@ def _closure(seed, run, started):
             truncated, reason = True, "time_budget"
             break
         nodes += 1
-        requires = run(["rpm", "-q", "--requires", package])
+        requires = run(["rpm", "-q", "--requires", "--", package])
         if requires["rc"] != 0 or requires["truncated"]:
             truncated, reason = True, _failure_reason(requires)
             break
