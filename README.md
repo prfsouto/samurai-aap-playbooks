@@ -450,9 +450,9 @@ naming, conf/webapps/libs migration, ROOT handling, symlink resolution),
 against the full extra-vars/unreachable-host pipeline with
 `ansible-playbook`, and with a real `ACTION=Check` run against the actual
 lab hosts (`vm1-samurai`/`vm2-samurai`) through a disposable AAP Job
-Template. A live `ACTION=Apply` run (service stop/start, automatic rollback,
-live-process verification) is still pending — it mutates a shared lab host
-and needs a change window.
+Template. A live `ACTION=Apply` run against `vm1-samurai` through a disposable AAP Job
+Template (`9.0.50` → `9.0.121`, with the `-Dcatalina.base` live-process
+verification confirming the new install) was also executed and succeeded.
 
 > [!NOTE]
 > Scope boundary: this playbook patches the **Tomcat server component**
@@ -542,10 +542,13 @@ reports `already_current` with no service restart (idempotency); a cutover
 failure (induced via a read-only target directory) triggers the automatic
 rollback, restoring both original jars and the service, which is confirmed
 active again; a stage failure (induced via a deliberately wrong checksum)
-never touches the service at all. A live `ACTION=Apply` run against
-`vm1-samurai`'s own surviving `log4j-core-2.14.1.jar` (the exact #92 finding)
-is still pending — it mutates the shared lab host's Tomcat installation and
-needs a change window.
+never touches the service at all. A live `ACTION=Apply` run through AAP against
+`vm1-samurai`'s own surviving `log4j-core-2.14.1.jar` (the exact #92 finding,
+`SEARCH_ROOT=/opt/current-tomcat`, replaced by `log4j-core-2.17.1.jar`) also
+succeeded; a following `Check` confirmed the new jar's sha512 and the service
+active. That run showed that the AAP execution environment's `find` has no
+`checksum_algorithm` (ansible-core older than 2.19), so the sha512 of each
+match comes from `stat`.
 
 ### vulnerability_validation/linux_rpm_package.yml
 
