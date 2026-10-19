@@ -3,6 +3,8 @@
 Roda com o usuário de coleta, sem become. Fontes permitidas:
 - systemctl list-units/show: metadados de unidade;
 - rpm -qf, rpm -q --requires, rpm -q --whatprovides: banco RPM, só leitura;
+- rpm -q, rpm -q --provides, rpm -ql, rpm -q --whatrequires: banco RPM, só leitura, só para os
+  pacotes que o request da origem A pede em ``reverse_dependency_packages``;
 - uname -r: kernel em execução.
 
 Não lê /proc/<pid>/exe nem /proc/<pid>/maps de outro usuário, não usa ldd (ele executa
@@ -19,6 +21,10 @@ carregada sem requisito declarado no RPM: é o risco de falso ``absent`` declara
 Corte que compromete a medição (limite de arestas, de nós, de tempo, de saída; nome ou caminho
 que a sonda não representa; kernel sem pacote correspondente) aparece em ``coverage.reasons`` e
 torna a cobertura ``partial``. Nenhum corte descarta dado em silêncio.
+
+Dependentes reversos (``reverse_dependencies``) só existem quando o request os pede: para cada
+pacote, quem o requer pelo nome, por cada capacidade que ele fornece (soname incluído) e por cada
+arquivo dele. Pacote que não coube na medição fica ``unmeasured`` com o motivo, nunca "sem dependente".
 """
 import collections
 import datetime
@@ -57,6 +63,12 @@ PACKAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
 SKIPPED_REQUIREMENTS = ("rpmlib(", "config(")
 # Mensagem do rpm -qf para binário sem dono. O rpmlog emite NOTICE no stdout por padrão; esta forma é defensiva.
 UNOWNED_RE = re.compile(r"file .+ is not owned by any package")
+MAX_REVERSE_PACKAGES = 32
+# Nome, capacidades e arquivos de um pacote numa só consulta; acima disso o pacote fica não medido.
+MAX_REVERSE_ARGUMENTS = 512
+REVERSE_TIME_BUDGET_S = 30
+NOT_REQUIRED_RE = re.compile(r"no package requires .+")
+NOT_INSTALLED_RE = re.compile(r"package .+ is not installed")
 
 
 def _kill_group(process):
@@ -377,6 +389,124 @@ def _scope():
     return {"dependency_depth": MAX_DEPTH, "unit_kinds": sorted(UNIT_KINDS)}
 
 
+def _reverse_request(request):
+    """Pacotes pedidos para dependente reverso: ``None`` sem pedido, ``[]`` com pedido inválido."""
+    if "reverse_dependency_packages" not in request:
+        return None
+    names = request["reverse_dependency_packages"]
+    if (not isinstance(names, list) or not 0 < len(names) <= MAX_REVERSE_PACKAGES
+            or len(set(map(str, names))) != len(names)
+            or not all(isinstance(name, str) and PACKAGE_RE.fullmatch(name) for name in names)):
+        return []
+    return names
+
+
+def _unmeasured(reason):
+    return {"status": "unmeasured", "reason": reason}
+
+
+def _installed(package, run):
+    """``True`` instalado, ``False`` ausente do banco RPM, ``None`` quando a leitura falhou."""
+    result = run(["rpm", "-q", "--qf", "%{NAME}\n", "--", package])
+    if result["truncated"] or result["rc"] not in (0, 1):
+        return None
+    if result["rc"] == 1:
+        message = (result["stdout"] + result["stderr"]).strip()
+        return False if NOT_INSTALLED_RE.fullmatch(message) else None
+    return True if _package_names(result["stdout"]) == [package] else None
+
+
+def _provided_capabilities(package, run):
+    """Capacidades que o pacote fornece, soname incluído: (lista, None) ou (None, motivo)."""
+    result = run(["rpm", "-q", "--provides", "--", package])
+    if result["rc"] != 0 or result["truncated"]:
+        return None, _failure_reason(result)
+    names = []
+    for line in result["stdout"].splitlines():
+        parts = line.split()
+        if parts and parts[0] not in names:
+            names.append(parts[0])
+    return names, None
+
+
+def _owned_files(package, run):
+    """Arquivos do pacote: (lista, None) ou (None, motivo). Linha que não é caminho absoluto corta a medição."""
+    result = run(["rpm", "-ql", "--", package])
+    if result["rc"] != 0 or result["truncated"]:
+        return None, _failure_reason(result)
+    files = []
+    for line in result["stdout"].splitlines():
+        path = line.strip()
+        if not path or path == "(contains no files)":
+            continue
+        if not path.startswith("/"):
+            return None, "unsupported_file_path"
+        files.append(path)
+    return files, None
+
+
+def _requirers(package, arguments, run):
+    """Quem requer qualquer argumento (nome, capacidade ou arquivo): (lista, None) ou (None, motivo).
+
+    rc do ``rpm -q`` conta os argumentos sem resposta, então rc diferente de zero não é falha. Falha é
+    saída cortada, tempo esgotado, stderr com outra mensagem ou linha que não é nome de pacote.
+    """
+    result = run(["rpm", "-q", "--whatrequires", "--qf", "%{NAME}\n", "--", *arguments])
+    if result["truncated"] or result["rc"] == 124:
+        return None, _failure_reason(result)
+    if any(line.strip() and not NOT_REQUIRED_RE.fullmatch(line.strip())
+           for line in result["stderr"].splitlines()):
+        return None, "command_failed"
+    names = set()
+    for line in result["stdout"].splitlines():
+        text = line.strip()
+        if not text or NOT_REQUIRED_RE.fullmatch(text):
+            continue
+        if not PACKAGE_RE.fullmatch(text):
+            return None, "command_failed"
+        names.add(text)
+    names.discard(package)
+    return sorted(names), None
+
+
+def _reverse_of(package, run):
+    installed = _installed(package, run)
+    if installed is None:
+        return _unmeasured("command_failed")
+    if installed is False:
+        return {"status": "not_installed"}
+    capabilities, reason = _provided_capabilities(package, run)
+    if reason:
+        return _unmeasured(reason)
+    files, reason = _owned_files(package, run)
+    if reason:
+        return _unmeasured(reason)
+    arguments = list(dict.fromkeys([package, *capabilities, *files]))
+    if len(arguments) > MAX_REVERSE_ARGUMENTS:
+        return _unmeasured("arguments_over_limit")
+    requirers, reason = _requirers(package, arguments, run)
+    if reason:
+        return _unmeasured(reason)
+    return {"status": "measured", "requirers": requirers,
+            "capabilities": len(capabilities), "files": len(files)}
+
+
+def _reverse_dependencies(packages, run):
+    """Dependentes reversos dos pacotes pedidos, com cobertura própria."""
+    started = time.monotonic()
+    measured = {}
+    for package in packages:
+        if time.monotonic() - started > REVERSE_TIME_BUDGET_S:
+            measured[package] = _unmeasured("time_budget")
+        else:
+            measured[package] = _reverse_of(package, run)
+    reasons = sorted({entry["reason"] for entry in measured.values() if entry["status"] == "unmeasured"})
+    if not packages:
+        reasons = ["request_invalid"]
+    return {"packages": measured, "elapsed_ms": _elapsed_ms(started),
+            "coverage": {"status": "partial" if reasons else "complete", "reasons": reasons}}
+
+
 def collect(request, run=command):
     if not isinstance(request, dict):
         raise ValueError("binding must be an object")
@@ -424,7 +554,8 @@ def collect(request, run=command):
         reasons.append("running_kernel_unmatched")
     unresolved = [entry["unit"] for entry in units if entry["status"] != "resolved"]
     reasons = sorted(set(reasons))
-    return {
+    reverse = _reverse_request(request)
+    observation = {
         "schema": SCHEMA,
         "binding": request,
         "observed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -442,6 +573,9 @@ def collect(request, run=command):
             "scope": _scope(),
         },
     }
+    if reverse is not None:
+        observation["reverse_dependencies"] = _reverse_dependencies(reverse, run)
+    return observation
 
 
 if __name__ == "__main__":
