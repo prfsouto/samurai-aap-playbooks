@@ -460,9 +460,22 @@
             patterns: "{{ jl_jar_pattern }}"
             recurse: true
             file_type: file
-            get_checksum: true
-            checksum_algorithm: sha512
           register: jl_matches_found
+
+        # The sha512 comes from `stat`, not `find`: the ansible-core in the AAP
+        # execution environment is older than 2.19 and its `find` has no
+        # `checksum_algorithm` parameter (only sha1), which failed the first
+        # real run on vm1. `stat` has had it for much longer. `follow: false`
+        # so a symlink is hashed as the link it is, never as its target.
+        - name: "Hash each match with sha512 (lstat, do not follow)"
+          ansible.builtin.stat:
+            path: "{{ item['path'] }}"
+            follow: false
+            checksum_algorithm: sha512
+          loop: "{{ jl_matches_found.files | default([]) }}"
+          loop_control:
+            label: "{{ item['path'] }}"
+          register: jl_match_stats
 
         - name: "Reset matches_before to an explicit structured list"
           ansible.builtin.set_fact:
@@ -471,10 +484,11 @@
         - name: "Append each match as a structured entry (path/size/checksum)"
           ansible.builtin.set_fact:
             jl_matches_before: >-
-              {{ jl_matches_before + [{'path': item['path'], 'size': item['size'], 'checksum': item['checksum']}] }}
-          loop: "{{ jl_matches_found.files | default([]) }}"
+              {{ jl_matches_before + [{'path': item.stat.path, 'size': item.stat.size, 'checksum': item.stat.checksum}] }}
+          loop: "{{ jl_match_stats.results | default([]) }}"
           loop_control:
-            label: "{{ item['path'] }}"
+            label: "{{ item['item']['path'] }}"
+          when: item.stat.exists and (item.stat.isreg | default(false))
 
         - name: "Write matches_before.json"
           ansible.builtin.copy:
