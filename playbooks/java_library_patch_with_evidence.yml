@@ -123,7 +123,7 @@
     - name: "Reject SEARCH_ROOT = / (never a sane search root)"
       ansible.builtin.fail:
         msg: "SEARCH_ROOT cannot be '/' — point it at the specific application tree to search."
-      when: samurai_search_root_raw == '/'
+      when: samurai_search_root_raw is match('^/+$')
 
     - name: "Validate JAR_NAME_PATTERN is provided"
       ansible.builtin.fail:
@@ -146,11 +146,14 @@
         msg: >-
           JAR_NAME_PATTERN must be a single glob ending in ".jar", with no comma
           (one pattern only — "find" would silently split a CSV into several)
-          and no "/" (patterns match the basename only). Got: '{{ samurai_jar_pattern_raw }}'.
+          and no "/" (patterns match the basename only), and starting with a literal
+          character (never a bare wildcard such as "*.jar", which would replace every
+          jar in the tree). Got: '{{ samurai_jar_pattern_raw }}'.
       when: >-
         ',' in samurai_jar_pattern_raw
         or '/' in samurai_jar_pattern_raw
         or samurai_jar_pattern_raw is not match('.*\.jar$')
+        or samurai_jar_pattern_raw is not match('^[A-Za-z0-9_]')
 
     - name: "Validate SERVICE_NAME is provided"
       ansible.builtin.fail:
@@ -434,9 +437,13 @@
         # `already_current` on Apply, `patch_needed: false` on Check. Stat it
         # explicitly first so a non-existent root is a loud failure, never a
         # quiet false negative.
+        # `follow: true` (bedin #94 N1): SEARCH_ROOT is routinely a symlink
+        # (the stable `<parent>/current-<SERVICE_NAME>` path that
+        # tomcat_update_with_evidence.yml maintains) and `find` follows it.
         - name: "Stat SEARCH_ROOT"
           ansible.builtin.stat:
             path: "{{ jl_search_root }}"
+            follow: true
           register: jl_search_root_stat
 
         - name: "Fail when SEARCH_ROOT does not exist or is not a directory"
@@ -702,6 +709,18 @@
               when:
                 - item.stat.exists
                 - item.stat.path != item.item['path']
+
+            # bedin #94 N2 — the same destination can be recorded twice (two
+            # old jars in one directory) or can itself be one of the matches
+            # being replaced (a broad pattern also matching a wrong-content
+            # file already named like the target). Either way the cutover
+            # would `mv` the same path twice and fail after the stop. Dedupe,
+            # and drop what the "rename each old jar" step already backs up.
+            - name: "Patch :: dedupe pre-existing destinations and drop those already being replaced"
+              ansible.builtin.set_fact:
+                jl_preexisting_destinations: >-
+                  {{ jl_preexisting_destinations | unique
+                     | difference(jl_locations_to_patch | map(attribute='path') | list) }}
           rescue:
             # ---- nothing here touched the service: no rollback needed, just
             # clean up the partial download before re-raising. ---------------
