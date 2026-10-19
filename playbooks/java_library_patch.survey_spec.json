@@ -1,0 +1,88 @@
+{
+  "name": "SamurAI Shield :: Java library (jar) patch",
+  "description": "Input contract for playbooks/java_library_patch_with_evidence.yml (repo: prfsouto/samurai-aap-playbooks). Replaces a vulnerable Java library (.jar) found anywhere inside SEARCH_ROOT — a server's own lib/ or a webapp's WEB-INF/lib, unified — via a rename-to-backup + replace + restart cutover with automatic rollback. HOSTNAMES is auto-filled by SamurAI Shield from the governed asset and hidden from the operator form. IMPORTANT: enable 'Prompt on launch -> Extra variables' (ask_variables_on_launch) on the Job Template so the engine's governed HOSTNAMES overrides the survey's blank default instead of being discarded.",
+  "spec": [
+    {
+      "question_name": "Target host(s)",
+      "question_description": "Single host, IP, or space/comma-separated list. Filled automatically by SamurAI Shield from the selected asset — do not type it by hand.",
+      "variable": "HOSTNAMES",
+      "type": "text",
+      "required": true,
+      "default": "",
+      "new_question": true
+    },
+    {
+      "question_name": "Search root",
+      "question_description": "Absolute path of the directory tree to search for the jar (any Java application's root — not Tomcat-specific).",
+      "variable": "SEARCH_ROOT",
+      "type": "text",
+      "required": true,
+      "default": "",
+      "new_question": true
+    },
+    {
+      "question_name": "Jar name pattern",
+      "question_description": "Glob of the jar to find, e.g. \"log4j-core-*.jar\". Never a single path — the same jar can exist in more than one place.",
+      "variable": "JAR_NAME_PATTERN",
+      "type": "text",
+      "required": true,
+      "default": "",
+      "new_question": true
+    },
+    {
+      "question_name": "Service name",
+      "question_description": "The systemd unit to restart after the jar swap, so the JVM's classloader picks up the new jar.",
+      "variable": "SERVICE_NAME",
+      "type": "text",
+      "required": true,
+      "default": "",
+      "new_question": true
+    },
+    {
+      "question_name": "Action",
+      "question_description": "Check lists every matching jar under the search root, read-only. Apply downloads, verifies, backs up and replaces each match, then restarts the service.",
+      "variable": "ACTION",
+      "type": "multiplechoice",
+      "choices": "Check\nApply",
+      "required": true,
+      "default": "Check",
+      "new_question": true
+    },
+    {
+      "question_name": "New jar URL",
+      "question_description": "Required when ACTION=Apply: the exact replacement jar.",
+      "variable": "NEW_JAR_URL",
+      "type": "text",
+      "required": false,
+      "default": "",
+      "new_question": true
+    },
+    {
+      "question_name": "New jar SHA-512",
+      "question_description": "Required when ACTION=Apply: the jar is never installed without a matching checksum.",
+      "variable": "NEW_JAR_SHA512",
+      "type": "text",
+      "required": false,
+      "default": "",
+      "new_question": true
+    },
+    {
+      "question_name": "New jar filename",
+      "question_description": "Required when ACTION=Apply: the exact filename the replacement jar is installed as (may differ from the old name, e.g. log4j-core-2.17.1.jar replacing log4j-core-2.14.1.jar).",
+      "variable": "NEW_JAR_FILENAME",
+      "type": "text",
+      "required": false,
+      "default": "",
+      "new_question": true
+    },
+    {
+      "question_name": "Evidence base directory",
+      "question_description": "Base directory on the target where the structured evidence files are written.",
+      "variable": "EVIDENCE_BASE_DIR",
+      "type": "text",
+      "required": false,
+      "default": "/var/tmp/samurai-shield/java-library-patch",
+      "new_question": true
+    }
+  ]
+}

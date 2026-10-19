@@ -1,0 +1,1330 @@
+---
+# ============================================================================
+# SamurAI Shield :: Java library (jar) patch with evidence
+# ----------------------------------------------------------------------------
+# Unified replace of a vulnerable Java library (.jar) found ANYWHERE inside a
+# directory tree — the server's own lib/ (e.g. Tomcat's lib/log4j-core-*.jar)
+# or a webapp's WEB-INF/lib/ — without distinguishing the two: both are just
+# paths under the same SEARCH_ROOT. Executed from Ansible Automation Platform
+# (AAP). Same evidence/service-check discipline as
+# tomcat_update_with_evidence.yml / linux_yum_update_with_evidence.yml /
+# linux_apt_update_with_evidence.yml / windows_update_with_evidence.yml:
+# pre-checks, optional patch, post-checks, structured evidence files, and a
+# consolidated samurai_shield_result JSON block on stdout.
+#
+# Design doc (published before any code, per the product owner's explicit
+# transparency instruction): issue #93 in this repository. Context: issue #92
+# (log4j-core-2.14.1.jar, CVE-2021-44228, survived the Tomcat patch on
+# vm1-samurai because it sat loose in Tomcat's own lib/, treated as a
+# legitimate "extra jar an operator added" — tomcat_update_with_evidence.yml
+# has no way to tell a legitimate extra jar from a vulnerable one, by design).
+# Issue #88 (original Java-library item, split off when Tomcat was scoped).
+#
+# Responsibility split (issue #93): this playbook carries NO CVE database and
+# never decides a jar is vulnerable. It receives exactly what to find
+# (JAR_NAME_PATTERN) and what to replace it with (NEW_JAR_URL/SHA512/FILENAME)
+# — the same externally-supplied-target model TARGET_VERSION already uses in
+# tomcat_update_with_evidence.yml. The product (scan + CVE + playbook mapping)
+# decides what is vulnerable and which version is the fix; Ansible executes.
+#
+# Patch strategy (stage + cutover, same philosophy as
+# tomcat_update_with_evidence.yml / oracle_rac_patch_with_evidence.yml —
+# "deliver the environment exactly as it was found, minus the vulnerability"):
+#   1. Check (read-only): finds every file under SEARCH_ROOT whose basename
+#      matches JAR_NAME_PATTERN and lists each one (path, size, sha512).
+#      Nothing changes.
+#   2. Apply :: stage (service untouched): downloads NEW_JAR_URL to a per-run
+#      random temp path (ansible.builtin.tempfile — a predictable /tmp name
+#      let a local attacker pre-stage a file there, the same class of issue
+#      fixed in tomcat_update_with_evidence.yml per bedin #89 B5), verifies
+#      NEW_JAR_SHA512, and locates every match of JAR_NAME_PATTERN under
+#      SEARCH_ROOT whose basename is NOT already NEW_JAR_FILENAME (the
+#      idempotency rule: a location already carrying the target filename is
+#      treated as already converged, so re-running Check/Apply after a
+#      successful patch does not loop on the newly-installed jar even when
+#      JAR_NAME_PATTERN is broad, e.g. "log4j-core-*.jar"). A failure here —
+#      bad URL, checksum mismatch, disk full — never touches the service
+#      (same split rationale as tomcat_update_with_evidence.yml's bedin #89
+#      N1: stage and cutover are separate blocks from the start).
+#   3. Apply :: cutover (with automatic rollback): stops SERVICE_NAME, RENAMES
+#      (never deletes) each old jar to "<name>.bak-<timestamp>" in place,
+#      copies the new jar to every location a match was found (as
+#      NEW_JAR_FILENAME), restarts the service, confirms it reports active.
+#      If any step from the service stop onward fails, the rescue restores
+#      every renamed backup to its original name and restarts the service
+#      before re-raising — a host is never left with the service down just
+#      because the cutover failed (same contract as tomcat_update_with_evidence
+#      .yml's bedin #89 B1).
+#   4. Post-check: confirms the new jar is present with the correct checksum
+#      at every patched location, plus the reused SERVICE_CHECK block. Unlike
+#      Tomcat (whose -Dcatalina.base proves which tree the live JVM actually
+#      loaded), there is no generic equivalent of "which jar a JVM loaded"
+#      without assuming a specific application server — file-presence +
+#      checksum + service-health is the practical substitute (issue #93).
+#
+# Explicitly OUT of scope (issue #93): deciding which jar is vulnerable;
+# resolving application-level classpath/compatibility breakage from the jar
+# swap (any error from that shows up in the service's own logs, not in this
+# playbook's checks); Java applications outside a plain filesystem tree (e.g.
+# a jar packed inside a container image).
+#
+# Stages:
+#   1. Build dynamic in-memory inventory from HOSTNAMES (localhost play).
+#   2. Pre-check, optional patch and post-check on each target host. Fact
+#      gathering and the evidence directory run inside the rescue block, so
+#      an unreachable or rejected host never stops the wave (same pattern as
+#      the yum/apt/tomcat playbooks).
+#   3. Emit a consolidated samurai_shield_result JSON block on stdout.
+#   4. Re-check hosts that were unreachable and re-fail every host whose
+#      execution ended failed (same pattern as the other playbooks' last play).
+#
+# Extra-vars contract — see java_library_patch.sample_extra_vars.yml
+# ============================================================================
+
+- name: "SamurAI :: java-library-patch :: build dynamic inventory from HOSTNAMES"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    # Distinct internal names: a play var that references its own name
+    # resolves to ITSELF when the extra-var is absent and dies with
+    # "recursive loop detected in template". Survey blanks arrive as ''
+    # (defined), so the fallback is `(X | default('') | trim) or Y`, never
+    # `default(Y)` (same pattern as tomcat_update_with_evidence.yml).
+    samurai_hostnames_raw: "{{ HOSTNAMES | default('') | string | trim }}"
+    samurai_action_raw: "{{ (ACTION | default('') | string | trim) or 'Check' }}"
+    samurai_search_root_raw: "{{ SEARCH_ROOT | default('') | string | trim }}"
+    samurai_jar_pattern_raw: "{{ JAR_NAME_PATTERN | default('') | string | trim }}"
+    samurai_service_name_raw: "{{ SERVICE_NAME | default('') | string | trim }}"
+    samurai_new_jar_url_raw: "{{ NEW_JAR_URL | default('') | string | trim }}"
+    samurai_new_jar_sha512_raw: "{{ NEW_JAR_SHA512 | default('') | string | trim }}"
+    samurai_new_jar_filename_raw: "{{ NEW_JAR_FILENAME | default('') | string | trim }}"
+  tasks:
+    - name: "Validate HOSTNAMES is provided"
+      ansible.builtin.fail:
+        msg: "HOSTNAMES extra-var is required (single host, IP, or space/comma-separated list)."
+      when: samurai_hostnames_raw == ''
+
+    - name: "Validate ACTION is Check or Apply"
+      ansible.builtin.fail:
+        msg: "Invalid ACTION '{{ samurai_action_raw }}'. Allowed values: Check, Apply."
+      when: samurai_action_raw not in ['Check', 'Apply']
+
+    - name: "Validate SEARCH_ROOT is provided"
+      ansible.builtin.fail:
+        msg: >-
+          SEARCH_ROOT extra-var is required: the absolute path of the directory
+          tree to search (e.g. the Tomcat CATALINA_HOME, or any other Java
+          application's root). This playbook does not guess it.
+      when: samurai_search_root_raw == '' or samurai_search_root_raw is not match('^/')
+
+    # bedin #94 B6 — `/` is a syntactically valid absolute path but turns a
+    # single run into a full-filesystem scan (and, on Apply, a full-filesystem
+    # rename/replace of every match); it is never a sane SEARCH_ROOT.
+    - name: "Reject SEARCH_ROOT = / (never a sane search root)"
+      ansible.builtin.fail:
+        msg: "SEARCH_ROOT cannot be '/' — point it at the specific application tree to search."
+      when: samurai_search_root_raw is match('^/+$')
+
+    - name: "Validate JAR_NAME_PATTERN is provided"
+      ansible.builtin.fail:
+        msg: >-
+          JAR_NAME_PATTERN extra-var is required (a glob, e.g. "log4j-core-*.jar")
+          — never a single path, because the same jar can exist in more than one
+          place (a server's own lib/ AND WEB-INF/lib of N webapps).
+      when: samurai_jar_pattern_raw == ''
+
+    # bedin #94 B6 — the `find` module's `patterns` splits on comma, so a
+    # pattern containing one silently becomes TWO independent globs (e.g.
+    # "log4j-core-*.jar,log4j-api-*.jar" would match and replace BOTH jars
+    # with the same NEW_JAR_* — never the intent of a single JAR_NAME_PATTERN
+    # value). A pattern not ending in ".jar" also matches this playbook's own
+    # "<name>.bak-<timestamp>" backups on the very next run, since they keep
+    # the old basename as a prefix. A pattern with a path separator makes no
+    # sense either — `find` matches patterns against the basename only.
+    - name: "Validate JAR_NAME_PATTERN is a single, well-formed .jar glob"
+      ansible.builtin.fail:
+        msg: >-
+          JAR_NAME_PATTERN must be a single glob ending in ".jar", with no comma
+          (one pattern only — "find" would silently split a CSV into several)
+          and no "/" (patterns match the basename only), and starting with a literal
+          character (never a bare wildcard such as "*.jar", which would replace every
+          jar in the tree). Got: '{{ samurai_jar_pattern_raw }}'.
+      when: >-
+        ',' in samurai_jar_pattern_raw
+        or '/' in samurai_jar_pattern_raw
+        or samurai_jar_pattern_raw is not match('.*\.jar$')
+        or samurai_jar_pattern_raw is not match('^[A-Za-z0-9_]')
+
+    - name: "Validate SERVICE_NAME is provided"
+      ansible.builtin.fail:
+        msg: >-
+          SERVICE_NAME extra-var is required: the systemd unit to restart after
+          the jar swap, so the JVM's classloader picks up the new jar.
+      when: samurai_service_name_raw == ''
+
+    - name: "Validate NEW_JAR_URL is provided for Apply"
+      ansible.builtin.fail:
+        msg: "NEW_JAR_URL extra-var is required when ACTION=Apply (the exact replacement jar)."
+      when:
+        - samurai_action_raw == 'Apply'
+        - samurai_new_jar_url_raw == ''
+
+    - name: "Validate NEW_JAR_SHA512 is provided for Apply"
+      ansible.builtin.fail:
+        msg: >-
+          NEW_JAR_SHA512 extra-var is required when ACTION=Apply — this
+          playbook never installs a jar without verifying its checksum first.
+      when:
+        - samurai_action_raw == 'Apply'
+        - samurai_new_jar_sha512_raw == ''
+
+    # bedin #94 B6/B1 — a syntactically-valid-looking but malformed checksum
+    # (wrong length, stray characters) must be rejected HERE, before it is
+    # trusted both as the get_url checksum gate AND as the convergence
+    # comparison value (B1) that decides whether a location still needs the
+    # patch at all.
+    - name: "Validate NEW_JAR_SHA512 looks like a real sha512 (128 hex chars)"
+      ansible.builtin.fail:
+        msg: "NEW_JAR_SHA512 must be exactly 128 hexadecimal characters. Got: '{{ samurai_new_jar_sha512_raw }}'."
+      when:
+        - samurai_action_raw == 'Apply'
+        - samurai_new_jar_sha512_raw is not match('^[0-9a-fA-F]{128}$')
+
+    - name: "Validate NEW_JAR_FILENAME is provided for Apply"
+      ansible.builtin.fail:
+        msg: >-
+          NEW_JAR_FILENAME extra-var is required when ACTION=Apply — the exact
+          filename the replacement jar will be installed as (may differ from
+          the old name, e.g. log4j-core-2.17.1.jar replacing
+          log4j-core-2.14.1.jar).
+      when:
+        - samurai_action_raw == 'Apply'
+        - samurai_new_jar_filename_raw == ''
+
+    # bedin #94 B6 — NEW_JAR_FILENAME is a bare filename, never a path: a
+    # value like "../../../etc/cron.d/x" would make the cutover's own `copy`
+    # (dest: "{{ dirname }}/{{ jl_new_jar_filename }}") write OUTSIDE the
+    # matched directory, as root. No "/" and no ".." anywhere in the value.
+    - name: "Validate NEW_JAR_FILENAME is a bare .jar filename (no path traversal)"
+      ansible.builtin.fail:
+        msg: >-
+          NEW_JAR_FILENAME must be a bare filename ending in ".jar" — no "/" and
+          no "..". Got: '{{ samurai_new_jar_filename_raw }}'.
+      when:
+        - samurai_action_raw == 'Apply'
+        - >-
+          '/' in samurai_new_jar_filename_raw
+          or '..' in samurai_new_jar_filename_raw
+          or samurai_new_jar_filename_raw is not match('^[A-Za-z0-9._-]+\.jar$')
+
+    - name: "Publish resolved run parameters as localhost facts"
+      ansible.builtin.set_fact:
+        samurai_action: "{{ samurai_action_raw }}"
+        samurai_search_root: "{{ samurai_search_root_raw }}"
+        samurai_jar_pattern: "{{ samurai_jar_pattern_raw }}"
+        samurai_service_name: "{{ samurai_service_name_raw }}"
+        samurai_new_jar_url: "{{ samurai_new_jar_url_raw }}"
+        samurai_new_jar_sha512: "{{ samurai_new_jar_sha512_raw }}"
+        samurai_new_jar_filename: "{{ samurai_new_jar_filename_raw }}"
+
+    - name: "Parse HOSTNAMES into a list (tolerant: space OR comma)"
+      ansible.builtin.set_fact:
+        samurai_target_hosts: >-
+          {{ samurai_hostnames_raw.replace(',', ' ').split() | reject('equalto', '') | list }}
+
+    - name: "Add hosts to dynamic group samurai_java_lib_targets"
+      ansible.builtin.add_host:
+        name: "{{ item }}"
+        groups: samurai_java_lib_targets
+      loop: "{{ samurai_target_hosts }}"
+      changed_when: false
+
+    - name: "Show resolved target hosts"
+      ansible.builtin.debug:
+        msg: >-
+          Targets: {{ samurai_target_hosts | join(', ') }} | ACTION={{ samurai_action }} |
+          SEARCH_ROOT={{ samurai_search_root }} | JAR_NAME_PATTERN={{ samurai_jar_pattern }}
+
+
+- name: "SamurAI :: java-library-patch :: pre-check, patch and post-check"
+  hosts: samurai_java_lib_targets
+  gather_facts: false
+  become: true
+  serial: "{{ SERIAL_BATCH | default(1) }}"
+
+  vars:
+    # Distinct internal names (jl_*), none of them shadowing an extra-var of
+    # the same name: Ansible's extra-vars always outrank play vars (the exact
+    # fix applied to tomcat_update_with_evidence.yml / linux_yum/apt per
+    # bedin #89 B8/B17 — applied here from the start, per issue #93).
+    jl_action: "{{ hostvars['localhost']['samurai_action'] | default('Check') }}"
+    jl_search_root: "{{ hostvars['localhost']['samurai_search_root'] }}"
+    jl_jar_pattern: "{{ hostvars['localhost']['samurai_jar_pattern'] }}"
+    jl_service_name: "{{ hostvars['localhost']['samurai_service_name'] }}"
+    jl_new_jar_url: "{{ hostvars['localhost']['samurai_new_jar_url'] | default('') }}"
+    jl_new_jar_sha512: "{{ hostvars['localhost']['samurai_new_jar_sha512'] | default('') }}"
+    jl_new_jar_filename: "{{ hostvars['localhost']['samurai_new_jar_filename'] | default('') }}"
+    EVIDENCE_BASE_DIR: "{{ hostvars['localhost']['EVIDENCE_BASE_DIR'] | default('/var/tmp/samurai-shield/java-library-patch') }}"
+
+    samurai_warnings: []
+    samurai_errors: []
+
+    # Mesmo contrato SERVICE_CHECK dos demais playbooks (reaproveitado tal e
+    # qual, já na forma pós-#91 do tomcat_update_with_evidence.yml: systemctl
+    # list-units, mensagens em inglês/ASCII — issue #93 pediu explicitamente
+    # para não precisar de retrofit depois).
+    svc_check_enabled: "{{ ((SERVICE_CHECK | default('') | string | trim) or 'on') | lower not in ['off', 'false', 'no', '0', 'disabled'] }}"
+    svc_settle_seconds: "{{ ((SERVICE_SETTLE_SECONDS | default('') | string | trim) or '120') | int }}"
+    svc_wait_retries: "{{ [((svc_settle_seconds | int) / 10) | round(0, 'ceil') | int, 1] | max + 1 }}"
+    svc_ignore_default:
+      - "user@*"
+      - "user-runtime-dir@*"
+      - "session-*"
+      - "apt-daily*"
+      - "packagekit*"
+      - "dnf-makecache*"
+      - "fwupd*"
+      - "man-db*"
+      - "systemd-hostnamed"
+      - "systemd-timedated"
+      - "systemd-localed"
+      - "systemd-fsckd"
+    svc_ignore_list: "{{ svc_ignore_default + ((SERVICE_IGNORE | default('') | string).split(',') | map('trim') | reject('equalto', '') | list) }}"
+    svc_ignore_ports: "{{ svc_ignore_list | select('match', '^[0-9]+$') | list }}"
+    svc_ignore_regex: >-
+      {%- set ns = namespace(r=[]) -%}
+      {%- for e in svc_ignore_list | reject('match', '^[0-9]+$') -%}
+      {%- set ns.r = ns.r + [((e[:-1] | regex_escape) if e.endswith('*') else ((e | regex_escape) ~ '([.]service)?$'))] -%}
+      {%- endfor -%}
+      ^({{ ns.r | join('|') }})
+    svc_units_cmd: |
+      systemctl list-units --type=service --state=running --plain --no-legend --no-pager | awk 'NF {print "running " $1}'
+      systemctl list-units --type=service --state=failed --plain --no-legend --no-pager | awk 'NF {print "failed " $1}'
+      systemctl list-unit-files --type=service --state=static --no-legend --no-pager | awk 'NF {print "static " $1}'
+    svc_unit_lines: "{{ svc_src.stdout_lines | default([]) }}"
+    svc_static_units: "{{ svc_unit_lines | select('match', '^static ') | map('regex_replace', '^static ', '') | list }}"
+    svc_running_from_facts: >-
+      {{ svc_unit_lines | select('match', '^running ') | map('regex_replace', '^running ', '')
+         | reject('in', svc_static_units) | reject('match', svc_ignore_regex, true) | unique | sort }}
+    svc_failed_from_facts: >-
+      {{ svc_unit_lines | select('match', '^failed ') | map('regex_replace', '^failed ', '')
+         | reject('match', svc_ignore_regex, true) | unique | sort }}
+    svc_listeners_from_ss: >-
+      {%- set ns = namespace(out=[]) -%}
+      {%- for l in (svc_ss_src.stdout_lines | default([])) -%}
+      {%- set f = l.split() -%}
+      {%- if f | length >= 4 and f[0] != 'State' -%}
+      {%- set item = {'port': f[3].split(':')[-1], 'process': (l.split('"')[1] if '"' in l else 'unknown')} -%}
+      {%- if item not in ns.out and item.port not in svc_ignore_ports and not (item.process is match(svc_ignore_regex, true)) -%}
+      {%- set ns.out = ns.out + [item] -%}
+      {%- endif -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ ns.out | sort(attribute='port') }}
+
+  tasks:
+
+    - name: "Capture execution start timestamp (UTC, controller-side)"
+      ansible.builtin.set_fact:
+        execution_started_at: "{{ '%Y-%m-%dT%H:%M:%SZ' | strftime(utc=true) }}"
+        execution_timestamp: "{{ '%Y%m%dT%H%M%S' | strftime(utc=true) }}"
+
+    # ------------------------------------------------------------------------
+    # Tudo que toca o host vive DENTRO do block, inclusive o fact gathering e
+    # o diretório de evidência: toda falha por host atravessa rescue/always
+    # (summary.json + samurai_shield_result estruturados, status=failed, erro
+    # legível) e é re-falhada no play 4 (mesmo padrão dos demais playbooks).
+    # ------------------------------------------------------------------------
+    - name: "Pre-check + optional patch + post-check"
+      block:
+
+        # ---- Phase 1: reachability + evidence directory ---------------------
+        - name: "Gather facts (an unreachable host is recorded, not fatal to the wave)"
+          ansible.builtin.setup:
+          ignore_unreachable: true
+          register: samurai_facts
+
+        - name: "Record that the host was unreachable"
+          ansible.builtin.set_fact:
+            samurai_unreachable: true
+          when: samurai_facts.unreachable | default(false)
+
+        - name: "Fail when the host is unreachable"
+          ansible.builtin.fail:
+            msg: >-
+              Host {{ inventory_hostname }} is unreachable:
+              {{ samurai_facts.msg | default('connection failed') }}
+          when: samurai_unreachable | default(false)
+
+        - name: "Build evidence directory path"
+          ansible.builtin.set_fact:
+            evidence_dir: "{{ EVIDENCE_BASE_DIR }}/{{ inventory_hostname }}/{{ execution_timestamp }}"
+
+        - name: "Create evidence directory"
+          ansible.builtin.file:
+            path: "{{ evidence_dir }}"
+            state: directory
+            mode: '0750'
+
+        - name: "Mark evidence directory as ready"
+          ansible.builtin.set_fact:
+            evidence_dir_ready: true
+
+        # ---- Phase 2: platform compatibility (systemd Linux only; the jar
+        # itself is JVM-portable, the service restart is not) ----------------
+        - name: "Assert target is Linux with systemd"
+          ansible.builtin.assert:
+            that:
+              - ansible_system == 'Linux'
+              - ansible_service_mgr == 'systemd'
+            fail_msg: >-
+              Unsupported target {{ inventory_hostname }} ({{ ansible_system | default('unknown') }},
+              service manager {{ ansible_service_mgr | default('unknown') }}). This playbook requires
+              Linux with systemd.
+
+        - name: "Capture system info"
+          ansible.builtin.set_fact:
+            system_info:
+              hostname: "{{ ansible_hostname }}"
+              fqdn: "{{ ansible_fqdn }}"
+              primary_ip: "{{ ansible_default_ipv4.address | default('unknown') }}"
+              distribution: "{{ ansible_distribution }}"
+              distribution_version: "{{ ansible_distribution_version }}"
+              architecture: "{{ ansible_architecture }}"
+              started_at: "{{ execution_started_at }}"
+              run_user: "{{ ansible_user_id | default('root') }}"
+
+        - name: "Write system_before.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/system_before.txt"
+            mode: '0640'
+            content: |
+              hostname: {{ system_info.hostname }}
+              fqdn: {{ system_info.fqdn }}
+              primary_ip: {{ system_info.primary_ip }}
+              distribution: {{ system_info.distribution }} {{ system_info.distribution_version }}
+              architecture: {{ system_info.architecture }}
+              search_root: {{ jl_search_root }}
+              jar_name_pattern: {{ jl_jar_pattern }}
+              service_name: {{ jl_service_name }}
+              started_at: {{ system_info.started_at }}
+              run_user: {{ system_info.run_user }}
+
+        # ---- disk space (the replacement jar needs room beside the old one,
+        # same evidence item as tomcat_update_with_evidence.yml) -------------
+        - name: "Collect disk usage"
+          ansible.builtin.command: df -P -k
+          register: df_out
+          changed_when: false
+
+        - name: "Write disk_before.txt"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/disk_before.txt"
+            mode: '0640'
+            content: "{{ df_out.stdout }}\n"
+
+        # ---- Phase 3: find every match of JAR_NAME_PATTERN under
+        # SEARCH_ROOT (recursive — server lib/ and any webapp's WEB-INF/lib
+        # are just paths under the same tree, issue #93's unification). This
+        # runs for BOTH Check and Apply: Check lists everything found;
+        # Apply additionally filters out locations already carrying
+        # NEW_JAR_FILENAME (the idempotency rule — see header comment). -----
+
+        # bedin #94 B5 — `find` only WARNS (`skipped_paths`) when a path does
+        # not exist; it never fails the task. A wrong SEARCH_ROOT (typo, a
+        # mapping pointing at a stale CATALINA_HOME) would silently return
+        # zero matches, which reads identically to "already patched" —
+        # `already_current` on Apply, `patch_needed: false` on Check. Stat it
+        # explicitly first so a non-existent root is a loud failure, never a
+        # quiet false negative.
+        # `follow: true` (bedin #94 N1): SEARCH_ROOT is routinely a symlink
+        # (the stable `<parent>/current-<SERVICE_NAME>` path that
+        # tomcat_update_with_evidence.yml maintains) and `find` follows it.
+        - name: "Stat SEARCH_ROOT"
+          ansible.builtin.stat:
+            path: "{{ jl_search_root }}"
+            follow: true
+          register: jl_search_root_stat
+
+        - name: "Fail when SEARCH_ROOT does not exist or is not a directory"
+          ansible.builtin.fail:
+            msg: >-
+              SEARCH_ROOT '{{ jl_search_root }}' does not exist (or is not a directory)
+              on {{ inventory_hostname }} — refusing to report zero matches as if the
+              tree had been searched and found clean.
+          when: not jl_search_root_stat.stat.exists or not (jl_search_root_stat.stat.isdir | default(false))
+
+        - name: "Find every jar matching JAR_NAME_PATTERN under SEARCH_ROOT"
+          ansible.builtin.find:
+            paths: "{{ jl_search_root }}"
+            patterns: "{{ jl_jar_pattern }}"
+            recurse: true
+            file_type: file
+          register: jl_matches_found
+
+        # The sha512 comes from `stat`, not `find`: the ansible-core in the AAP
+        # execution environment is older than 2.19 and its `find` has no
+        # `checksum_algorithm` parameter (only sha1), which failed the first
+        # real run on vm1. `stat` has had it for much longer. `follow: false`
+        # so a symlink is hashed as the link it is, never as its target.
+        - name: "Hash each match with sha512 (lstat, do not follow)"
+          ansible.builtin.stat:
+            path: "{{ item['path'] }}"
+            follow: false
+            checksum_algorithm: sha512
+          loop: "{{ jl_matches_found.files | default([]) }}"
+          loop_control:
+            label: "{{ item['path'] }}"
+          register: jl_match_stats
+
+        - name: "Reset matches_before to an explicit structured list"
+          ansible.builtin.set_fact:
+            jl_matches_before: []
+
+        - name: "Append each match as a structured entry (path/size/checksum)"
+          ansible.builtin.set_fact:
+            jl_matches_before: >-
+              {{ jl_matches_before + [{'path': item.stat.path, 'size': item.stat.size, 'checksum': item.stat.checksum}] }}
+          loop: "{{ jl_match_stats.results | default([]) }}"
+          loop_control:
+            label: "{{ item['item']['path'] }}"
+          when: item.stat.exists and (item.stat.isreg | default(false))
+
+        - name: "Write matches_before.json"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/matches_before.json"
+            mode: '0640'
+            content: "{{ jl_matches_before | to_nice_json }}\n"
+
+        # ---- idempotency filter (bedin #94 B1 — fixes a real security bug):
+        # a location is treated as already converged ONLY when its basename
+        # equals NEW_JAR_FILENAME **and** its checksum equals NEW_JAR_SHA512.
+        # Name alone is not proof of content: the first version of this
+        # filter excluded any match merely NAMED like the target (e.g. a
+        # vulnerable "log4j-core.jar" sitting where the fix is also named
+        # "log4j-core.jar") from `jl_locations_to_patch` — the job reported
+        # `already_current` and the vulnerable jar was never touched. Applied
+        # identically on Check and Apply (not gated on `jl_action`) so a
+        # Check run after a successful Apply reports the newly-installed jar
+        # as converged too, instead of re-flagging it via the same broad
+        # JAR_NAME_PATTERN that matched the version it just replaced. A
+        # same-name match with the WRONG checksum is NOT in `jl_converged_
+        # paths`, so it stays in `jl_locations_to_patch` and gets patched. --
+        - name: "Identify the exact, verified-converged locations (name AND checksum match)"
+          ansible.builtin.set_fact:
+            jl_converged_paths: >-
+              {{
+                jl_matches_before
+                | selectattr('path', 'match', '^.*/' ~ (jl_new_jar_filename | regex_escape) ~ '$')
+                | selectattr('checksum', 'equalto', jl_new_jar_sha512 | lower)
+                | map(attribute='path') | list
+              }}
+          when:
+            - jl_new_jar_filename != ''
+            - jl_new_jar_sha512 != ''
+
+        - name: "Identify locations still needing the patch"
+          ansible.builtin.set_fact:
+            jl_locations_to_patch: >-
+              {{ jl_matches_before | rejectattr('path', 'in', jl_converged_paths) | list }}
+          when: jl_converged_paths is defined
+
+        - name: "Default locations-to-patch to every match (no NEW_JAR_FILENAME/SHA512 given)"
+          ansible.builtin.set_fact:
+            jl_locations_to_patch: "{{ jl_matches_before }}"
+          when: jl_locations_to_patch is not defined
+
+        - name: "Determine whether a patch is needed"
+          ansible.builtin.set_fact:
+            jl_update_needed: "{{ (jl_locations_to_patch | length) > 0 }}"
+
+        # ---- #86-style serviços e portas em escuta (antes) — TODO o host,
+        # não só a unit do SERVICE_NAME, mesmo motivo dos demais playbooks. --
+        - name: "Service check :: pre-change baseline"
+          when:
+            - svc_check_enabled | bool
+          block:
+            - name: "Service check :: collect services (before)"
+              ansible.builtin.shell: "{{ svc_units_cmd }}"
+              register: svc_facts_before
+              changed_when: false
+              failed_when: false
+
+            - name: "Service check :: collect TCP listeners (before)"
+              ansible.builtin.command:
+                argv: [ss, -ltnp]
+              register: svc_ss_before
+              changed_when: false
+              failed_when: false
+
+            - name: "Service check :: select the pre-change sources"
+              ansible.builtin.set_fact:
+                svc_src: "{{ svc_facts_before }}"
+                svc_ss_src: "{{ svc_ss_before }}"
+
+            - name: "Service check :: record the pre-change baseline"
+              ansible.builtin.set_fact:
+                svc_running_before: "{{ svc_running_from_facts }}"
+                svc_failed_before: "{{ svc_failed_from_facts }}"
+                svc_listeners_before: "{{ svc_listeners_from_ss }}"
+
+            - name: "Write services_before.json"
+              ansible.builtin.copy:
+                dest: "{{ evidence_dir }}/services_before.json"
+                mode: '0640'
+                content: >-
+                  {{ {'running_services': svc_running_before, 'failed_services': svc_failed_before,
+                      'tcp_listeners': svc_listeners_before} | to_nice_json }}
+
+            - name: "Service check :: baseline result (Check)"
+              ansible.builtin.set_fact:
+                svc_check_result:
+                  status: baseline_only
+                  running_services_before: "{{ svc_running_before }}"
+                  tcp_listeners_before: "{{ svc_listeners_before }}"
+                  failed_services_before: "{{ svc_failed_before }}"
+                svc_check_message:
+                  - >-
+                    SERVICE BASELINE RECORDED (ACTION=Check) on {{ inventory_hostname }}:
+                    {{ svc_running_before | length }} running service(s) and
+                    {{ svc_listeners_before | length }} listening TCP port(s).
+                    The post-change check runs on ACTION=Apply.
+              when: jl_action == 'Check'
+
+            - name: "Service check :: result"
+              ansible.builtin.debug:
+                msg: "{{ svc_check_message }}"
+              when: jl_action == 'Check'
+          rescue:
+            - name: "Service check :: record that the check could not be completed (before)"
+              ansible.builtin.set_fact:
+                svc_check_result:
+                  status: error
+                  phase: before
+                  error: "{{ ansible_failed_result.msg | default('unknown error') }}"
+                svc_check_message:
+                  - >-
+                    WARNING: the service check could not be completed on {{ inventory_hostname }}
+                    (pre-change snapshot). The job was NOT marked as failed because of this; check the host's
+                    services manually. Error: {{ ansible_failed_result.msg | default('unknown error') }}
+
+            - name: "Service check :: record the warning in the summary (before)"
+              ansible.builtin.set_fact:
+                samurai_warnings: "{{ samurai_warnings + svc_check_message }}"
+
+            - name: "Service check :: result (before)"
+              ansible.builtin.debug:
+                msg: "{{ svc_check_message }}"
+
+        # ------------------------------------------------------------------
+        # Phase 4: Apply — download, stage, cut over (skipped in Check mode,
+        # and skipped entirely when no location needs the patch). Everything
+        # from the service stop onward lives in its OWN block/rescue: a
+        # failure anywhere there triggers an automatic rollback before
+        # re-raising to the outer block's rescue (same split as
+        # tomcat_update_with_evidence.yml's bedin #89 N1/B1, applied here
+        # from the start per issue #93).
+        # ------------------------------------------------------------------
+        - name: "Patch :: stage (download + verify, service untouched)"
+          when:
+            - jl_action == 'Apply'
+            - jl_update_needed | bool
+          block:
+            # ---- download to a per-run random path (same rationale as
+            # tomcat_update_with_evidence.yml bedin #89 B5): a fixed name
+            # under /tmp let a local attacker pre-stage a file there. --------
+            - name: "Patch :: create a unique temp path for the replacement jar"
+              ansible.builtin.tempfile:
+                suffix: ".jar"
+              register: jl_new_jar_tmp
+
+            - name: "Patch :: download the replacement jar (checksum verified)"
+              ansible.builtin.get_url:
+                url: "{{ jl_new_jar_url }}"
+                dest: "{{ jl_new_jar_tmp.path }}"
+                checksum: "sha512:{{ jl_new_jar_sha512 }}"
+                force: true
+                mode: '0600'
+
+            # ---- bedin #94 B3 — security pre-flight, still read-only, still
+            # before the service is stopped. The cutover below uses `mv -T`
+            # (never follows/enters a directory symlink at the target name),
+            # but a backup-name COLLISION or a destination that is ALREADY a
+            # symlink/directory must fail the run outright rather than let
+            # `mv -T` fail confusingly mid-cutover (with the service already
+            # stopped). Each location's own backup name is predictable
+            # ("<jar>.bak-<timestamp-to-the-second>"), and `WEB-INF/lib` is
+            # commonly writable by the service's own (non-root) user — a
+            # symlink planted there under either name would otherwise make
+            # root's `mv` write attacker-controlled content to an
+            # attacker-chosen path. -------------------------------------------
+            - name: "Patch :: stat each location's backup-name destination (lstat, do not follow)"
+              ansible.builtin.stat:
+                path: "{{ item['path'] }}.bak-{{ execution_timestamp }}"
+                follow: false
+              loop: "{{ jl_locations_to_patch }}"
+              loop_control:
+                label: "{{ item['path'] }}"
+              register: jl_backup_name_stats
+
+            - name: "Patch :: fail when a backup-name destination already exists (collision or planted symlink)"
+              ansible.builtin.fail:
+                msg: >-
+                  {{ item.item['path'] }}.bak-{{ execution_timestamp }} already exists on
+                  {{ inventory_hostname }} — refusing to rename onto it (possible stale backup
+                  or a planted symlink).
+              loop: "{{ jl_backup_name_stats.results }}"
+              loop_control:
+                label: "{{ item.item['path'] }}"
+              when: item.stat.exists
+
+            - name: "Patch :: stat each location's final destination (lstat, do not follow)"
+              ansible.builtin.stat:
+                path: "{{ (item['path'] | dirname) }}/{{ jl_new_jar_filename }}"
+                follow: false
+              loop: "{{ jl_locations_to_patch }}"
+              loop_control:
+                label: "{{ item['path'] }}"
+              register: jl_destination_stats
+
+            - name: "Patch :: fail when a destination already exists as a symlink or directory"
+              ansible.builtin.fail:
+                msg: >-
+                  {{ (item.item['path'] | dirname) }}/{{ jl_new_jar_filename }} on {{ inventory_hostname }}
+                  already exists and is not a regular file (symlink or directory) — refusing to
+                  write through it.
+              loop: "{{ jl_destination_stats.results }}"
+              loop_control:
+                label: "{{ item.item['path'] }}"
+              when:
+                - item.stat.exists
+                - not (item.stat.isreg | default(false))
+
+            # ---- bedin #94 B2 — a destination that ALREADY HELD A DIFFERENT
+            # FILE before this run (same directory, same target filename, but
+            # not the jar this run is about to replace — e.g. a leftover from
+            # an earlier partial attempt) must be backed up too, not silently
+            # overwritten: the rollback below restores THIS backup instead of
+            # deleting the file outright, so a pre-existing destination is
+            # never lost just because the cutover failed. A destination that
+            # IS the same path as the matched jar (the common case: no name
+            # change, or the B1 same-name-different-content case) is excluded
+            # here — the "rename old jar to backup" step already covers it. --
+            - name: "Patch :: reset the pre-existing-destinations list"
+              ansible.builtin.set_fact:
+                jl_preexisting_destinations: []
+
+            - name: "Patch :: record each destination that pre-exists and differs from the matched jar"
+              ansible.builtin.set_fact:
+                jl_preexisting_destinations: "{{ jl_preexisting_destinations + [item.stat.path] }}"
+              loop: "{{ jl_destination_stats.results }}"
+              loop_control:
+                label: "{{ item.item['path'] }}"
+              when:
+                - item.stat.exists
+                - item.stat.path != item.item['path']
+
+            # bedin #94 N2 — the same destination can be recorded twice (two
+            # old jars in one directory) or can itself be one of the matches
+            # being replaced (a broad pattern also matching a wrong-content
+            # file already named like the target). Either way the cutover
+            # would `mv` the same path twice and fail after the stop. Dedupe,
+            # and drop what the "rename each old jar" step already backs up.
+            - name: "Patch :: dedupe pre-existing destinations and drop those already being replaced"
+              ansible.builtin.set_fact:
+                jl_preexisting_destinations: >-
+                  {{ jl_preexisting_destinations | unique
+                     | difference(jl_locations_to_patch | map(attribute='path') | list) }}
+          rescue:
+            # ---- nothing here touched the service: no rollback needed, just
+            # clean up the partial download before re-raising. ---------------
+            - name: "Stage failed :: remove the partial download"
+              ansible.builtin.file:
+                path: "{{ jl_new_jar_tmp.path }}"
+                state: absent
+              ignore_errors: true
+              when: jl_new_jar_tmp is defined
+
+            - name: "Re-raise the stage failure"
+              ansible.builtin.fail:
+                msg: "{{ ansible_failed_result.msg | default('unknown failure during stage') }}"
+
+        - name: "Patch :: cut over"
+          when:
+            - jl_action == 'Apply'
+            - jl_update_needed | bool
+          block:
+            # ---- stop the service BEFORE the cutover — anything that goes
+            # wrong from here on triggers the rescue's rollback below. -------
+            - name: "Patch :: stop the service"
+              ansible.builtin.systemd:
+                name: "{{ jl_service_name }}"
+                state: stopped
+
+            # ---- bedin #94 B2 — back up a PRE-EXISTING destination (a
+            # different file than the one being replaced, already sitting
+            # under the target filename before this run) BEFORE it gets
+            # overwritten by the copy below, so the rollback can restore it
+            # instead of deleting it. `-T --` (bedin #94 B3): `mv` never
+            # follows/enters a directory symlink at the target name, so a
+            # symlink planted at the backup name cannot redirect the move. ---
+            - name: "Patch :: back up each pre-existing destination that differs from the matched jar"
+              ansible.builtin.command:
+                argv: [mv, "-T", "--", "{{ item }}", "{{ item }}.bak-{{ execution_timestamp }}"]
+              loop: "{{ jl_preexisting_destinations }}"
+              loop_control:
+                label: "{{ item }}"
+
+            # ---- rename (never delete) each old jar to a timestamped backup
+            # in place, per issue #93's "deliver the environment exactly as
+            # it was found" philosophy (same as
+            # tomcat_update_with_evidence.yml's conf/webapps migration and
+            # oracle_rac_patch_with_evidence.yml). `-T --` per bedin #94 B3,
+            # same rationale as above. ------------------------------------
+            - name: "Patch :: rename each old jar to a timestamped backup"
+              ansible.builtin.command:
+                argv: [mv, "-T", "--", "{{ item['path'] }}", "{{ item['path'] }}.bak-{{ execution_timestamp }}"]
+              loop: "{{ jl_locations_to_patch }}"
+              loop_control:
+                label: "{{ item['path'] }}"
+              register: jl_backups
+
+            - name: "Patch :: copy the replacement jar to every patched location"
+              ansible.builtin.copy:
+                src: "{{ jl_new_jar_tmp.path }}"
+                dest: "{{ (item['path'] | dirname) }}/{{ jl_new_jar_filename }}"
+                remote_src: true
+                mode: '0644'
+              loop: "{{ jl_locations_to_patch }}"
+              loop_control:
+                label: "{{ item['path'] }}"
+
+            - name: "Patch :: remove the downloaded artifact (no longer needed, never left behind)"
+              ansible.builtin.file:
+                path: "{{ jl_new_jar_tmp.path }}"
+                state: absent
+
+            - name: "Patch :: start the service on the replacement jar"
+              ansible.builtin.systemd:
+                name: "{{ jl_service_name }}"
+                state: started
+
+            - name: "Patch :: wait for the service to report active"
+              ansible.builtin.command:
+                argv: [systemctl, is-active, "{{ jl_service_name }}"]
+              register: jl_service_wait
+              changed_when: false
+              failed_when: false
+              until: jl_service_wait.stdout | default('') | trim == 'active'
+              retries: "{{ svc_wait_retries }}"
+              delay: 10
+
+            - name: "Patch :: fail when the service did not come up active"
+              ansible.builtin.fail:
+                msg: >-
+                  {{ jl_service_name }} did not reach 'active' on {{ inventory_hostname }} after the
+                  jar swap (last state: {{ jl_service_wait.stdout | default('unknown') | trim }}).
+              when: (jl_service_wait.stdout | default('') | trim) != 'active'
+          rescue:
+            # ---- automatic rollback (same contract as
+            # tomcat_update_with_evidence.yml's bedin #89 B1): a host must
+            # never be left with its service down just because the cutover
+            # failed. ignore_errors on every restore/cleanup below because not
+            # every location necessarily got as far as being touched before
+            # the failure. `-T --` per bedin #94 B3 (never follow/enter a
+            # directory symlink). Order matters for bedin #94 B2: restore a
+            # pre-existing destination BEFORE touching anything at the SAME
+            # path via the old-jar restore, and never delete a destination
+            # that pre-existed before this run — only one that this run itself
+            # created. ----------------------------------------------------
+            - name: "Rollback :: restore each pre-existing destination that differed from the matched jar"
+              ansible.builtin.command:
+                argv: [mv, "-T", "--", "{{ item }}.bak-{{ execution_timestamp }}", "{{ item }}"]
+              loop: "{{ jl_preexisting_destinations }}"
+              loop_control:
+                label: "{{ item }}"
+              ignore_errors: true
+
+            # bedin #94 N3 — a destination that is itself one of the matches
+            # (see N2) is NOT something this run created: when the failure
+            # comes before it was renamed (e.g. at the service stop) deleting
+            # it here would destroy the original. The old-jar restore below
+            # puts the right content back whenever a backup exists.
+            - name: "Rollback :: remove the replacement jar this run created (destination did not pre-exist)"
+              ansible.builtin.file:
+                path: "{{ (item['path'] | dirname) }}/{{ jl_new_jar_filename }}"
+                state: absent
+              loop: "{{ jl_locations_to_patch }}"
+              loop_control:
+                label: "{{ item['path'] }}"
+              ignore_errors: true
+              when:
+                - jl_new_jar_filename != ''
+                - ((item['path'] | dirname) ~ '/' ~ jl_new_jar_filename) not in (jl_locations_to_patch | map(attribute='path') | list)
+                - ((item['path'] | dirname) ~ '/' ~ jl_new_jar_filename) not in jl_preexisting_destinations
+
+            - name: "Rollback :: restore each old jar backup to its original name"
+              ansible.builtin.command:
+                argv: [mv, "-T", "--", "{{ item['path'] }}.bak-{{ execution_timestamp }}", "{{ item['path'] }}"]
+              loop: "{{ jl_locations_to_patch }}"
+              loop_control:
+                label: "{{ item['path'] }}"
+              ignore_errors: true
+              register: jl_rollback_restores
+
+            - name: "Rollback :: restart the service on the restored jars"
+              ansible.builtin.systemd:
+                name: "{{ jl_service_name }}"
+                state: restarted
+              ignore_errors: true
+              register: jl_rollback_restart
+
+            - name: "Rollback :: wait for the service to report active again"
+              ansible.builtin.command:
+                argv: [systemctl, is-active, "{{ jl_service_name }}"]
+              register: jl_rollback_wait
+              changed_when: false
+              failed_when: false
+              until: jl_rollback_wait.stdout | default('') | trim == 'active'
+              retries: 6
+              delay: 10
+              ignore_errors: true
+
+            - name: "Rollback :: record the outcome"
+              ansible.builtin.set_fact:
+                jl_rollback_outcome: >-
+                  {{
+                    'rolled_back_ok' if (jl_rollback_wait.stdout | default('') | trim) == 'active'
+                    else 'rollback_failed_service_down'
+                  }}
+
+            - name: "Re-raise the original failure, with the rollback outcome attached"
+              ansible.builtin.fail:
+                msg: >-
+                  Java library patch failed on {{ inventory_hostname }}:
+                  {{ ansible_failed_result.msg | default('unknown failure') }}.
+                  Rollback: {{ jl_rollback_outcome }}
+                  {{ '(service is back up on the original jars)' if jl_rollback_outcome == 'rolled_back_ok'
+                     else '— THE SERVICE IS DOWN, manual intervention required NOW.' }}
+
+        # ------------------------------------------------------------------
+        # Phase 5: Post-check (only meaningful after a real Apply) — confirm
+        # the replacement jar is present with the right checksum at every
+        # patched location. No live-process proof exists generically for an
+        # arbitrary Java app (unlike Tomcat's -Dcatalina.base check) — issue
+        # #93 names file-presence + checksum + service-health as the
+        # practical substitute.
+        # ------------------------------------------------------------------
+        # bedin #94 B4 — the post-check must PROVE content, not just presence:
+        # `follow: false` so a symlink at the target name is caught (never
+        # trusted as "the file"), `checksum_algorithm: sha512` so the result
+        # is directly comparable to NEW_JAR_SHA512 (the contract's own
+        # algorithm — sha256 told us nothing about whether THIS is the right
+        # jar), and the fail condition below checks the checksum too, not
+        # only existence.
+        - name: "Stat the replacement jar at every patched location (lstat, do not follow)"
+          ansible.builtin.stat:
+            path: "{{ (item['path'] | dirname) }}/{{ jl_new_jar_filename }}"
+            follow: false
+            checksum_algorithm: sha512
+          loop: "{{ jl_locations_to_patch }}"
+          loop_control:
+            label: "{{ item['path'] }}"
+          register: jl_post_stats
+          when:
+            - jl_action == 'Apply'
+            - jl_update_needed | bool
+
+        - name: "Fail when the replacement jar is missing, not a regular file, or has the wrong checksum"
+          ansible.builtin.fail:
+            msg: >-
+              {{ jl_new_jar_filename }} at {{ item['item']['path'] | dirname }} on
+              {{ inventory_hostname }} is {{ 'missing' if not item.stat.exists
+                 else ('not a regular file' if not (item.stat.isreg | default(false))
+                 else 'present but its checksum does not match NEW_JAR_SHA512') }}
+              after the patch.
+          loop: "{{ jl_post_stats.results | default([]) }}"
+          loop_control:
+            label: "{{ item['item']['path'] }}"
+          when:
+            - jl_action == 'Apply'
+            - jl_update_needed | bool
+            - >-
+              not item.stat.exists
+              or not (item.stat.isreg | default(false))
+              or (item.stat.checksum | default('')) != (jl_new_jar_sha512 | lower)
+
+        - name: "Record locations patched and their post-patch checksum"
+          ansible.builtin.set_fact:
+            jl_locations_patched: >-
+              {{
+                (jl_post_stats.results | default([]))
+                | map(attribute='stat')
+                | map(attribute='path')
+                | list
+              }}
+          when:
+            - jl_action == 'Apply'
+            - jl_update_needed | bool
+
+        # bedin #94 B4 — `matches_after.json` must be valid JSON in EVERY
+        # branch, including Check mode and "no patch needed": a bare string
+        # with no quotes is not JSON, and this file is evidence a human or a
+        # downstream tool is expected to parse.
+        - name: "Write matches_after.json"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/matches_after.json"
+            mode: '0640'
+            content: >-
+              {{
+                (jl_locations_patched if (jl_action == 'Apply' and (jl_update_needed | bool))
+                 else {'status': 'not_applicable_check_mode_or_no_patch_needed'})
+                | to_nice_json
+              }}
+
+        # ---- #86-style serviços e portas em escuta (depois do restart) ----
+        # Mesmo bloco de comparação dos demais playbooks, reaproveitado tal e
+        # qual (issue #93 pediu que isto não precisasse de retrofit depois).
+        - name: "Service check :: compare with the pre-change baseline"
+          when:
+            - jl_action == 'Apply'
+            - svc_check_enabled | bool
+            - svc_running_before is defined
+            - (svc_check_result.status | default('')) != 'error'
+          block:
+            - name: "Service check :: wait for the services that were running before"
+              ansible.builtin.command:
+                argv: "{{ ['systemctl', 'is-active'] + svc_running_before }}"
+              register: svc_wait
+              changed_when: false
+              failed_when: false
+              until: >-
+                (svc_wait.stdout_lines | default([]) | reject('equalto', 'active') | list | length == 0)
+                or ((svc_wait.attempts | default(1) | int) >= (svc_wait_retries | int))
+              retries: "{{ svc_wait_retries }}"
+              delay: 10
+              when: svc_running_before | length > 0
+
+            - name: "Service check :: collect services (after the wait)"
+              ansible.builtin.shell: "{{ svc_units_cmd }}"
+              register: svc_facts_wait
+              changed_when: false
+              failed_when: false
+
+            - name: "Service check :: select the post-change source"
+              ansible.builtin.set_fact:
+                svc_src: "{{ svc_facts_wait }}"
+
+            - name: "Service check :: list services that did not come back"
+              ansible.builtin.set_fact:
+                svc_down: "{{ svc_running_before | difference(svc_running_from_facts) }}"
+
+            - name: "Service check :: try to start the services that did not come back"
+              ansible.builtin.service:
+                name: "{{ item }}"
+                state: started
+              loop: "{{ svc_down | default([]) }}"
+              register: svc_restart
+              failed_when: false
+
+            - name: "Service check :: wait for the services the playbook started"
+              ansible.builtin.command:
+                argv: "{{ ['systemctl', 'is-active'] + svc_down }}"
+              register: svc_wait_started
+              changed_when: false
+              failed_when: false
+              until: >-
+                (svc_wait_started.stdout_lines | default([]) | reject('equalto', 'active') | list | length == 0)
+                or ((svc_wait_started.attempts | default(1) | int) >= 3)
+              retries: 3
+              delay: 5
+              when: svc_down | default([]) | length > 0
+
+            - name: "Service check :: collect services (after)"
+              ansible.builtin.shell: "{{ svc_units_cmd }}"
+              register: svc_facts_final
+              changed_when: false
+              failed_when: false
+              when: svc_down | default([]) | length > 0
+
+            - name: "Service check :: collect TCP listeners (after)"
+              ansible.builtin.command:
+                argv: [ss, -ltnp]
+              register: svc_ss_after
+              changed_when: false
+              failed_when: false
+
+            - name: "Service check :: select the post-change sources"
+              ansible.builtin.set_fact:
+                svc_src: "{{ svc_facts_wait if (svc_facts_final is skipped) else svc_facts_final }}"
+                svc_ss_src: "{{ svc_ss_after }}"
+
+            - name: "Service check :: record the post-change state"
+              ansible.builtin.set_fact:
+                svc_running_after: "{{ svc_running_from_facts }}"
+                svc_failed_after: "{{ svc_failed_from_facts }}"
+                svc_listeners_after: "{{ svc_listeners_from_ss }}"
+
+            - name: "Service check :: compute what changed"
+              ansible.builtin.set_fact:
+                svc_still_down: >-
+                  {%- set ns = namespace(out=[]) -%}
+                  {%- for s in (svc_running_before | difference(svc_running_after)) -%}
+                  {%- set r = (svc_restart.results | default([]) | selectattr('item', 'defined') | selectattr('item', 'equalto', s) | list) -%}
+                  {%- set err = ((r[0].msg | default('')) if r else '') | string | trim -%}
+                  {%- if not r -%}
+                  {%- set err = 'no start was attempted (the service went down after the check)' -%}
+                  {%- elif not err -%}
+                  {%- set err = 'the start was accepted, but the service did not stay running; see journalctl -u ' ~ s -%}
+                  {%- endif -%}
+                  {%- set ns.out = ns.out + [{'service': s, 'error': err}] -%}
+                  {%- endfor -%}
+                  {{ ns.out }}
+                svc_restored: "{{ (svc_down | default([])) | intersect(svc_running_after) }}"
+                svc_listeners_lost: >-
+                  {%- set ports = svc_listeners_after | map(attribute='port') | list -%}
+                  {%- set ns = namespace(out=[]) -%}
+                  {%- for l in svc_listeners_before -%}
+                  {%- set n_before = svc_listeners_before | selectattr('process', 'equalto', l.process) | list | length -%}
+                  {%- set n_after = svc_listeners_after | selectattr('process', 'equalto', l.process) | list | length -%}
+                  {%- if l.port not in ports and (l.process == 'unknown' or n_after < n_before) -%}
+                  {%- set ns.out = ns.out + [l] -%}
+                  {%- endif -%}
+                  {%- endfor -%}
+                  {{ ns.out }}
+                svc_failed_new: "{{ svc_failed_after | difference(svc_failed_before) | difference(svc_running_before) }}"
+
+            - name: "Service check :: build the result and the message"
+              ansible.builtin.set_fact:
+                svc_check_result:
+                  status: "{{ 'ok' if (svc_still_down | length == 0 and svc_listeners_lost | length == 0 and svc_failed_new | length == 0) else 'warning' }}"
+                  running_services_before: "{{ svc_running_before }}"
+                  tcp_listeners_before: "{{ svc_listeners_before }}"
+                  services_restored_by_playbook: "{{ svc_restored }}"
+                  services_still_down: "{{ svc_still_down }}"
+                  tcp_listeners_lost: "{{ svc_listeners_lost }}"
+                  failed_services_before: "{{ svc_failed_before }}"
+                  failed_services_after: "{{ svc_failed_after }}"
+                  services_newly_failed: "{{ svc_failed_new }}"
+                svc_check_message: >-
+                  {%- set ns = namespace(issues=[]) -%}
+                  {%- for s in svc_still_down -%}
+                  {%- set ns.issues = ns.issues + ['service ' ~ s.service ~ ': was running before the change and did not come back, not even after the playbook tried to start it. Start attempt error: ' ~ s.error] -%}
+                  {%- endfor -%}
+                  {%- for l in svc_listeners_lost -%}
+                  {%- set ns.issues = ns.issues + ['TCP port ' ~ l.port ~ ' (process ' ~ l.process ~ '): was listening before the change and is not anymore. If the port belongs to a service listed above, it follows from it; otherwise it is an application outside the service manager, which the playbook does not restart. Check the application.'] -%}
+                  {%- endfor -%}
+                  {%- for s in svc_failed_new -%}
+                  {%- set ns.issues = ns.issues + ['service ' ~ s ~ ': started failing after the change (it was not failed before).'] -%}
+                  {%- endfor -%}
+                  {%- set restored = ['Started by the playbook because they did not come back on their own (running now): ' ~ (svc_restored | join(', '))] if svc_restored else [] -%}
+                  {%- if ns.issues -%}
+                  {{ ['WARNING: SERVICES NOT AS BEFORE THE CHANGE on ' ~ inventory_hostname ~ '. The job was NOT marked as failed because of this. Check on the host why each item below happened:'] + ns.issues + restored }}
+                  {%- else -%}
+                  {{ ['SERVICES VALIDATED on ' ~ inventory_hostname ~ ': the ' ~ (svc_running_before | length) ~ ' service(s) and ' ~ (svc_listeners_before | length) ~ ' listening TCP port(s) that were active before the change are active again, as before the change.'] + restored }}
+                  {%- endif -%}
+
+            - name: "Service check :: record the warning in the summary"
+              ansible.builtin.set_fact:
+                samurai_warnings: "{{ samurai_warnings + svc_check_message[1:] | reject('match', '^Started by the playbook') | list }}"
+              when: svc_check_result.status == 'warning'
+
+            - name: "Service check :: result"
+              ansible.builtin.debug:
+                msg: "{{ svc_check_message }}"
+
+            - name: "Write services_check.json"
+              ansible.builtin.copy:
+                dest: "{{ evidence_dir }}/services_check.json"
+                mode: '0640'
+                content: "{{ svc_check_result | to_nice_json }}"
+          rescue:
+            - name: "Service check :: record that the check could not be completed (after)"
+              ansible.builtin.set_fact:
+                svc_check_result:
+                  status: error
+                  phase: after
+                  error: "{{ ansible_failed_result.msg | default('unknown error') }}"
+                svc_check_message:
+                  - >-
+                    WARNING: the service check could not be completed on {{ inventory_hostname }}
+                    (post-change comparison). The job was NOT marked as failed because of this; check the host's
+                    services manually. Error: {{ ansible_failed_result.msg | default('unknown error') }}
+
+            - name: "Service check :: record the warning in the summary (after)"
+              ansible.builtin.set_fact:
+                samurai_warnings: "{{ samurai_warnings + svc_check_message }}"
+
+            - name: "Service check :: result (after)"
+              ansible.builtin.debug:
+                msg: "{{ svc_check_message }}"
+
+      rescue:
+        - name: "Capture rescue error"
+          ansible.builtin.set_fact:
+            samurai_errors: "{{ samurai_errors + [ansible_failed_result.msg | default('unknown failure')] }}"
+
+        - name: "Mark execution status as failed"
+          ansible.builtin.set_fact:
+            execution_status: "failed"
+
+      always:
+        - name: "Compute final execution status"
+          ansible.builtin.set_fact:
+            execution_status: >-
+              {{
+                execution_status | default(
+                  'check_completed' if jl_action == 'Check'
+                  else ('patched' if (jl_update_needed | default(false) | bool)
+                        else 'already_current')
+                )
+              }}
+
+        - name: "Capture finished_at timestamp"
+          ansible.builtin.set_fact:
+            execution_finished_at: "{{ '%Y-%m-%dT%H:%M:%SZ' | strftime(utc=true) }}"
+
+        - name: "Build per-host summary"
+          ansible.builtin.set_fact:
+            host_summary:
+              tool: "SamurAI Shield"
+              playbook: "java_library_patch_with_evidence"
+              host: "{{ inventory_hostname }}"
+              fqdn: "{{ ansible_fqdn | default(inventory_hostname) }}"
+              primary_ip: "{{ ansible_default_ipv4.address | default('unknown') }}"
+              search_root: "{{ jl_search_root | default('unknown') }}"
+              jar_name_pattern: "{{ jl_jar_pattern | default('unknown') }}"
+              service_name: "{{ jl_service_name | default('unknown') }}"
+              action: "{{ jl_action | default('Check') }}"
+              matches_before: "{{ jl_matches_before | default([]) }}"
+              patch_needed: "{{ jl_update_needed | default(false) | bool }}"
+              patch_applied: "{{ (jl_action | default('') == 'Apply' and (jl_update_needed | default(false) | bool)) }}"
+              locations_patched: "{{ jl_locations_patched | default([]) }}"
+              new_jar_filename: "{{ jl_new_jar_filename | default('not_applicable') }}"
+              rollback_outcome: "{{ jl_rollback_outcome | default('not_applicable') }}"
+              service_check: "{{ svc_check_result | default({'status': ('disabled' if not (svc_check_enabled | bool) else 'not_run')}) }}"
+              evidence_dir: "{{ evidence_dir if (evidence_dir_ready | default(false)) else 'not_created' }}"
+              unreachable: "{{ samurai_unreachable | default(false) | bool }}"
+              started_at: "{{ execution_started_at }}"
+              finished_at: "{{ execution_finished_at }}"
+              status: "{{ execution_status }}"
+              warnings: "{{ samurai_warnings }}"
+              errors: "{{ samurai_errors }}"
+
+        - name: "Write summary.json"
+          ansible.builtin.copy:
+            dest: "{{ evidence_dir }}/summary.json"
+            mode: '0640'
+            content: "{{ host_summary | to_nice_json }}\n"
+          register: samurai_summary_write
+          ignore_errors: true
+          ignore_unreachable: true
+          when:
+            - evidence_dir_ready | default(false)
+            - not (samurai_unreachable | default(false) | bool)
+
+        - name: "Record that summary.json could not be written"
+          ansible.builtin.set_fact:
+            execution_status: "failed"
+            samurai_unreachable: "{{ ((samurai_unreachable | default(false) | bool) or (samurai_summary_write.unreachable | default(false))) | bool }}"
+            samurai_errors: >-
+              {{ samurai_errors + ['summary.json could not be written to ' + evidence_dir + ': '
+                 + (samurai_summary_write.msg | default('unknown error'))] }}
+          when: samurai_summary_write is failed or (samurai_summary_write.unreachable | default(false))
+
+        - name: "Reflect the summary.json write failure in the published summary"
+          ansible.builtin.set_fact:
+            host_summary: >-
+              {{ host_summary | combine({'status': execution_status, 'errors': samurai_errors,
+                                         'unreachable': samurai_unreachable | bool}) }}
+          when: samurai_summary_write is failed or (samurai_summary_write.unreachable | default(false))
+
+        - name: "Publish per-host summary as run stat"
+          ansible.builtin.set_stats:
+            data:
+              samurai_java_library_patch_summary: "{{ host_summary }}"
+            per_host: true
+            aggregate: false
+
+
+- name: "SamurAI :: java-library-patch :: emit consolidated stdout JSON"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: "Collect per-host summaries"
+      ansible.builtin.set_fact:
+        all_host_summaries: >-
+          {{
+            groups['samurai_java_lib_targets'] | default([])
+            | map('extract', hostvars, 'host_summary')
+            | select('defined') | list
+          }}
+
+    - name: "Compute consolidated status"
+      ansible.builtin.set_fact:
+        consolidated_status: >-
+          {{
+            'failed' if (all_host_summaries | selectattr('status', 'equalto', 'failed') | list | length) > 0
+            else 'completed'
+          }}
+
+    - name: "Build consolidated samurai_shield_result block"
+      ansible.builtin.set_fact:
+        samurai_shield_result:
+          playbook: "java_library_patch_with_evidence"
+          action: "{{ samurai_action | default('Check') }}"
+          jar_name_pattern: "{{ samurai_jar_pattern | default('unknown') }}"
+          status: "{{ consolidated_status }}"
+          host_count: "{{ all_host_summaries | length }}"
+          hosts: "{{ all_host_summaries }}"
+
+    - name: "Print consolidated SamurAI Shield JSON to stdout"
+      ansible.builtin.debug:
+        msg: "{{ {'samurai_shield_result': samurai_shield_result} | to_nice_json }}"
+
+    - name: "Service check :: consolidated result"
+      ansible.builtin.debug:
+        msg: >-
+          {%- set ns = namespace(out=[]) -%}
+          {%- for h in all_host_summaries -%}
+          {%- set sc = h.service_check | default({}) -%}
+          {%- set st = sc.status | default('not_run') -%}
+          {%- if st == 'ok' -%}
+          {%- set line = h.host ~ ': SERVICES VALIDATED (as before the change)' -%}
+          {%- elif st == 'warning' -%}
+          {%- set line = h.host ~ ': WARNING, services not as before the change (see the host warnings); the job did not fail because of it' -%}
+          {%- elif st == 'baseline_only' -%}
+          {%- set line = h.host ~ ': service baseline recorded (ACTION=Check)' -%}
+          {%- elif st == 'error' -%}
+          {%- set line = h.host ~ ': WARNING, the service check could not be completed (see the host warnings); the job did not fail because of it' -%}
+          {%- elif st == 'disabled' -%}
+          {%- set line = h.host ~ ': service check disabled (SERVICE_CHECK=off)' -%}
+          {%- else -%}
+          {%- set line = h.host ~ ': service check not executed (the host execution ended before this point)' -%}
+          {%- endif -%}
+          {%- set ns.out = ns.out + [line] -%}
+          {%- endfor -%}
+          {{ ns.out }}
+
+    - name: "Publish consolidated result as workflow stat"
+      ansible.builtin.set_stats:
+        data:
+          samurai_shield_result: "{{ samurai_shield_result }}"
+        aggregate: false
+        per_host: false
+
+
+- name: "SamurAI :: java-library-patch :: fail hosts whose execution ended failed"
+  hosts: samurai_java_lib_targets
+  gather_facts: false
+  tasks:
+    - name: "Re-check hosts that were unreachable in play 2"
+      ansible.builtin.ping:
+      when: samurai_unreachable | default(false) | bool
+
+    - name: "Fail the host when execution ended failed (structured evidence already published)"
+      ansible.builtin.fail:
+        msg: >-
+          Java library patch failed on {{ inventory_hostname }}:
+          {{ (samurai_errors | join(' | ')) if (samurai_errors | default([]) | length) > 0 else 'see summary.json' }}
+      when: (execution_status | default('')) == 'failed'
