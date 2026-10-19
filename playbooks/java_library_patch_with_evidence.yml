@@ -831,6 +831,11 @@
                 label: "{{ item }}"
               ignore_errors: true
 
+            # bedin #94 N3 — a destination that is itself one of the matches
+            # (see N2) is NOT something this run created: when the failure
+            # comes before it was renamed (e.g. at the service stop) deleting
+            # it here would destroy the original. The old-jar restore below
+            # puts the right content back whenever a backup exists.
             - name: "Rollback :: remove the replacement jar this run created (destination did not pre-exist)"
               ansible.builtin.file:
                 path: "{{ (item['path'] | dirname) }}/{{ jl_new_jar_filename }}"
@@ -841,7 +846,7 @@
               ignore_errors: true
               when:
                 - jl_new_jar_filename != ''
-                - ((item['path'] | dirname) ~ '/' ~ jl_new_jar_filename) != item['path']
+                - ((item['path'] | dirname) ~ '/' ~ jl_new_jar_filename) not in (jl_locations_to_patch | map(attribute='path') | list)
                 - ((item['path'] | dirname) ~ '/' ~ jl_new_jar_filename) not in jl_preexisting_destinations
 
             - name: "Rollback :: restore each old jar backup to its original name"
