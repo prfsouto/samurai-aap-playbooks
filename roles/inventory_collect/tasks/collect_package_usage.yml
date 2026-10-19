@@ -1,7 +1,8 @@
 ---
 # Sonda de uso de pacote: somente leitura, sem become, sem mutação, isolada das outras medições.
-# Roda só quando a validação RHEL ligou o request à candidata B (``inventory_collect_package_usage_request``
-# com ``enabled``, incluído por collect_linux.yml). Qualquer falha — request que não confere, sonda com
+# Roda quando o request está ligado (``inventory_collect_package_usage_request`` com ``enabled``, incluído
+# por collect_linux.yml): na candidata B, pela validação RHEL; na origem A, quando a coleta pede as omissões
+# a medir (uso e dependentes reversos). Qualquer falha — request que não confere, sonda com
 # erro, saída que não é JSON — termina no rescue: o recibo não é mesclado e as medições de serviço e de
 # configuração seguem como estão. O recibo entra em ``inventory_collect_functional`` (a variável que
 # publish.yml serializa) por combine, sem sobrescrever as outras chaves. Gravar em ``ansible_facts``
