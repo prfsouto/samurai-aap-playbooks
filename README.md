@@ -452,7 +452,9 @@ against the full extra-vars/unreachable-host pipeline with
 lab hosts (`vm1-samurai`/`vm2-samurai`) through a disposable AAP Job
 Template. A live `ACTION=Apply` run against `vm1-samurai` through a disposable AAP Job
 Template (`9.0.50` → `9.0.121`, with the `-Dcatalina.base` live-process
-verification confirming the new install) was also executed and succeeded.
+verification confirming the new install) was also executed and succeeded; the
+lab host had no systemd unit for Tomcat, so a minimal one was created for that
+test.
 
 > [!NOTE]
 > Scope boundary: this playbook patches the **Tomcat server component**
@@ -495,12 +497,13 @@ as it was found" philosophy as `tomcat_update_with_evidence.yml` /
    Nothing changes.
 2. `Apply :: stage` — service untouched: downloads `NEW_JAR_URL` to a per-run
    random temp path (checksum-verified against `NEW_JAR_SHA512`, never
-   installed without one) and locates every match whose basename is **not**
-   already `NEW_JAR_FILENAME` (the idempotency rule — a location already
-   carrying the target filename is treated as converged, so a broad
-   `JAR_NAME_PATTERN` like `log4j-core-*.jar` does not loop on the jar it
-   just installed on a previous run). A failure here — bad URL, checksum
-   mismatch — never touches the service.
+   installed without one) and locates every match that is **not** already
+   converged (the idempotency rule — a location counts as converged only when
+   its basename is `NEW_JAR_FILENAME` **and** its sha512 equals
+   `NEW_JAR_SHA512`, so a broad `JAR_NAME_PATTERN` like `log4j-core-*.jar`
+   does not loop on the jar it just installed on a previous run, while a
+   vulnerable jar that merely carries the target name is still replaced).
+   A failure here — bad URL, checksum mismatch — never touches the service.
 3. `Apply :: cutover` — stops `SERVICE_NAME`, **renames** (never deletes)
    each old jar to `<name>.bak-<timestamp>` in place, copies the replacement
    to every matched location, restarts the service, confirms it reports
@@ -546,9 +549,9 @@ never touches the service at all. A live `ACTION=Apply` run through AAP against
 `vm1-samurai`'s own surviving `log4j-core-2.14.1.jar` (the exact #92 finding,
 `SEARCH_ROOT=/opt/current-tomcat`, replaced by `log4j-core-2.17.1.jar`) also
 succeeded; a following `Check` confirmed the new jar's sha512 and the service
-active. That run showed that the AAP execution environment's `find` has no
-`checksum_algorithm` (ansible-core older than 2.19), so the sha512 of each
-match comes from `stat`.
+active. The first run through AAP showed that the AAP execution environment's
+`find` has no `checksum_algorithm` (ansible-core older than 2.19), so the
+sha512 of each match comes from `stat`.
 
 ### vulnerability_validation/linux_rpm_package.yml
 
