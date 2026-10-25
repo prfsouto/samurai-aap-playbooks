@@ -27,6 +27,9 @@
           - "{{ lookup('file', role_path + '/files/collect_rhel_package_usage.py') }}"
         stdin: "{{ inventory_collect_package_usage_request | to_json }}"
       become: false
+      # Teto da sonda inteira (unidades 60 s, dependentes reversos 30 s, dimensões 30 s + 10 s de prazo
+      # duro). Leitura presa sem interrupção (NFS parado) estoura aqui e cai no rescue, sem recibo.
+      timeout: 300
       register: inventory_collect_package_usage_raw
       changed_when: false
       failed_when: false
