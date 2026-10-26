@@ -1,0 +1,62 @@
+---
+# Nó `data_continuity_destination_reread` do workflow legado `samurai_rebuild_replace_workflow`.
+#
+# Roda entre `data_sync_final` e `cutover`, no candidato (B). Usa o mesmo role do caminho nativo
+# (`destination_reread.yml`): lista cada volume em B com o listador compartilhado e publica, no
+# canal top-level do workflow, `data_sync_destination_reread_results` (`samurai.destination_reread/v1`).
+# A ingestão está em ree_services/data_continuity_destination_reread_ingestion.py; o veredito é do domínio.
+#
+# O workflow legado não tem a geração da cópia FINAL que a releitura precisa para provar o volume: o
+# role entrega geração 0 e a ingestão RECUSA. Com o aceite de mutação desligado o nó é inerte. Ele está
+# morto no STG (o WFJT 57 nunca rodou); o caminho que vale é o nativo, do JT 68 (campaign_prepare.yml).
+#
+# O job segue no workflow porque o AAP não tem condição de nó por variável; a inércia fica na task.
+#
+# O guard do alvo é o de data_sync.yml, copiado de propósito: o estágio de escrita e este
+# nó de leitura têm de recusar o mesmo alvo. tests/test_data_continuity_destination_reread_
+# playbook_contract.py mantém os dois idênticos.
+
+- name: "SamurAI :: guard against an undefined target"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: "[destination_reread] Require a single, literal candidate host"
+      ansible.builtin.assert:
+        that:
+          - new_hostname is defined
+          - new_hostname | default('') | length > 0
+          - new_hostname is string
+          - new_hostname | regex_search('[:,;&!*?\[\]~()@\s]') is none
+          - new_hostname | lower not in ['localhost', '127.0.0.1', '::1', 'all', 'ungrouped']
+        fail_msg: >-
+          new_hostname must be a single literal host name. Got '{{ new_hostname | default("<undefined>") }}'.
+          Inventory patterns (`:`, `,`, `;`, `&`, `!`, wildcards), tag selectors (`~`),
+          regex selectors (`@`) and local aliases are refused: the reread reads the candidate's
+          destination volume, and a pattern that resolves to the execution node would read the
+          wrong disk.
+
+    - name: "[destination_reread] Require the target to be an individual host, never a group"
+      ansible.builtin.assert:
+        that:
+          - new_hostname not in groups
+          - new_hostname in hostvars
+        fail_msg: >-
+          new_hostname '{{ new_hostname }}' is not an individual host in this inventory.
+          {% if new_hostname in groups %}It is a GROUP with
+          {{ groups[new_hostname] | default([]) | length }} member(s).
+          {% else %}No such host exists.{% endif %}
+
+- name: "SamurAI :: relê o destino por conteúdo e publica as contagens"
+  hosts: "{{ new_hostname | default('samurai_data_sync_no_target') }}"
+  gather_facts: true
+  become: true
+  tasks:
+    - ansible.builtin.import_role:
+        name: data_sync
+        tasks_from: destination_reread
+
+    - name: "[destination_reread] Publish the readout on the legacy workflow channel"
+      ansible.builtin.set_stats:
+        aggregate: true
+        data:
+          data_sync_destination_reread_results: "{{ campaign_data_sync_destination_reread_results | default([]) }}"

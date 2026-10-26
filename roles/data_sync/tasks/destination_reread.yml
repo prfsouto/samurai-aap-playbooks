@@ -1,0 +1,190 @@
+---
+# ============================================================================
+# Releitura do destino: mede, em B, o que a cópia FINAL escreveu. Só lê.
+#
+# Roda em `campaign_prepare.yml`, depois do guard de montagem da FINAL, e só em Linux. Para cada
+# volume da FINAL (`data_sync_items`): monta o filesystem somente-leitura (ou faz bind somente-leitura
+# quando o guard já montou), lista com o listador compartilhado `samurai_file_listing` (o mesmo que
+# mede a referência na origem) e desmonta só o que este role montou.
+#
+# Não há manifesto nem referência aqui, e este role não compara nada. A comparação é da ingestão, com
+# a `source_reference` que o control plane gravou sob cerca na origem. Este role só mede.
+#
+# Saída: `campaign_data_sync_destination_reread_results`, uma entrada `samurai.destination_reread/v1`
+# por volume, na ordem do plano. O payload do membro a leva (campaign_publish_member.yml).
+#
+# Inerte sem `samurai_mutation_acceptance_required` ou sem volume da FINAL: o domínio decide pelo plano.
+#
+# Falta no lab, registrada: releitura de produção com amostragem não existe; Windows não tem leitor.
+# ============================================================================
+
+- name: "[destination_reread] Read the FINAL volumes only when the campaign requires mutation acceptance"
+  when:
+    - samurai_mutation_acceptance_required | default(false) | bool
+    - data_sync_items | default([]) | length > 0
+  tags: [data_sync, destination_reread]
+  block:
+    - name: "[destination_reread] Refuse a Windows candidate: this reader covers Linux volumes only"
+      ansible.builtin.assert:
+        that:
+          - not (samurai_candidate_windows | default(false) | bool)
+        fail_msg: destination reread has no Windows reader yet; the candidate is Windows.
+        quiet: true
+      tags: [guard]
+
+    - name: "[destination_reread] Require each FINAL volume to carry its identity and an absolute mount point"
+      ansible.builtin.assert:
+        that:
+          - item.stage | default('') == 'final'
+          - item.replication_execution_id | default('') | length > 0
+          - item.source_volume_stable_id | default('') | length > 0
+          - item.destination_volume_stable_id | default('') | length > 0
+          - item.mount_point | default('', true) is match('^/[A-Za-z0-9._/-]+$')
+        fail_msg: >-
+          each FINAL volume needs stage final, replication_execution_id, source and destination
+          stable identities and an absolute mount point. A reread without them cannot name the
+          volume it reads.
+        quiet: true
+      loop: "{{ data_sync_items }}"
+      loop_control:
+        label: "{{ item.source_volume_stable_id | default('?') }}"
+      tags: [guard]
+
+    - name: "[destination_reread] Observe the candidate's block devices"
+      samurai_destination_observation:
+        organization_id: "{{ organization_id | int }}"
+        provider: "{{ samurai_destination_provider }}"
+      become: true
+      register: data_sync_destination_reread_devices
+
+    # Mesma resolução do estágio de cópia e do guard: pelo id do volume no provider, nunca pelo
+    # caminho observado, que muda a cada reinicialização.
+    - name: "[destination_reread] Resolve each destination device through its provider evidence"
+      ansible.builtin.set_fact:
+        data_sync_destination_reread_devices_by_volume: >-
+          {{ data_sync_items
+             | map(attribute='destination_volume_stable_id')
+             | map('samurai_destination_observed_device',
+                   data_sync_destination_reread_devices.observation,
+                   samurai_destination_provider,
+                   data_sync_destination_bindings | default([]))
+             | map(attribute='name')
+             | list }}
+
+    - name: "[destination_reread] Start the readout list empty, in plan order"
+      ansible.builtin.set_fact:
+        campaign_data_sync_destination_reread_results: []
+
+    - name: "[destination_reread] Read and list each FINAL volume through a private read-only mount"
+      block:
+        # Montagem privada de leitura. Se o guard já montou o volume, faz bind somente-leitura dessa
+        # montagem. Senão monta ro com a opção que não replaya nem grava no log: xfs com norecovery,
+        # ext4 com noload. Outro tipo de filesystem é recusado. A primeira linha de stdout é o
+        # diretório privado, escrita antes de qualquer montagem, para a limpeza saber o que desmontar.
+        # A segunda é o modo usado.
+        - name: "[destination_reread] Mount each FINAL volume read-only in a private directory"
+          ansible.builtin.shell: |
+            set -uo pipefail
+            mount_dir="$(mktemp -d /run/samurai-reread.XXXXXX)"
+            echo "$mount_dir"
+            existing="$(findmnt -n -o TARGET -S "$DEVICE" 2>/dev/null | head -n 1)"
+            if [ -n "$existing" ]; then
+              mount --bind "$existing" "$mount_dir" || { echo "bind of existing mount failed" >&2; exit 3; }
+              mount -o remount,bind,ro,nosuid,nodev,noexec "$mount_dir" || { echo "read-only remount failed" >&2; exit 3; }
+              echo "bind-ro"
+              exit 0
+            fi
+            fs_type="$(blkid -p -s TYPE -o value "$DEVICE" 2>/dev/null || true)"
+            case "$fs_type" in
+              xfs) opts="ro,norecovery,nosuid,nodev,noexec" ;;
+              ext4) opts="ro,noload,nosuid,nodev,noexec" ;;
+              *) echo "refused: filesystem '${fs_type:-none}' has no read-only reread path" >&2; exit 3 ;;
+            esac
+            mount -o "$opts" "$DEVICE" "$mount_dir" || { echo "read-only mount failed" >&2; exit 3; }
+            echo "$opts"
+          args:
+            executable: /bin/bash
+          environment:
+            DEVICE: "{{ data_sync_destination_reread_devices_by_volume[item_index] }}"
+          loop: "{{ data_sync_items }}"
+          loop_control:
+            index_var: item_index
+            label: "{{ item.source_volume_stable_id | default('?') }}"
+          register: data_sync_destination_reread_mounts
+          changed_when: false
+          become: true
+
+        # O mesmo listador da referência da origem: caminho, tamanho e sha256 de cada arquivo regular,
+        # sem seguir link e sem atravessar dispositivo. Erro ou limite não derruba o nó: vira leitura
+        # com `error` ou `complete=false`, e o domínio a trata como NOT_MEASURED.
+        - name: "[destination_reread] List each mounted FINAL volume with the shared lister"
+          samurai_file_listing:
+            mount_point: "{{ data_sync_destination_reread_mounts.results[item_index].stdout_lines[0] }}"
+          loop: "{{ data_sync_items }}"
+          loop_control:
+            index_var: item_index
+            label: "{{ item.source_volume_stable_id | default('?') }}"
+          register: data_sync_destination_reread_listings
+          failed_when: false
+          become: true
+
+        - name: "[destination_reread] Stamp the measurement after every volume was listed"
+          ansible.builtin.command:
+            argv: ["date", "-u", "+%Y-%m-%dT%H:%M:%SZ"]
+          register: data_sync_destination_reread_clock
+          changed_when: false
+
+        # Uma entrada por volume, na ordem do plano. Identidade vem do item FINAL e da campanha;
+        # arquivos, completude e erro vêm da listagem; o instante vem da medição.
+        - name: "[destination_reread] Keep one samurai.destination_reread/v1 readout per volume"
+          ansible.builtin.set_fact:
+            campaign_data_sync_destination_reread_results: "{{ campaign_data_sync_destination_reread_results + [readout] }}"
+          loop: "{{ data_sync_items }}"
+          loop_control:
+            index_var: item_index
+            label: "{{ item.source_volume_stable_id | default('?') }}"
+          vars:
+            listing_result: "{{ data_sync_destination_reread_listings.results[item_index] }}"
+            listing_failed: "{{ listing_result.failed | default(false) | bool }}"
+            readout:
+              schema: samurai.destination_reread/v1
+              organization_id: "{{ organization_id | int }}"
+              replication_execution_id: "{{ item.replication_execution_id }}"
+              source_volume_stable_id: "{{ item.source_volume_stable_id }}"
+              destination_volume_stable_id: "{{ item.destination_volume_stable_id }}"
+              plan_revision: "{{ samurai_data_replication_plan_revision | int }}"
+              plan_digest: "{{ samurai_data_replication_plan_digest }}"
+              generation: "{{ campaign_data_sync_final_generation | default(0) | int }}"
+              candidate_instance_id: "{{ replacement.instance_id }}"
+              scope: ["."]
+              files: "{{ ((listing_result.listing | default({})).files | default([])) if not listing_failed else [] }}"
+              complete: "{{ (not listing_failed) and ((listing_result.listing | default({})).complete | default(false) | bool) }}"
+              error: "{{ listing_result.msg | default('listing failed') if listing_failed else none }}"
+              measured_at: "{{ data_sync_destination_reread_clock.stdout }}"
+              reader:
+                version: samurai-reread/2
+                mount_mode: "{{ data_sync_destination_reread_mounts.results[item_index].stdout_lines[1] | default('') }}"
+          tags: [data_sync, destination_reread]
+      always:
+        # Desmonta só o diretório privado que este role criou. A montagem do guard nunca é tocada:
+        # o bind é desfeito pelo umount do diretório privado, e só se ele estiver montado.
+        - name: "[destination_reread] Unmount only the private read-only mounts this role created"
+          ansible.builtin.shell: |
+            set -uo pipefail
+            case "$MOUNT_DIR" in
+              /run/samurai-reread.*) ;;
+              *) exit 0 ;;
+            esac
+            if mountpoint -q "$MOUNT_DIR"; then
+              umount "$MOUNT_DIR" || exit 3
+            fi
+            rmdir "$MOUNT_DIR" 2>/dev/null || true
+          args:
+            executable: /bin/bash
+          environment:
+            MOUNT_DIR: "{{ (item.stdout_lines | default([]) | first) | default('', true) }}"
+          loop: "{{ data_sync_destination_reread_mounts.results | default([]) }}"
+          loop_control:
+            label: "{{ item.item.source_volume_stable_id | default('?') }}"
+          changed_when: false
+          become: true

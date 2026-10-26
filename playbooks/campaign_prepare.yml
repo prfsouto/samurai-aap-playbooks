@@ -171,6 +171,9 @@
                   delegate_to: localhost
               vars:
                 campaign_copy_operation: open-final-delta
+            - name: "Keep the FINAL generation the Engine opened for the destination reread"
+              ansible.builtin.set_fact:
+                campaign_data_sync_final_generation: "{{ campaign_open_stage.json.generation | int }}"
             - ansible.builtin.include_role:
                 name: data_sync
             - name: "Mount each replicated filesystem after final copy"
@@ -190,6 +193,12 @@
                   CommandJson: "{{ {'organization_id': organization_id | int, 'provider': samurai_destination_provider, 'instance_id': replacement.instance_id, 'bindings': data_sync_destination_bindings, 'action': 'observe'} | to_json }}"
                 error_action: stop
               when: samurai_candidate_windows | bool
+
+            - name: "Read the FINAL volumes back read-only for the destination reread"
+              ansible.builtin.include_role:
+                name: data_sync
+                tasks_from: destination_reread
+              when: not (samurai_candidate_windows | bool)
 
         - name: "Record preparation completion without authorizing cutover"
           ansible.builtin.set_fact:
