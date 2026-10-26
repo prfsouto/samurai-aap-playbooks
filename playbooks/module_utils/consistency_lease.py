@@ -14,16 +14,19 @@ class FenceRejected(RuntimeError):
 
 
 class FilesystemFence:
-    def __init__(self, *, store, filesystem, boot_id):
+    def __init__(self, *, store, filesystem, boot_id, lister=None):
         self.store = store
         self.filesystem = filesystem
         self.boot_id = boot_id
+        self.lister = lister
 
     def execute(self, command):
         scope = command['scope']
         action = scope['action']
         mounts = sorted(command['parameters']['volumes'], key=lambda v: (v.get('stable_id', ''), v['mount_point']))
         self.filesystem.validate(mounts)
+        if action == 'measure_reference':
+            return self.measure_reference(scope, mounts)
         if action == 'inspect_candidate':
             if not all(self.filesystem.is_readonly(v['mount_point']) for v in mounts):
                 raise FenceRejected('Candidate data filesystem is writable before commit')
@@ -123,6 +126,66 @@ class FilesystemFence:
             record['state'] = 'TRANSFERRED'
             self.store.write(record)
         return self.evidence(record)
+
+    def measure_reference(self, scope, mounts):
+        """Lê o conteúdo da origem sob a cerca HELD, sem regravar o journal numa medição normal.
+
+        Repete as checagens do inspect, mas recusa boot trocado em vez de adotá-lo: a
+        adoção do inspect regrava o journal. A cerca é provada antes e depois da leitura.
+        Se ela cai nessa janela, grava UNCERTAIN e recusa, como o inspect faz: o estado
+        precisa registrar a queda, senão a próxima ação leria a cerca como íntegra.
+        """
+        record = self.store.read()
+        if not record or record['scope']['generation'] != scope['generation']:
+            raise FenceRejected('No matching fence generation')
+        if record['scope']['organization_id'] != scope['organization_id']:
+            raise FenceRejected('Foreign organization owns the source fence')
+        if record['scope']['plan_digest'] != scope['plan_digest']:
+            raise FenceRejected('Source fence plan mismatch')
+        if record.get('volumes') != mounts:
+            raise FenceRejected('Source fence volume manifest changed')
+        if record['state'] != 'HELD':
+            raise FenceRejected('Source fence is not held')
+        if record['boot_id'] != self.boot_id:
+            raise FenceRejected('Host reboot invalidated the observed fence')
+        if not self.filesystem.boot.verify(mounts):
+            raise FenceRejected('Persistent source boot fence was lost')
+        if record.get('protection') == 'boot_read_only' and not all(
+                self.filesystem.is_readonly(v['mount_point']) for v in mounts):
+            raise FenceRejected('Persistent source boot fence was lost')
+        self._prove_still_held(record, mounts)
+        measured_at = datetime.now(timezone.utc).isoformat()
+        volumes = []
+        for volume in mounts:
+            listing = self._list_volume(volume['mount_point'])
+            volumes.append(dict(listing, stable_id=volume['stable_id'], mount_point=volume['mount_point']))
+        self._prove_still_held(record, mounts)
+        result = self.evidence(record)
+        result['evidence'] = {'measured_at': measured_at, 'volumes': volumes}
+        return result
+
+    def _boot_read_only_holds(self, mounts):
+        return self.filesystem.boot.verify(mounts) and all(
+            self.filesystem.is_readonly(v['mount_point']) for v in mounts)
+
+    def _prove_still_held(self, record, mounts):
+        if record.get('protection') == 'boot_read_only':
+            # Sem re-freeze, a prova da cerca é o boot e o RO; repetida depois da leitura.
+            if not self._boot_read_only_holds(mounts):
+                raise FenceRejected('Persistent source boot fence was lost')
+            return
+        for volume in mounts:
+            if self.filesystem.freeze(volume['mount_point']):
+                record['state'] = 'UNCERTAIN'
+                self.store.write(record)
+                raise FenceRejected('Source fence was lost; refusing continuity proof')
+
+    def _list_volume(self, mount):
+        if self.lister is not None:
+            return self.lister(mount)
+        # Import tardio: no host o módulo chega como ansible.module_utils; nos testes, o listador é injetado.
+        from ansible.module_utils.file_listing import list_volume
+        return list_volume(mount)
 
     def acquire(self, command, record, mounts):
         if record and record['state'] in ('HELD', 'TRANSFERRED'):
