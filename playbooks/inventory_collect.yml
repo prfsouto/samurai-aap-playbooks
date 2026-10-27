@@ -114,6 +114,12 @@
       changed_when: false
       tags: [inventory_collect]
 
+    # D1: antes de qualquer conexão ao alvo. Falha aqui encerra a execução sem tocar no alvo.
+    - name: "[inventory_collect] Guard the launch inputs before reaching the target"
+      ansible.builtin.include_tasks:
+        file: inventory_collect_input_guard.yml
+      tags: [inventory_collect]
+
 - name: "SamurAI :: inventory_collect :: collect facts (read-only) → presigned S3 PUT"
   hosts: samurai_collect_target
   # gather_facts IS half the collection — the setup module captures OS, kernel,

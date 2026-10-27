@@ -45,6 +45,9 @@
   when: rhel_service_observation_request is defined and rhel_service_observation_request | length > 0
   tags: [inventory_collect, collect, functional]
 
+# ``inventory_collect_publish_deferred`` só adia: o playbook dedicado publica depois da sonda elevada. Ligado na
+# coleta comum, nada é publicado e a coleta falha na promoção; nunca dá privilégio.
 - name: "[inventory_collect] Publish the facts document (common to every arm)"
   ansible.builtin.include_tasks: publish.yml
+  when: not (inventory_collect_publish_deferred | default(false) | bool)
   tags: [inventory_collect, collect]

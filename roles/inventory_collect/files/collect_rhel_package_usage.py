@@ -1,6 +1,7 @@
-"""Uso de pacote pelo guest RHEL: leitura somente-leitura, sem root e sem executar binário.
+"""Uso de pacote pelo guest RHEL: leitura somente-leitura e sem executar binário.
 
-Roda com o usuário de coleta, sem become. Fontes permitidas:
+Roda com o usuário de coleta, sem become; só o playbook do template dedicado a eleva (ver C1 abaixo). Fontes
+permitidas:
 - systemctl list-units/show: metadados de unidade;
 - rpm -qf, rpm -q --requires, rpm -q --whatprovides: banco RPM, só leitura;
 - rpm -q, rpm -q --provides, rpm -ql, rpm -q --whatrequires: banco RPM, só leitura, só para os
@@ -96,9 +97,14 @@ Dimensões de uso (``usage_dimensions``) só existem quando o request de A as pe
 
 Na dúvida, ``not_measured``: falha parcial ou entrada que a sonda não resolve nunca vira ausência de uso.
 
-Coleta sem root (C1): o coletor roda sem ``become`` (``ec2-user``). Com isso, ``/proc`` de outro usuário e o spool
-de cron podem ficar ilegíveis, e ``processes`` e ``schedules`` só provam ``used``; ``not_used`` não sai nessas
-dimensões. Esse é o limite atual de cobertura, e a escolha de privilégio é do dono: a sonda não a muda.
+Privilégio da coleta (C1): por padrão o coletor roda sem ``become`` (``ec2-user``). Com isso, ``/proc`` de outro
+usuário e o spool de cron podem ficar ilegíveis, e ``processes`` e ``schedules`` só provam ``used``; ``not_used`` não
+sai nessas dimensões. Só o template dedicado ``samurai_inventory_source_privileged_probe`` (decisão do dono, D1) roda
+a sonda como root, com o request de omissões de A e o ``privileged_measurement`` desta execução. O recibo leva
+``effective_uid`` (o euid real da sonda), e o REE recusa recibo com root fora desse template. No código, root só muda uma coisa: com ``euid == 0``, ``_proc_restricted`` não marca a lista como restrita
+por ``hidepid``. A regra não muda: qualquer motivo de ``not_measured`` (processo ilegível, corte por limite, entrada sem resolução, código inline de
+interpretador, fonte ilegível) continua impedindo ``not_used``. Root não garante ``not_used``; só retira um motivo
+de ``not_measured``. A sonda não escolhe o privilégio; ela só o recebe.
 """
 import collections
 import datetime
@@ -1938,9 +1944,12 @@ def collect(request, run=command, fs=None):
     unresolved = [entry["unit"] for entry in units if entry["status"] != "resolved"]
     reasons = sorted(set(reasons))
     reverse = _reverse_request(request)
+    fs = fs or HostFiles()
     observation = {
         "schema": SCHEMA,
         "binding": request,
+        # Privilégio medido pela própria sonda, não declarado pelo launch: o REE confere com o template que lançou.
+        "effective_uid": fs.identity()["euid"],
         "observed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "service_mutations": 0,
         "configuration_writes": 0,
@@ -1962,7 +1971,7 @@ def collect(request, run=command, fs=None):
     dimensions = _dimension_request(request)
     if dimensions is not None:
         observation["usage_dimensions"] = _usage_dimensions(
-            dimensions, package_files, units, reasons, run, fs or HostFiles())
+            dimensions, package_files, units, reasons, run, fs)
     return observation
 
 

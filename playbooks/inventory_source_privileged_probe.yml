@@ -1,0 +1,73 @@
+---
+# Playbook do template samurai_inventory_source_privileged_probe (D1). Separa a coleta privilegiada da comum:
+#   1. recusa, em localhost, entrada fora do contrato do survey e o request de omissões de A sem o marcador
+#      desta execução (defesa em profundidade; a autoridade é o REE na promoção);
+#   2. roda a coleta comum de A (inventory_collect.yml, só leitura, com a mesma guarda de entrada antes de
+#      conectar ao alvo), adiando a sonda de uso e a publicação;
+#   3. mede a sonda com ``become`` (única task que executa elevada, somente leitura) e publica o documento.
+# O ``become`` vem do ``apply`` do include por caminho fixo, não de variável: a coleta comum nunca chega aqui.
+
+- name: "SamurAI :: source A privileged probe :: refuse inputs outside the survey contract"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: "[privileged_probe] Refuse a launch that is not the closed survey of the dedicated template"
+      ansible.builtin.assert:
+        that:
+          - facts_s3_put_headers_json is string
+          - inventory_collect_package_usage_request_json is string
+          - (target_connection_type | default('')) == 'ssh'
+          - (target_shell_type | default('')) == 'sh'
+          - target_login_user is not defined
+          - request.purpose | default('') == 'source_omission_evidence'
+          - request.candidate_execution_id is not defined
+          - request.execution_plan_id is not defined
+          - request.samurai_execution_id | default('') == samurai_execution_id
+          - (request.organization_id | default(-1) | string) == (organization_id | string)
+          - request.target_host | default('') == target_host
+          - marker is mapping
+          - marker.become | default(false) is sameas true
+          - marker.reason | default('') == 'source_omission_usage_dimensions'
+          - marker.job_template | default('') == 'samurai_inventory_source_privileged_probe'
+          - marker.samurai_execution_id | default('') == samurai_execution_id
+          - (marker.organization_id | default(-1) | string) == (organization_id | string)
+          - marker.managed_server_id | default(none) == request.managed_server_id
+          - marker.collection_run_id | default(none) == request.collection_run_id
+          # now() local: datetime ingênuo em UTC (utc=true) com .timestamp() seria lido como hora local.
+          - (marker.expires_at | default(0) | int) > (now().timestamp() | int)
+        fail_msg: the privileged probe accepts only the source A omission request issued for this execution
+        quiet: true
+      vars:
+        request: "{{ inventory_collect_package_usage_request_json | from_json }}"
+        marker: "{{ request.privileged_measurement | default(none) }}"
+      tags: [inventory_collect]
+
+- name: "SamurAI :: source A privileged probe :: read-only collection, probe and publication deferred"
+  ansible.builtin.import_playbook: inventory_collect.yml
+  vars:
+    facts_s3_put_headers: "{{ facts_s3_put_headers_json | from_json }}"
+    inventory_collect_package_usage_request: "{{ inventory_collect_package_usage_request_json | from_json }}"
+    inventory_collect_package_usage_deferred: true
+    inventory_collect_publish_deferred: true
+
+- name: "SamurAI :: source A privileged probe :: elevated read-only usage probe, then publish"
+  hosts: samurai_collect_target
+  gather_facts: false
+  vars:
+    facts_s3_put_headers: "{{ facts_s3_put_headers_json | from_json }}"
+    inventory_collect_package_usage_request: "{{ inventory_collect_package_usage_request_json | from_json }}"
+  tasks:
+    - name: "[privileged_probe] Measure package usage with become (read-only probe, the only elevated task)"
+      ansible.builtin.include_role:
+        name: inventory_collect
+        tasks_from: collect_package_usage
+        apply:
+          become: true
+      when: inventory_collect_package_usage_request.enabled | default(false) | bool
+      tags: [inventory_collect]
+
+    - name: "[privileged_probe] Publish the facts document with the receipt"
+      ansible.builtin.include_role:
+        name: inventory_collect
+        tasks_from: publish
+      tags: [inventory_collect]

@@ -241,13 +241,15 @@
     - (inventory_collect_azure_imds.status | default(0)) == 200
   tags: [inventory_collect, collect]
 
-# Uso de pacote (sonda read-only, sem become). Desligada por padrão: só roda quando a
-# validação RHEL admitiu o request. Mesmo caminho da sonda de serviços.
+# Uso de pacote (sonda read-only, sem elevação aqui). Desligada por padrão: só roda quando o request está ligado.
+# ``inventory_collect_package_usage_deferred`` só desliga (o playbook dedicado mede depois, com elevação, por
+# caminho fixo); ligá-lo na coleta comum só tira a medição, nunca dá privilégio.
 - name: "[inventory_collect] Read package usage admitted by the RHEL validation bind"
   ansible.builtin.include_tasks: collect_package_usage.yml
   when:
     - inventory_collect_package_usage_request is defined
     - inventory_collect_package_usage_request.enabled | default(false) | bool
+    - not (inventory_collect_package_usage_deferred | default(false) | bool)
   tags: [inventory_collect, collect, package_usage]
 
 - name: "[inventory_collect] Initialize workload evidence as unavailable"

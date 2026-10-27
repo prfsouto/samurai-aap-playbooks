@@ -44,6 +44,18 @@ inventory_collect_cloud_init_timeout_seconds: 60
 inventory_collect_systemd_settle_timeout_seconds: 120
 inventory_collect_systemd_settle_interval_seconds: 5
 
+# Elevação da sonda de uso de pacote (D1): não existe variável que a ligue.
+# Na coleta comum a sonda roda com o usuário da coleta (C1): ``/proc`` de outro
+# usuário e o spool de cron podem ficar ilegíveis, e ``processes``/``schedules``
+# só provam ``used``. Só o playbook do template dedicado
+# (playbooks/inventory_source_privileged_probe.yml) inclui a sonda com
+# ``become``, por caminho fixo. Com root, ``hidepid`` deixa de restringir a
+# lista (``_proc_restricted``); qualquer outro motivo de ``not_measured``
+# continua impedindo ``not_used``. As duas variáveis abaixo só desligam etapas
+# da coleta comum para o playbook dedicado refazê-las; nunca dão privilégio.
+inventory_collect_package_usage_deferred: false
+inventory_collect_publish_deferred: false
+
 # The presigned PUT URL for this run's inbox object, and the exact HTTP
 # headers the engine signed the URL for (the SSE-KMS directives — S3 rejects
 # the PUT if the headers sent do not match what was signed). Both are

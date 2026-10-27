@@ -1,0 +1,63 @@
+---
+# Guarda de entrada da coleta (D1, 27/10/2026). Roda na play de localhost de inventory_collect.yml, DEPOIS do
+# add_host e ANTES da play do alvo: nenhuma conexão ao alvo acontece se ela falhar (todos os hosts da play
+# falham e o Ansible encerra a execução).
+#
+# Por que aqui: o template comum tem ``ask_variables_on_launch: true`` (o REE envia objetos que o survey não
+# comporta) e ``ask_credential_on_launch: true`` (o REE escolhe a credencial de cada servidor, #1811). Quem
+# lança controla extra_vars, e extra_vars vencem o add_host e qualquer ``become: false``. A guarda olha o que
+# o alvo vai usar de fato (``hostvars[target_host]``, que já inclui as extra_vars) e recusa:
+#   - variável de conexão ou de escalonamento que o add_host não define (``ansible_become*``,
+#     ``ansible_ssh_*``, ``ansible_*_interpreter``, ``ansible_shell_executable``, ``ansible_password`` e afins);
+#   - conexão, porta, shell ou conta diferente do que o add_host derivou dos aliases ``target_*``;
+#   - alias ``target_*`` fora do contrato do REE (valores fechados, porta e nomes com forma conferida).
+# A credencial de máquina governada (escolhida pelo REE) não passa por aqui: o AWX/AAP a entrega como
+# argumentos (``-u``, ``--become-method``, ``--become-user``) e respostas de prompt (senha SSH e de become),
+# não como variável de host (awx/main/tasks/jobs.py, RunJob.build_args/build_passwords). Por isso
+# ``ansible_user``/``ansible_password`` em ``hostvars`` só podem vir de extra_vars ou do inventário.
+# Não substitui o RBAC do AAP (execute, use da credencial, leitura do job): é a parte que o playbook controla.
+
+- name: "[inventory_collect] Refuse target aliases outside the engine contract"
+  ansible.builtin.assert:
+    that:
+      - target_host is string
+      - target_host is match('^[A-Za-z0-9][A-Za-z0-9.:-]{0,252}$')
+      - (target_connection_type | default('ssh')) in ['ssh', 'winrm']
+      - (target_shell_type | default('sh')) in ['sh', 'powershell']
+      - (target_port | default(22) | string) is match('^[0-9]{1,5}$')
+      - (target_port | default(22) | int) >= 1 and (target_port | default(22) | int) <= 65535
+      - target_winrm_cert_validation is not defined or ((target_connection_type | default('ssh')) == 'winrm'
+          and target_winrm_cert_validation in ['ignore', 'validate'])
+      - target_login_user is not defined or (target_login_user is string
+          and target_login_user is match('^[A-Za-z_][A-Za-z0-9_.-]{0,63}$') and target_login_user != 'root')
+    fail_msg: target aliases are outside the collection contract; nothing was run on the target
+    quiet: true
+  tags: [inventory_collect]
+
+- name: "[inventory_collect] Refuse connection or privilege variables the collection does not set"
+  ansible.builtin.assert:
+    that:
+      - forbidden | length == 0
+      - (effective.ansible_connection | default('')) == (target_connection_type | default('ssh'))
+      - (effective.ansible_port | default(0) | string) == (target_port | default(22) | string)
+      - (effective.ansible_shell_type | default('')) == (target_shell_type | default('sh'))
+      - (effective.ansible_user | default(none)) == (target_login_user | default(none))
+      - (effective.ansible_host | default(target_host)) == target_host
+      # WinRM: transporte e política TLS só os que o add_host derivou; no SSH, nenhum dos dois.
+      - (effective.ansible_winrm_transport | default(none))
+          == ('ntlm' if (target_connection_type | default('ssh')) == 'winrm' else none)
+      - (effective.ansible_winrm_server_cert_validation | default(none))
+          == ((target_winrm_cert_validation | default('ignore'))
+              if (target_connection_type | default('ssh')) == 'winrm' else none)
+    fail_msg: >-
+      launch variables would change how the target is reached or elevated
+      ({{ forbidden | join(', ') if forbidden | length > 0 else 'connection, port, shell, account or address' }});
+      nothing was run on the target
+    quiet: true
+  vars:
+    effective: "{{ hostvars[target_host] }}"
+    forbidden: >-
+      {{ effective.keys() | select('match', inventory_collect_forbidden_connection_vars) | list }}
+    inventory_collect_forbidden_connection_vars: >-
+      ^ansible_(become.*|sudo.*|su_.*|ssh_.*|scp_.*|sftp_.*|password|pass|private_key_file|.*interpreter|shell_executable|executable|remote_tmp|remote_user|pipelining|timeout|paramiko_.*|libssh_.*|psrp_.*|persistent_.*|connection_.*|httpapi_.*|network_.*|module_compression|async_dir|winrm_(?!transport$|server_cert_validation$).*)$
+  tags: [inventory_collect]

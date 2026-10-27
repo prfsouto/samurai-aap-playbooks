@@ -1,12 +1,19 @@
 ---
-# Sonda de uso de pacote: somente leitura, sem become, sem mutação, isolada das outras medições.
-# Roda quando o request está ligado (``inventory_collect_package_usage_request`` com ``enabled``, incluído
-# por collect_linux.yml): na candidata B, pela validação RHEL; na origem A, quando a coleta pede as omissões
-# a medir (uso e dependentes reversos). Qualquer falha — request que não confere, sonda com
-# erro, saída que não é JSON — termina no rescue: o recibo não é mesclado e as medições de serviço e de
-# configuração seguem como estão. O recibo entra em ``inventory_collect_functional`` (a variável que
-# publish.yml serializa) por combine, sem sobrescrever as outras chaves. Gravar em ``ansible_facts``
-# perderia o recibo, porque publish.yml sobrescreve essa chave.
+# Sonda de uso de pacote: somente leitura, sem mutação, isolada das outras medições.
+#
+# Privilégio (D1): nenhuma task deste arquivo declara ``become``, e nenhuma variável o liga. Na coleta comum
+# (inventory_collect.yml) a sonda herda o padrão sem elevação: o play não eleva, o template tem
+# ``become_enabled: false`` e a guarda de entrada (inventory_collect_input_guard.yml) recusa ``ansible_become*``
+# antes de qualquer conexão. Só o playbook do template dedicado (inventory_source_privileged_probe.yml) inclui
+# este arquivo com ``apply: {become: true}``, por caminho fixo; a coleta comum não tem como chegar lá. A única
+# task deste arquivo que executa no alvo é a sonda.
+#
+# Roda quando o request está ligado (``inventory_collect_package_usage_request`` com ``enabled``): na candidata
+# B, pela validação RHEL; na origem A, quando a coleta pede as omissões a medir (uso e dependentes reversos).
+# Qualquer falha — request que não confere, elevação negada, sonda com erro, saída que não é JSON — termina no
+# rescue: o recibo não é mesclado e as medições de serviço e de configuração seguem como estão. O recibo entra
+# em ``inventory_collect_functional`` (a variável que publish.yml serializa) por combine, sem sobrescrever as
+# outras chaves. Gravar em ``ansible_facts`` perderia o recibo, porque publish.yml sobrescreve essa chave.
 
 - name: "[inventory_collect] Package usage probe (bounded, isolated from the other measurements)"
   block:
@@ -19,14 +26,13 @@
       no_log: true
       tags: [inventory_collect, collect, package_usage]
 
-    - name: "[inventory_collect] Read package usage of running units (read-only, no become)"
+    - name: "[inventory_collect] Read package usage of running units (read-only)"
       ansible.builtin.command:
         argv:
           - "{{ ansible_facts.python.executable }}"
           - -c
           - "{{ lookup('file', role_path + '/files/collect_rhel_package_usage.py') }}"
         stdin: "{{ inventory_collect_package_usage_request | to_json }}"
-      become: false
       # Teto da sonda inteira (unidades 60 s, dependentes reversos 30 s, dimensões 30 s + 10 s de prazo
       # duro). Leitura presa sem interrupção (NFS parado) estoura aqui e cai no rescue, sem recibo.
       timeout: 300
@@ -37,11 +43,20 @@
       when: inventory_collect_package_usage_bound | bool
       tags: [inventory_collect, collect, package_usage]
 
+    # ``privilege`` registra o privilégio MEDIDO (euid da sonda), o marcador que veio no request e o job do
+    # Controller. A autoridade sobre ele é o REE na promoção (verify_privileged_receipt), não este registro.
     - name: "[inventory_collect] Preserve the package usage receipt with the functional observations"
       ansible.builtin.set_fact:
         inventory_collect_functional: >-
           {{ (inventory_collect_functional | default({})) | combine({
-              'rhel_package_usage_observation': inventory_collect_package_usage_raw.stdout | from_json
+              'rhel_package_usage_observation': (inventory_collect_package_usage_raw.stdout | from_json) | combine({
+                'privilege': {
+                  'become': ((inventory_collect_package_usage_raw.stdout | from_json).effective_uid | default(-1)) == 0,
+                  'measurement': inventory_collect_package_usage_request.privileged_measurement | default(none),
+                  'job_template_name': awx_job_template_name | default(none),
+                  'job_id': awx_job_id | default(none)
+                }
+              })
             }) }}
       when:
         - inventory_collect_package_usage_bound | bool
