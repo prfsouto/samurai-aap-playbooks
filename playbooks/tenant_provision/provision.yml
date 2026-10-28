@@ -1,0 +1,8 @@
+---
+# Governed tenant provisioning (ADR 0031). Launched only by the remediation-engine with the closed extra-vars.
+- name: Provision one tenant
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  roles:
+    - role: tenant_provision

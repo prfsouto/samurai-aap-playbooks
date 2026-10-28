@@ -1,0 +1,3 @@
+---
+tenant_provision_argocd_timeout_seconds: 600
+tenant_provision_argocd_interval_seconds: 10

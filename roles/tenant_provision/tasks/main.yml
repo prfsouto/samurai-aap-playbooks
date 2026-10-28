@@ -1,0 +1,80 @@
+---
+# Provisioning of one tenant (ADR 0031): Vault precondition, tenant file in Git, wait for ArgoCD, report.
+# Endpoint, repository and branch come from the credential (environment), never from launch variables, so nobody who can
+# launch the template can point the GitHub App JWT at another host. The tokens are masked by the modules themselves
+# (no_log in the argument spec), so a failure keeps its reason in the job output.
+# tenant_name and the admin fields are only ever DATA handed to modules, never part of a command or a template.
+# Ansible evaluates "{{ }}" inside an extra-var VALUE as soon as it is referenced, so the engine and the BFF only let
+# through a closed character list (no braces) and the modules validate again; this check looks at NAMES only.
+- name: Require the closed set of extra-vars
+  ansible.builtin.assert:
+    that:
+      - lookup('ansible.builtin.varnames', '^' ~ item ~ '$') | length > 0
+    quiet: true
+    fail_msg: "extra-var {{ item }} is required"
+  loop:
+    - samurai_execution_id
+    - tenant_provision_organization_id
+    - tenant_provision_job_id
+    - tenant_provision_attempt_key
+    - tenant_provision_idempotency_key
+    - tenant_internal_id
+    - tenant_slug
+    - tenant_name
+    - tenant_environment
+    - tenant_customer_organization_id
+    - tenant_admin_email
+    - tenant_admin_full_name
+  loop_control: {label: "{{ item }}"}
+
+- name: Check the Vault precondition (read-only)
+  samurai_vault_precondition:
+    addr: "{{ lookup('ansible.builtin.env', 'SAMURAI_VAULT_ADDR') }}"
+    token: "{{ lookup('ansible.builtin.env', 'SAMURAI_VAULT_TOKEN') }}"
+    tenant_internal_id: "{{ tenant_internal_id }}"
+    ca_file: "{{ lookup('ansible.builtin.env', 'SAMURAI_VAULT_CA_FILE') }}"
+  register: tenant_provision_vault
+
+- name: Commit the tenant file
+  samurai_tenant_file:
+    tenant_internal_id: "{{ tenant_internal_id }}"
+    tenant_slug: "{{ tenant_slug }}"
+    tenant_environment: "{{ tenant_environment }}"
+    tenant_name: "{{ tenant_name }}"
+    admin_email: "{{ tenant_admin_email }}"
+    admin_full_name: "{{ tenant_admin_full_name }}"
+    repository: "{{ lookup('ansible.builtin.env', 'SAMURAI_TENANT_REPOSITORY') | default('SamurAI-Shield/samurai-shield-tenants', true) }}"
+    branch: "{{ lookup('ansible.builtin.env', 'SAMURAI_TENANT_BRANCH') | default('main', true) }}"
+    api_url: "{{ lookup('ansible.builtin.env', 'SAMURAI_GITHUB_API_URL') | default('https://api.github.com', true) }}"
+    app_id: "{{ lookup('ansible.builtin.env', 'SAMURAI_GITHUB_APP_ID') }}"
+    installation_id: "{{ lookup('ansible.builtin.env', 'SAMURAI_GITHUB_APP_INSTALLATION_ID') }}"
+    private_key_file: "{{ lookup('ansible.builtin.env', 'SAMURAI_GITHUB_APP_PRIVATE_KEY_FILE') }}"
+    commit_message: "feat(tenants): provision {{ tenant_environment }}/{{ tenant_internal_id }} (job {{ tenant_provision_job_id }}, correlation {{ samurai_execution_id }})"
+  register: tenant_provision_file
+
+- name: Wait for the ArgoCD Application to be Synced and Healthy (read-only)
+  samurai_argocd_wait:
+    server: "{{ lookup('ansible.builtin.env', 'SAMURAI_ARGOCD_SERVER') }}"
+    token: "{{ lookup('ansible.builtin.env', 'SAMURAI_ARGOCD_TOKEN') }}"
+    project: "{{ lookup('ansible.builtin.env', 'SAMURAI_ARGOCD_PROJECT') | default('tenants', true) }}"
+    ca_file: "{{ lookup('ansible.builtin.env', 'SAMURAI_ARGOCD_CA_FILE') }}"
+    name: "tenant-{{ tenant_internal_id }}"
+    timeout_seconds: "{{ tenant_provision_argocd_timeout_seconds | int }}"
+    interval_seconds: "{{ tenant_provision_argocd_interval_seconds | int }}"
+  register: tenant_provision_argocd
+
+- name: Report the result to the Execution Center
+  ansible.builtin.set_stats:
+    per_host: false
+    aggregate: false
+    data:
+      samurai_tenant_provision:
+        tenant_internal_id: "{{ tenant_internal_id }}"
+        correlation_id: "{{ samurai_execution_id }}"
+        idempotency_key: "{{ tenant_provision_idempotency_key }}"
+        attempt_key: "{{ tenant_provision_attempt_key }}"
+        commit_sha: "{{ tenant_provision_file.commit_sha }}"
+        file_changed: "{{ tenant_provision_file.changed }}"
+        application: "{{ tenant_provision_argocd.application }}"
+        sync: "{{ tenant_provision_argocd.sync }}"
+        health: "{{ tenant_provision_argocd.health }}"
