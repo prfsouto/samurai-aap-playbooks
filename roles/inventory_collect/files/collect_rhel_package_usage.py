@@ -97,6 +97,12 @@ Dimensões de uso (``usage_dimensions``) só existem quando o request de A as pe
 
 Na dúvida, ``not_measured``: falha parcial ou entrada que a sonda não resolve nunca vira ausência de uso.
 
+Onde o bloqueio ficou: ``usage_dimensions.sources.processes.blocking`` lista o pid, o executável e as posições
+no argv de cada processo que bloqueou (nunca o valor do argumento); ``sources.schedules.unresolved_entries`` lista a
+fonte e a linha, ou o timer, de cada entrada agendada sem resolução (nunca o comando). Cada lista tem teto de
+50 entradas; o que passa do teto só soma em ``*_over_limit``. Cada match de processo traz ``exe`` e ``exe_owner``
+(pacote dono único do executável, ou ``null``).
+
 Privilégio da coleta (C1): por padrão o coletor roda sem ``become`` (``ec2-user``). Com isso, ``/proc`` de outro
 usuário e o spool de cron podem ficar ilegíveis, e ``processes`` e ``schedules`` só provam ``used``; ``not_used`` não
 sai nessas dimensões. Só o template dedicado ``samurai_inventory_source_privileged_probe`` (decisão do dono, D1) roda
@@ -168,6 +174,8 @@ MAX_FDS = 4096
 MAX_SCHEDULE_FILES = 256
 MAX_OWNER_QUERIES = 128
 MAX_MATCHES = 8
+MAX_BLOCKING = 50
+MAX_UNRESOLVED_ENTRIES = 50
 PF_KTHREAD = 0x00200000
 # Já na forma usrmerge (``/usr/...``): o caminho do pacote e o observado passam por ``_usrmerge``.
 DBUS_SYSTEM_DIRS = ("/usr/share/dbus-1/system-services/", "/usr/lib/dbus-1/system-services/")
@@ -810,9 +818,18 @@ class _Paths:
         index = {}
         for package, files in package_files.items():
             for path in files:
+                if self._device(path):
+                    continue  # /dev/null e afins são abertos por qualquer processo: não provam uso do pacote
                 for form in self.forms(path):
                     index.setdefault(form, set()).add(package)
         return index
+
+    def _device(self, path):
+        try:
+            mode = self.fs.mode(path)
+        except OSError:
+            return False
+        return stat.S_ISCHR(mode) or stat.S_ISBLK(mode)
 
 
 class _Matches:
@@ -843,11 +860,24 @@ class _Matches:
                 self.found[package].append(dict(where, path=path))
 
 
+class _Capped:
+    """Lista com teto. O que passa do teto só soma em ``over``: o recibo diz quantas entradas ficaram de fora."""
+
+    def __init__(self, limit):
+        self.limit, self.items, self.over = limit, [], 0
+
+    def add(self, item):
+        if len(self.items) < self.limit:
+            self.items.append(item)
+        else:
+            self.over += 1
+
+
 class _Owners:
     """Dono RPM de arquivo citado: ``owned``, ``unowned``, ``failed`` ou ``over_limit``; uma consulta por caminho."""
 
     def __init__(self, run):
-        self.run, self.cache, self.left = run, {}, MAX_OWNER_QUERIES
+        self.run, self.cache, self.names, self.left = run, {}, {}, MAX_OWNER_QUERIES
 
     def __call__(self, path):
         if path not in self.cache:
@@ -855,8 +885,15 @@ class _Owners:
                 return "over_limit"
             self.left -= 1
             names, reason = _owner_lookup(path, self.run)
+            self.names[path] = names
             self.cache[path] = "owned" if names else "unowned" if reason == "unowned_binary" else "failed"
         return self.cache[path]
+
+    def package(self, path):
+        """Pacote dono único do arquivo, ou ``None``: sem dono, com mais de um dono ou sem consulta disponível."""
+        self(path)
+        names = self.names.get(path)
+        return names[0] if names and len(names) == 1 else None
 
 
 def _verdict(package, matches, reasons):
@@ -1066,6 +1103,12 @@ def _argv_program(spec, argv):
     módulo por nome ou entrada padrão; ``("ambiguous", None)`` com opção que a sonda não conhece. Opção
     curta agrupada (``-Ic``, ``-Im``) é lida letra a letra.
     """
+    kind, program, _ = _argv_scan(spec, argv)
+    return kind, program
+
+
+def _argv_scan(spec, argv):
+    """``_argv_program`` mais a posição (no argv) do token que decidiu o resultado. Só a posição sai daqui, nunca o valor."""
     i = 1
     while i < len(argv):
         arg = argv[i]
@@ -1073,7 +1116,7 @@ def _argv_program(spec, argv):
             i += 1
             break
         if arg == "-":
-            return "inline", None
+            return "inline", None, i
         if not (arg.startswith("-") or (spec is SHELL and arg.startswith("+"))):
             break
         if arg.startswith("--"):
@@ -1083,21 +1126,23 @@ def _argv_program(spec, argv):
             elif key in spec.long_no_arg:
                 i += 1
             else:
-                return "ambiguous", None
+                return "ambiguous", None, i
             continue
         if len(arg) == 1:
-            return "ambiguous", None
+            return "ambiguous", None, i
         step = 1
         for position, letter in enumerate(arg[1:], 1):
             if letter in spec.inline:
-                return "inline", None
+                return "inline", None, i
             if letter in spec.with_arg:
                 step = 2 if position == len(arg) - 1 else 1
                 break
             if letter not in spec.no_arg:
-                return "ambiguous", None
+                return "ambiguous", None, i
         i += step
-    return ("program", argv[i]) if i < len(argv) else ("none", None)
+    if i < len(argv):
+        return "program", argv[i], i
+    return "none", None, i
 
 
 def _environment_changes_imports(spec, pid, fs):
@@ -1155,6 +1200,9 @@ def _processes_dimension(package_files, index, paths, fs, owners, deadline):
     counts, unattributed, reasons = collections.Counter(), collections.Counter(), set()
     matches = _Matches(index, paths)
     judge = _TokenJudge(fs, paths, None)
+    blocking = _Capped(MAX_BLOCKING)
+    # Orçamento próprio: o dono do executável não consome o dos interpretadores, então o veredito não muda.
+    exe_owners = _Owners(owners.run)
     languages = set()
     for files in package_files.values():
         languages |= _module_languages(files)
@@ -1195,12 +1243,20 @@ def _processes_dimension(package_files, index, paths, fs, owners, deadline):
         # Argumento que nomeia executável do PATH do próprio processo (ou caminho executável dentro do token) pode ser
         # rodado por ele, então nenhum pacote sai not_used. Os caminhos que ele nomeia continuam como evidência de uso.
         script = _script_argument_index(exe, argv)
-        if _inline_code(exe, argv):
+        inline = _inline_indexes(exe, argv)
+        if inline:
             reasons.add("interpreter_inline_code")
-        if _process_argument_blocks(judge, argv, pid, fs, script):
+            blocking.add(_blocking_entry(pid, exe, "interpreter_inline_code", inline))
+        arguments = _process_argument_blocks(judge, argv, pid, fs, script)
+        if arguments:
             reasons.add("process_argument_unresolved")
-        for via, path in sorted(found):
-            matches.add(path, pid=int(pid), via=via)
+            blocking.add(_blocking_entry(pid, exe, "process_argument_unresolved", arguments))
+        hits = [(via, path) for via, path in sorted(found) if _package_hit(path, paths, index)]
+        if hits:
+            # Dono do executável só para quem usa arquivo de pacote pedido; o cache de _Owners evita repetir por exe.
+            exe_owner = exe_owners.package(exe)
+            for via, path in hits:
+                matches.add(path, pid=int(pid), via=via, exe=exe, exe_owner=exe_owner)
         spec = _interpreter_named(exe.rsplit("/", 1)[-1])
         pending = _embedded_languages(found) - {spec.language if spec else None}
         if spec is not None and (spec is SHELL or spec.language in languages):
@@ -1225,7 +1281,8 @@ def _processes_dimension(package_files, index, paths, fs, owners, deadline):
                          "/proc/<pid>/fd", "/proc/<pid>/cmdline"],
               "counts": {key: counts[key] for key in (
                   "listed", "read", "unreadable", "truncated", "exited", "kernel_thread", "own_session")},
-              "interpreters_unattributed": dict(sorted(unattributed.items()))}
+              "interpreters_unattributed": dict(sorted(unattributed.items())),
+              "blocking": blocking.items, "blocking_over_limit": blocking.over}
     return source, states
 
 
@@ -1467,24 +1524,38 @@ def _process_token_blocks(judge, token, dirs):
     return False
 
 
+def _package_hit(path, paths, index):
+    """Caminho observado que é arquivo de algum pacote pedido, pelas mesmas formas que o índice usa."""
+    return any(form in index for form in paths.forms(path))
+
+
 def _process_argument_blocks(judge, argv, pid, fs, script):
-    """Bloqueio de ``not_used`` pelos argumentos do processo. argv[0] (título do processo) e o script que o interpretador
-    lê ficam fora. O PATH do processo só é lido quando há argumento."""
-    arguments = [arg for index, arg in enumerate(argv[1:], 1) if index != script]
-    if not arguments:
-        return False
+    """Posições no argv dos argumentos que bloqueiam ``not_used``. argv[0] (título do processo) e o script que o
+    interpretador lê ficam fora. O PATH do processo só é lido quando há argumento."""
+    indexes = [index for index in range(1, len(argv)) if index != script]
+    if not indexes:
+        return []
     dirs = _process_path_dirs(pid, fs)
-    return any(_process_token_blocks(judge, arg, dirs) for arg in arguments)
+    return [index for index in indexes if _process_token_blocks(judge, argv[index], dirs)]
 
 
-def _inline_code(exe, argv):
-    """Código inline roda programa que não está no argv. Vale para qualquer interpretador da tabela (``_argv_program``
-    lê ``-c``, ``-e``, ``-m`` e equivalentes como código inline) e para interpretador desconhecido com as opções de
-    ``INLINE_CODE_OPTIONS`` seguidas de argumento."""
+def _inline_indexes(exe, argv):
+    """Posições no argv do código inline que o interpretador roda (``-c``, ``-e``, ``-`` e equivalentes pela tabela).
+    Para interpretador desconhecido, vale a opção de ``INLINE_CODE_OPTIONS`` seguida de argumento."""
     spec = _interpreter_named(exe.rsplit("/", 1)[-1])
-    if spec is not None and argv and _argv_program(spec, argv)[0] == "inline":
-        return True
-    return any(arg in INLINE_CODE_OPTIONS and index + 1 < len(argv) for index, arg in enumerate(argv) if index)
+    found = set()
+    if spec is not None and argv:
+        kind, _, index = _argv_scan(spec, argv)
+        if kind == "inline":
+            found.add(index)
+    found.update(index for index, arg in enumerate(argv)
+                 if index and arg in INLINE_CODE_OPTIONS and index + 1 < len(argv))
+    return sorted(found)
+
+
+def _blocking_entry(pid, exe, reason, indexes):
+    """Processo que bloqueia ``not_used``: pid, executável e posições no argv. O valor de argumento nunca entra."""
+    return {"pid": int(pid), "exe": exe, "reason": reason, "argument_indexes": indexes}
 
 
 def _timer_service(unit):
@@ -1510,6 +1581,7 @@ class _Schedules:
         self.paths, self.fs, self.owners, self.deadline = paths, fs, owners, deadline
         self.counts = collections.Counter()
         self.reasons = set()
+        self.unresolved = _Capped(MAX_UNRESOLVED_ENTRIES)
         self.judge = _TokenJudge(fs, paths, self.owned)
         self.script_dirs = {paths.final(directory) for directory in CRON_SCRIPT_DIRS}
 
@@ -1562,10 +1634,16 @@ class _Schedules:
             self.reasons.add("owner_lookup_failed" if status == "failed" else "owner_queries_over_limit")
         return status == "owned"
 
-    def outcome(self, status):
-        """Conta a entrada sem resolução: ``unresolved``, ou ``not_allowlisted`` quando a forma está fora da lista."""
+    def outcome(self, status, source, line=None):
+        """Conta a entrada sem resolução: ``unresolved``, ou ``not_allowlisted`` quando a forma está fora da lista.
+        A sem resolução vai para ``unresolved_entries`` com a fonte e a linha (ou o timer), nunca com o comando."""
         if status != RESOLVED:
             self.counts["unresolved" if status == UNRESOLVED else "not_allowlisted"] += 1
+        if status == UNRESOLVED:
+            entry = {"source": source, "reason": "schedule_command_unresolved"}
+            if line is not None:
+                entry["line"] = line
+            self.unresolved.add(entry)
 
     def _program(self, word, path_dirs):
         """Arquivo que a palavra executa, depois do ``realpath``; ``None`` quando não se identifica."""
@@ -1678,7 +1756,7 @@ class _Schedules:
         self.matches.add(path, source=path)
         self.scan(text, path)
         path_dirs, safe = CRON_DEFAULT_PATH, True
-        for raw in text.splitlines():
+        for number, raw in enumerate(text.splitlines(), 1):
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue
@@ -1696,9 +1774,9 @@ class _Schedules:
             self.counts["entries"] += 1
             command = _cron_command(line, kind)
             if not safe or command is None:
-                self.outcome(UNRESOLVED)
+                self.outcome(UNRESOLVED, path, number)
             else:
-                self.outcome(self.command(command, path_dirs, path))
+                self.outcome(self.command(command, path_dirs, path), path, number)
 
     def tables(self):
         for path in CRON_FILES:
@@ -1730,7 +1808,7 @@ class _Schedules:
                 # Script com dono RPM roda o que o RPM requer; sem dono, pode rodar qualquer coisa. O run-parts executa
                 # o script direto: o interpretador do ``#!`` também precisa se identificar.
                 owned = RESOLVED if self.owned(self.paths.final(path)) else UNRESOLVED
-                self.outcome(_worst(owned, self._shebang(self.paths.final(path), path)))
+                self.outcome(_worst(owned, self._shebang(self.paths.final(path), path)), path)
                 text = self.text(path)
                 if text is not None:
                     self.scan(_script_text(text), path)
@@ -1744,7 +1822,7 @@ class _Schedules:
                 continue
             # Job de at é o shell do usuário mais o comando: não há programa identificável.
             self.counts["entries"] += 1
-            self.outcome(UNRESOLVED)
+            self.outcome(UNRESOLVED, path)
             self.scan(text, path)
 
     def timers(self, units, unit_reasons, run):
@@ -1770,7 +1848,7 @@ class _Schedules:
                     continue
                 if key == "EnvironmentFiles" or (key == "Environment" and RISKY_ENV_RE.search(value)):
                     self.counts["entries"] += 1
-                    self.outcome(UNRESOLVED)  # ambiente que a sonda não lê ou que muda o que o programa carrega
+                    self.outcome(UNRESOLVED, source)  # ambiente que a sonda não lê ou que muda o que o programa carrega
                 elif key.startswith("Exec"):
                     commands += 1
                     self.timer_command(value, source)
@@ -1782,15 +1860,15 @@ class _Schedules:
         self.counts["entries"] += 1
         match = EXEC_LINE_RE.match(value)
         if match is None:
-            self.outcome(UNRESOLVED)
+            self.outcome(UNRESOLVED, source)
             return
         program, argv = match.group(1), match.group(2)
         self.scan(argv, source)
         words = argv.split()
         if UNRESOLVED_RE.search(argv) or not words:
-            self.outcome(UNRESOLVED)
+            self.outcome(UNRESOLVED, source)
             return
-        self.outcome(self.resolves([program] + words[1:], SYSTEMD_DEFAULT_PATH, source))
+        self.outcome(self.resolves([program] + words[1:], SYSTEMD_DEFAULT_PATH, source), source)
 
 
 def _schedules_dimension(package_files, index, paths, units, unit_reasons, fs, run, owners, deadline):
@@ -1809,7 +1887,9 @@ def _schedules_dimension(package_files, index, paths, units, unit_reasons, fs, r
     source = {"status": NOT_MEASURED if reasons else "measured", "reasons": sorted(reasons),
               "source": list(CRON_FILES + CRON_TABLE_DIRS + CRON_SCRIPT_DIRS) + [AT_SPOOL, "systemctl show"],
               "counts": {key: schedules.counts[key]
-                         for key in ("files", "entries", "timers", "unresolved", "not_allowlisted")}}
+                         for key in ("files", "entries", "timers", "unresolved", "not_allowlisted")},
+              "unresolved_entries": schedules.unresolved.items,
+              "unresolved_entries_over_limit": schedules.unresolved.over}
     return source, states
 
 
