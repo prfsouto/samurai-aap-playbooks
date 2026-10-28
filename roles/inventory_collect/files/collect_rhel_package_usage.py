@@ -95,11 +95,20 @@ Dimensões de uso (``usage_dimensions``) só existem quando o request de A as pe
   Executor guiado por configuração (``postrotate`` do logrotate, ``rc.local``, ``RUN`` do udev, dispatcher do
   NetworkManager) fica fora da medição.
 
+Gramática declarada por executável (``EXEC_GRAMMARS``): agetty (``-o`` é argumento do login, a menos que ``-l`` troque
+o programa), unbound-anchor (valor de opção é dado, exceto ``-C``, que carrega configuração) e dnf (a primeira palavra
+posicional é um dos comandos sem transação; aliases de ``/etc/dnf/aliases.d/`` ou arquivo ilegível tiram a resolução).
+A gramática cobre o token da linha de comando, não os hooks de plugin do dnf, que são Python carregado por
+configuração. Cada entrada exige o pacote dono esperado e cita a semântica da versão no código; o critério completo
+está na docstring de ``EXEC_GRAMMARS``. O que a gramática não cobre continua sem resolução.
+
 Na dúvida, ``not_measured``: falha parcial ou entrada que a sonda não resolve nunca vira ausência de uso.
 
 Onde o bloqueio ficou: ``usage_dimensions.sources.processes.blocking`` lista o pid, o executável e as posições
 no argv de cada processo que bloqueou (nunca o valor do argumento); ``sources.schedules.unresolved_entries`` lista a
-fonte e a linha, ou o timer, de cada entrada agendada sem resolução (nunca o comando). Cada lista tem teto de
+fonte e a linha, ou o timer, de cada entrada agendada sem resolução (nunca o comando), com um ``detail`` fixo
+(``environment_file``, ``risky_environment``, ``exec_line_unparsed``, ``argv_unresolved``, ``token_unresolved:<índice
+do argv>`` ou ``command_unresolved``), sem texto de comando nem valor de variável. Cada lista tem teto de
 50 entradas; o que passa do teto só soma em ``*_over_limit``. Cada match de processo traz ``exe`` e ``exe_owner``
 (pacote dono único do executável, ou ``null``).
 
@@ -267,6 +276,46 @@ EXEC_LINE_RE = re.compile(r"^\{ path=(\S+) ; argv\[\]=(.*?) ; ignore_errors=(?:y
 RISKY_ENV_RE = re.compile(r"(?:^|[\s\"'])(PATH|LD_PRELOAD|LD_LIBRARY_PATH|LD_AUDIT|BASH_ENV|ENV|LUA_[A-Z0-9_]*|%s)=" % (
     "|".join(name for spec in INTERPRETERS for name in spec.env)))
 DELETED = " (deleted)"
+# Gramática declarada por executável: o argumento listado não pode fazer o processo executar um programa, e a
+# gramática cobre o token da linha de comando, não os hooks de plugin do dnf (Python, carregados por configuração).
+# agetty (util-linux 2.32.1, term-utils/agetty.c): o único exec é ``execv(options.login)``; só
+# ``-l``/``--login-program`` troca esse programa; ``-o``/``--login-options`` vai para os argumentos do login (agetty.8).
+# unbound-anchor (unbound 1.16.2, a versão do spec c8s, smallapp/unbound-anchor.c): nenhum exec, system, popen ou fork;
+# ``-C`` carrega unbound.conf na libunbound e fica excluído; as demais opções com valor são arquivo, porta, endereço ou
+# texto de dados (unbound-anchor.8).
+# dnf-3 (dnf 4.7.0): a primeira palavra posicional é buscada em ``cli_commands`` (cli.py, ``_parse_commands``) e nunca
+# vira programa; a lista abaixo tem só comandos sem transação (confirmados em cli.py e nos módulos). ``-c``/``--config``
+# e ``--setopt`` carregam configuração e ficam excluídos. Se ``/etc/dnf/aliases.d/`` define a palavra, ou não pode ser
+# lido por inteiro, a palavra não resolve (aliases.py troca a primeira palavra e ignora arquivo ilegível).
+ExecGrammar = collections.namedtuple("ExecGrammar", (
+    "package", "value_short", "optional_short", "payload_short", "excluded_short", "value_long", "optional_long",
+    "payload_long", "excluded_long", "program_short", "program_long", "commands", "alias_dir"))
+# ``namedtuple(defaults=...)`` só existe a partir do 3.7; o guest RHEL 8 roda a sonda no platform-python 3.6.
+ExecGrammar.__new__.__defaults__ = (frozenset(),) * 11 + (None,)
+_NO_NAMES = frozenset()
+# Só comandos do dnf 4.7.0 sem transação de pacote: consulta, metadata e solver em memória (check usa Goal sem
+# do_transaction). Install, update, remove, erase, autoremove, downgrade, distro-sync, upgrade, swap, localinstall,
+# reinstall, shell/sh, group, module e history ficam fora: rodam transação com scriptlet.
+DNF_COMMANDS = frozenset({
+    "makecache", "check-update", "list", "info", "search", "provides", "repolist", "repoquery", "updateinfo",
+    "deplist", "check", "help"})
+AGETTY_LONG_VALUE = frozenset({"autologin", "chdir", "delay", "issue-file", "host", "init-string", "login-program",
+                               "login-options", "nice", "chroot", "timeout", "erase-chars", "kill-chars"})
+EXEC_GRAMMARS = {
+    "agetty": ExecGrammar("util-linux", value_short=frozenset("aCdfHIloPrt"), optional_short=frozenset("L"),
+                          payload_short=frozenset("o"), value_long=AGETTY_LONG_VALUE,
+                          optional_long=frozenset({"local-line"}), payload_long=frozenset({"login-options"}),
+                          program_short=frozenset("l"), program_long=frozenset({"login-program"})),
+    "unbound-anchor": ExecGrammar("unbound-libs", value_short=frozenset("CPabcfnrsux"),
+                                  payload_short=frozenset("Pabcfnrsux"), excluded_short=frozenset("C")),
+    "dnf-3": ExecGrammar("dnf", value_short=frozenset("c"), excluded_short=frozenset("c"),
+                         value_long=frozenset({"config", "setopt"}), excluded_long=frozenset({"config", "setopt"}),
+                         commands=DNF_COMMANDS, alias_dir="/etc/dnf/aliases.d"),
+}
+"""Critério (bedin): a entrada só existe quando a semântica da versão confirma que o token não faz o processo executar
+programa. Ficam de fora: opções que carregam módulo ou configuração interpretada (``excluded_*``), subcomandos que
+rodam transação com scriptlet (fora de ``DNF_COMMANDS``) e palavras que aliases ou configuração possam trocar
+(``alias_dir``). Entrada que a gramática não cobre continua sem resolução."""
 
 
 def _kill_group(process):
@@ -1247,7 +1296,11 @@ def _processes_dimension(package_files, index, paths, fs, owners, deadline):
         if inline:
             reasons.add("interpreter_inline_code")
             blocking.add(_blocking_entry(pid, exe, "interpreter_inline_code", inline))
-        arguments = _process_argument_blocks(judge, argv, pid, fs, script)
+        grammar = EXEC_GRAMMARS.get(exe.rsplit("/", 1)[-1])
+        exempt, forced = (_grammar_scan(grammar, argv)
+                          if grammar is not None and exe_owners.package(exe) == grammar.package
+                          else (frozenset(), frozenset()))
+        arguments = _process_argument_blocks(judge, argv, pid, fs, script, exempt, forced)
         if arguments:
             reasons.add("process_argument_unresolved")
             blocking.add(_blocking_entry(pid, exe, "process_argument_unresolved", arguments))
@@ -1412,6 +1465,67 @@ def _process_path_dirs(pid, fs):
     return STANDARD_BIN_DIRS
 
 
+def _option_values(grammar, argv):
+    """Opções com valor lidas como o getopt. Cada item: (índice da opção, índice do valor ou ``None``, é opção de
+    programa, é opção de dado, é opção excluída).
+
+    Valor separado consome o próximo argumento; valor colado (``-Ovalor``, ``--opt=valor``) fica no próprio token.
+    Posicional não encerra as opções (o getopt permuta). ``--`` encerra. Opção que a gramática não conhece não consome.
+    """
+    found, index = [], 1
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--":
+            break
+        if arg.startswith("--"):
+            name, equals, _ = arg[2:].partition("=")
+            if name not in grammar.value_long and name:
+                # argparse aceita prefixo de opção longa (``--conf`` = ``--config``): prefixo de opção excluída exclui.
+                prefixed = [long for long in grammar.excluded_long if long.startswith(name)]
+                name = prefixed[0] if len(prefixed) == 1 else name
+            if name in grammar.value_long:
+                flags = (name in grammar.program_long, name in grammar.payload_long, name in grammar.excluded_long)
+                if equals:
+                    found.append((index, index, *flags))
+                elif index + 1 < len(argv):
+                    found.append((index, index + 1, *flags))
+                    index += 1
+                else:
+                    found.append((index, None, *flags))
+        elif arg.startswith("-") and len(arg) > 1:
+            position = 1
+            while position < len(arg):
+                letter = arg[position]
+                if letter in grammar.value_short:
+                    flags = (letter in grammar.program_short, letter in grammar.payload_short,
+                             letter in grammar.excluded_short)
+                    if position + 1 < len(arg):
+                        found.append((index, index, *flags))
+                    elif index + 1 < len(argv):
+                        found.append((index, index + 1, *flags))
+                        index += 1
+                    else:
+                        found.append((index, None, *flags))
+                    break
+                if letter in grammar.optional_short:
+                    break
+                position += 1
+        index += 1
+    return found
+
+
+def _grammar_scan(grammar, argv):
+    """(dado, bloqueio): índices de valor que a gramática lê como dado, e índices de opção excluída (carrega módulo ou
+    configuração interpretada), que bloqueiam sempre. Com opção de programa (``-l``) presente, nenhum dado sai da lista:
+    o caminho dela é o programa e é julgado como qualquer argumento."""
+    found = _option_values(grammar, argv)
+    blocking = frozenset(option for option, _, _, _, excluded in found if excluded)
+    if any(is_program for _, _, is_program, _, _ in found):
+        return frozenset(), blocking
+    data = frozenset(value for _, value, _, is_payload, _ in found if is_payload and value is not None)
+    return data, blocking
+
+
 class _TokenJudge:
     """Avaliador de token único. Agendamento, argumentos de ``#!`` e argv de processo chamam o mesmo ``evaluate``.
 
@@ -1529,14 +1643,15 @@ def _package_hit(path, paths, index):
     return any(form in index for form in paths.forms(path))
 
 
-def _process_argument_blocks(judge, argv, pid, fs, script):
-    """Posições no argv dos argumentos que bloqueiam ``not_used``. argv[0] (título do processo) e o script que o
-    interpretador lê ficam fora. O PATH do processo só é lido quando há argumento."""
-    indexes = [index for index in range(1, len(argv)) if index != script]
+def _process_argument_blocks(judge, argv, pid, fs, script, exempt=frozenset(), forced=frozenset()):
+    """Posições no argv dos argumentos que bloqueiam ``not_used``. argv[0] (título do processo), o script que o
+    interpretador lê e os valores que a gramática lê como dado (``exempt``) ficam fora. Opção excluída pela gramática
+    (``forced``) bloqueia sempre. O PATH do processo só é lido quando há argumento."""
+    indexes = [index for index in range(1, len(argv)) if index != script and index not in exempt]
     if not indexes:
         return []
     dirs = _process_path_dirs(pid, fs)
-    return [index for index in indexes if _process_token_blocks(judge, argv[index], dirs)]
+    return [index for index in indexes if index in forced or _process_token_blocks(judge, argv[index], dirs)]
 
 
 def _inline_indexes(exe, argv):
@@ -1584,6 +1699,8 @@ class _Schedules:
         self.unresolved = _Capped(MAX_UNRESOLVED_ENTRIES)
         self.judge = _TokenJudge(fs, paths, self.owned)
         self.script_dirs = {paths.final(directory) for directory in CRON_SCRIPT_DIRS}
+        self.token_failure = None  # índice do primeiro token sem resolução do Exec* em análise (só o índice sai)
+        self.alias_cache = {}  # diretório de aliases do dnf: texto lido uma vez por execução (None = ilegível)
 
     def expired(self):
         if time.monotonic() > self.deadline:
@@ -1634,15 +1751,18 @@ class _Schedules:
             self.reasons.add("owner_lookup_failed" if status == "failed" else "owner_queries_over_limit")
         return status == "owned"
 
-    def outcome(self, status, source, line=None):
+    def outcome(self, status, source, line=None, detail=None):
         """Conta a entrada sem resolução: ``unresolved``, ou ``not_allowlisted`` quando a forma está fora da lista.
-        A sem resolução vai para ``unresolved_entries`` com a fonte e a linha (ou o timer), nunca com o comando."""
+        A sem resolução vai para ``unresolved_entries`` com a fonte e a linha (ou o timer), nunca com o comando. ``detail``
+        é um código fixo, sem texto do comando nem valor de variável."""
         if status != RESOLVED:
             self.counts["unresolved" if status == UNRESOLVED else "not_allowlisted"] += 1
         if status == UNRESOLVED:
             entry = {"source": source, "reason": "schedule_command_unresolved"}
             if line is not None:
                 entry["line"] = line
+            if detail is not None:
+                entry["detail"] = detail
             self.unresolved.add(entry)
 
     def _program(self, word, path_dirs):
@@ -1695,11 +1815,80 @@ class _Schedules:
             if not script.startswith("/") or not self.fs.is_file(script) or not self.owned(self.paths.final(script)):
                 return UNRESOLVED
             self.matches.add(script, source=source)
-            args = args[1:]
+            start, grammar = 2, None
         else:
             # Programa executado direto: se for script, o interpretador do ``#!`` também precisa se identificar.
             form = _worst(form, self._shebang(program, source))
-        return _worst(form, *[self._argument(arg, source, path_dirs) for arg in args])
+            start, grammar = 1, self._grammar(name, program)
+        return _worst(form, *self._arguments(words, start, path_dirs, source, wrapped, grammar))
+
+    def _grammar(self, name, program):
+        """Gramática declarada do executável, só quando o dono RPM é o pacote que ela descreve."""
+        grammar = EXEC_GRAMMARS.get(name)
+        return grammar if grammar is not None and self.owners.package(program) == grammar.package else None
+
+    def _arguments(self, words, start, path_dirs, source, wrapped, grammar):
+        """Argumentos de ``words`` a partir de ``start``. Com gramática, valor de dado e palavra de comando registrado
+        não resolvem programa. Falha de token fora de envoltório grava o índice em ``token_failure`` (só o índice)."""
+        exempt, blocking = frozenset(), frozenset()
+        if grammar is not None:
+            exempt, blocking = _grammar_scan(grammar, words)
+            command = words[start] if len(words) > start else None
+            aliased = (command is not None and grammar.alias_dir is not None
+                       and not self._alias_free(command, grammar.alias_dir))
+            if command in grammar.commands and not aliased:
+                exempt = exempt | {start}
+        statuses = []
+        for index in range(start, len(words)):
+            if index in blocking:
+                status = UNRESOLVED
+            elif index in exempt:
+                status = self._payload(words[index], source)
+            else:
+                status = self._argument(words[index], source, path_dirs)
+            if status == UNRESOLVED and not wrapped and self.token_failure is None:
+                self.token_failure = index
+            statuses.append(status)
+        return statuses
+
+    def _alias_free(self, word, directory):
+        """``False`` quando ``directory`` (aliases.d do dnf) define a palavra, ou não pode ser lido por inteiro."""
+        texts = self._alias_texts(directory)
+        if texts is None:
+            return False
+        pattern = re.compile(r"^\s*%s\s*[=:]" % re.escape(word))
+        return not any(pattern.search(line) for text in texts for line in text.splitlines())
+
+    def _alias_texts(self, directory):
+        if directory not in self.alias_cache:
+            self.alias_cache[directory] = self._read_dir(directory)
+        return self.alias_cache[directory]
+
+    def _read_dir(self, directory):
+        """Texto de todos os arquivos do diretório. Sem diretório, não há alias (``[]``). Listagem, leitura, arquivo
+        cortado ou ilegível: ``None``, que a chamada trata como sem resolução."""
+        try:
+            names = self.fs.listdir(directory)
+        except FileNotFoundError:
+            return []
+        except OSError:
+            return None
+        texts = []
+        for name in names:
+            try:
+                text, cut = self.fs.read(directory.rstrip("/") + "/" + name, FILE_LIMIT)
+            except OSError:
+                return None
+            if cut:
+                return None
+            texts.append(text)
+        return texts
+
+    def _payload(self, word, source):
+        """Valor que a gramática declara como dado: não roda programa. Caminho limpo conta como uso do pacote dono."""
+        if _clean_path(word):
+            self.matches.add(word, source=source)
+        return RESOLVED
 
     def _argument(self, arg, source, path_dirs):
         """Um token de agendamento pelo avaliador de token único (``_TokenJudge``). Caminho de dado que resolve vira
@@ -1848,7 +2037,9 @@ class _Schedules:
                     continue
                 if key == "EnvironmentFiles" or (key == "Environment" and RISKY_ENV_RE.search(value)):
                     self.counts["entries"] += 1
-                    self.outcome(UNRESOLVED, source)  # ambiente que a sonda não lê ou que muda o que o programa carrega
+                    # ambiente que a sonda não lê ou que muda o que o programa carrega
+                    self.outcome(UNRESOLVED, source,
+                                 detail="environment_file" if key == "EnvironmentFiles" else "risky_environment")
                 elif key.startswith("Exec"):
                     commands += 1
                     self.timer_command(value, source)
@@ -1860,15 +2051,21 @@ class _Schedules:
         self.counts["entries"] += 1
         match = EXEC_LINE_RE.match(value)
         if match is None:
-            self.outcome(UNRESOLVED, source)
+            self.outcome(UNRESOLVED, source, detail="exec_line_unparsed")
             return
         program, argv = match.group(1), match.group(2)
         self.scan(argv, source)
         words = argv.split()
         if UNRESOLVED_RE.search(argv) or not words:
-            self.outcome(UNRESOLVED, source)
+            self.outcome(UNRESOLVED, source, detail="argv_unresolved")
             return
-        self.outcome(self.resolves([program] + words[1:], SYSTEMD_DEFAULT_PATH, source), source)
+        self.token_failure = None
+        status = self.resolves([program] + words[1:], SYSTEMD_DEFAULT_PATH, source)
+        detail = None
+        if status == UNRESOLVED:
+            detail = ("command_unresolved" if self.token_failure is None
+                      else "token_unresolved:%d" % self.token_failure)
+        self.outcome(status, source, detail=detail)
 
 
 def _schedules_dimension(package_files, index, paths, units, unit_reasons, fs, run, owners, deadline):
