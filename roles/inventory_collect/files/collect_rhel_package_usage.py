@@ -123,6 +123,7 @@ de ``not_measured``. A sonda não escolhe o privilégio; ela só o recebe.
 """
 import collections
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -2173,6 +2174,25 @@ def _usage_dimensions(requested, package_files, units, unit_reasons, run, fs):
     return block
 
 
+def probe_sha256(file_name=None, cmdline="/proc/self/cmdline"):
+    """sha256 dos bytes desta sonda, lidos em tempo de execução: identidade da versão que mediu.
+
+    Roda por caminho (``file_name``) ou por ``python -c <texto>`` (``argv`` do processo, o mesmo texto que o
+    playbook lê do arquivo). ``None`` quando nenhum dos dois se lê: o recibo sai sem identidade e não é reaproveitado.
+    """
+    try:
+        if file_name is not None:
+            with open(file_name, "rb") as handle:
+                data = handle.read()
+        else:
+            with open(cmdline, "rb") as handle:
+                parts = handle.read().split(b"\0")
+            data = parts[parts.index(b"-c") + 1]
+    except (OSError, ValueError, IndexError):
+        return None
+    return hashlib.sha256(data).hexdigest()
+
+
 def collect(request, run=command, fs=None):
     if not isinstance(request, dict):
         raise ValueError("binding must be an object")
@@ -2225,6 +2245,8 @@ def collect(request, run=command, fs=None):
     observation = {
         "schema": SCHEMA,
         "binding": request,
+        # Identidade da versão que mediu: o REE só reaproveita recibo cuja sonda é a que o produto lançaria.
+        "probe_sha256": probe_sha256(file_name=globals().get("__file__")),
         # Privilégio medido pela própria sonda, não declarado pelo launch: o REE confere com o template que lançou.
         "effective_uid": fs.identity()["euid"],
         "observed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
