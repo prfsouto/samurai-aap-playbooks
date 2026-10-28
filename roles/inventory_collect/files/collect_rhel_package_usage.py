@@ -1701,6 +1701,7 @@ class _Schedules:
         self.judge = _TokenJudge(fs, paths, self.owned)
         self.script_dirs = {paths.final(directory) for directory in CRON_SCRIPT_DIRS}
         self.token_failure = None  # índice do primeiro token sem resolução do Exec* em análise (só o índice sai)
+        self.grammar_state = None  # motivo da gramática não aplicada ao Exec* em análise (código fixo, sem texto)
         self.alias_cache = {}  # diretório de aliases do dnf: texto lido uma vez por execução (None = ilegível)
 
     def expired(self):
@@ -1826,7 +1827,14 @@ class _Schedules:
     def _grammar(self, name, program):
         """Gramática declarada do executável, só quando o dono RPM é o pacote que ela descreve."""
         grammar = EXEC_GRAMMARS.get(name)
-        return grammar if grammar is not None and self.owners.package(program) == grammar.package else None
+        if grammar is None:
+            return None
+        if self.owners.package(program) != grammar.package:
+            owner = self.owners(program)
+            self.grammar_state = ("grammar_owner_" + owner if owner in ("failed", "over_limit", "unowned")
+                                  else "grammar_owner_mismatch")
+            return None
+        return grammar
 
     def _arguments(self, words, start, path_dirs, source, wrapped, grammar):
         """Argumentos de ``words`` a partir de ``start``. Com gramática, valor de dado e palavra de comando registrado
@@ -1839,6 +1847,9 @@ class _Schedules:
                        and not self._alias_free(command, grammar.alias_dir))
             if command in grammar.commands and not aliased:
                 exempt = exempt | {start}
+            elif command is not None and grammar.commands and self.grammar_state is None:
+                # Motivo da palavra de comando não isenta, sem o texto dela: alias ou palavra fora da lista.
+                self.grammar_state = "command_aliased" if aliased else "command_not_listed"
         statuses = []
         for index in range(start, len(words)):
             if index in blocking:
@@ -2060,12 +2071,14 @@ class _Schedules:
         if UNRESOLVED_RE.search(argv) or not words:
             self.outcome(UNRESOLVED, source, detail="argv_unresolved")
             return
-        self.token_failure = None
+        self.token_failure, self.grammar_state = None, None
         status = self.resolves([program] + words[1:], SYSTEMD_DEFAULT_PATH, source)
         detail = None
         if status == UNRESOLVED:
             detail = ("command_unresolved" if self.token_failure is None
                       else "token_unresolved:%d" % self.token_failure)
+            if self.token_failure is not None and self.grammar_state is not None:
+                detail += ":" + self.grammar_state
         self.outcome(status, source, detail=detail)
 
 
@@ -2189,6 +2202,12 @@ def probe_sha256(file_name=None, cmdline="/proc/self/cmdline"):
                 parts = handle.read().split(b"\0")
             data = parts[parts.index(b"-c") + 1]
     except (OSError, ValueError, IndexError):
+        return None
+    # O ``lookup('file')`` do Ansible corta o espaço em branco final; arquivo e argv precisam dar a mesma identidade.
+    try:
+        # O mesmo ``str.rstrip()`` do Ansible sobre o texto UTF-8 (cobre espaço Unicode, que ``bytes.rstrip`` não vê).
+        data = data.decode("utf-8").rstrip().encode("utf-8")
+    except UnicodeDecodeError:
         return None
     return hashlib.sha256(data).hexdigest()
 
