@@ -24,7 +24,9 @@ SLUG = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
 ENVIRONMENTS = frozenset({"stg", "prod"})
 NAME_CHARACTERS = re.compile(r"[\w .,&'’()/+@:-]+")
 # A safe subset of RFC 5322 on purpose: no braces, quotes or backticks (Ansible templates extra-var values).
-EMAIL = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
+# Same rule as the BFF and the engine (domain labels of 1-63 characters, no hyphen at the ends).
+_DOMAIN_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+EMAIL = re.compile(rf"[A-Za-z0-9._%+-]{{1,64}}@{_DOMAIN_LABEL}(?:\.{_DOMAIN_LABEL})*\.[A-Za-z]{{2,63}}")
 TEXT_MAX = 255
 REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9._-]{1,100}")
 BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,99}")
