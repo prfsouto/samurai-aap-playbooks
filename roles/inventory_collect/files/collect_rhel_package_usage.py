@@ -309,7 +309,8 @@ EXEC_GRAMMARS = {
                           program_short=frozenset("l"), program_long=frozenset({"login-program"})),
     "unbound-anchor": ExecGrammar("unbound-libs", value_short=frozenset("CPabcfnrsux"),
                                   payload_short=frozenset("Pabcfnrsux"), excluded_short=frozenset("C")),
-    "dnf-3": ExecGrammar("dnf", value_short=frozenset("c"), excluded_short=frozenset("c"),
+    # ``/usr/bin/dnf-3`` vem do ``python3-dnf`` (dnf.spec c8s 4.7.0, ``%files -n python3-%{name}``); ``dnf`` só tem o link.
+    "dnf-3": ExecGrammar("python3-dnf", value_short=frozenset("c"), excluded_short=frozenset("c"),
                          value_long=frozenset({"config", "setopt"}), excluded_long=frozenset({"config", "setopt"}),
                          commands=DNF_COMMANDS, alias_dir="/etc/dnf/aliases.d"),
 }
