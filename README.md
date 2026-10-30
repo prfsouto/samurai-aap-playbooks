@@ -409,8 +409,7 @@ was found", same philosophy as `oracle_rac_patch_with_evidence.yml`):
    re-pointed via `ln -sfn` on every later Apply — the **first** Apply
    against a host "adopts" its unmanaged install into this convention, and
    only when THIS service's own drop-in confirms the link is really its
-   own; every later Apply is a pure symlink flip. The old version directory
-   is left on disk untouched. The stage (download/extract/migrate) and the
+   own; every later Apply is a pure symlink flip. The stage (download/extract/migrate) and the
    cutover (stop/link/start/verify) run as two separate steps: a failure
    while staging — before anything in the running service was touched —
    never triggers a restart. If the cutover itself fails at any point from
@@ -423,6 +422,31 @@ was found", same philosophy as `oracle_rac_patch_with_evidence.yml`):
    running PID's `-Dcatalina.base` straight out of `/proc`. Version reads
    (Check included) never execute any vendor script: they parse
    `ServerInfo.properties` directly out of `lib/catalina.jar`, read-only.
+6. The **superseded install is retired**: archived as a `tar.gz` (owners and
+   modes kept) into `TOMCAT_BACKUP_DIR` (default
+   `/var/backups/samurai-shield/tomcat-update`, root-only), read back, and
+   only then removed. Scanners find a Tomcat by its `lib/catalina.jar` on
+   disk, running or not, so an old directory left behind kept every CVE of
+   the old version open after a successful patch (vm1/vm2/vm3-samurai,
+   9.0.50 → 9.0.121). A hand-made unit usually hard-codes the old
+   directory — the lab units do: `ExecStart=/opt/apache-tomcat-9.0.50/bin/catalina.sh run`,
+   `ExecStop=…`, `CATALINA_PID=…/temp/tomcat.pid` — so systemd kept starting
+   and stopping the new Tomcat through the old `bin/` scripts. Those
+   `[Service]` lines (`Exec*`, `Environment`, `PIDFile`,
+   `WorkingDirectory`) are first re-pointed at `<parent>/current-<SERVICE_NAME>`
+   in a second drop-in, `samurai-tomcat-paths.conf`, written only when every
+   re-pointed path exists in the live install, followed by a
+   `daemon-reload` (no restart: the JVM already serves from the link). The
+   old directory is then **kept, with a warning**, while anything else
+   still uses it: the unit's effective properties, its `EnvironmentFile`,
+   any other unit/init/cron/logrotate file, a process, or a symlink beside it. A
+   re-run of `Apply` on an already-current, adopted host retires the stale
+   `CATALINA_HOME` the caller still sends, which cleans up hosts patched
+   before this step existed. `old_installs.json` in the evidence directory
+   lists what was retired (with the backup's SHA-256 and the restore
+   command) and what was kept, and why; `Check` lists what `Apply` would
+   retire. `TOMCAT_RETIRE_OLD_INSTALL=false` leaves the old directory
+   untouched.
 
 Supported actions:
 

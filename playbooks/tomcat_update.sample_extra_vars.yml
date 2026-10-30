@@ -40,7 +40,8 @@ TARGET_VERSION: "9.0.121"
 # Apply = downloads + verifies the artifact, stages the new version in a
 #         sibling directory, migrates conf/ + custom webapps + extra jars
 #         from the current install, cuts the stable indirection symlink
-#         over to it, and restarts the service.
+#         over to it, restarts the service, then archives + removes the
+#         superseded install (see TOMCAT_RETIRE_OLD_INSTALL below).
 ACTION: "Check"
 
 # --- required only when ACTION=Apply -------------------------------------------
@@ -57,6 +58,21 @@ ACTION: "Check"
 #                                     # itself is a harmless no-op.
 # ALLOW_DOWNGRADE: false              # TARGET_VERSION older than what is installed is
 #                                     # refused unless this is explicitly true.
+# TOMCAT_RETIRE_OLD_INSTALL: true     # after a verified cutover, archive the superseded
+#                                     # install into TOMCAT_BACKUP_DIR and remove it.
+#                                     # Scanners report a Tomcat by its lib/catalina.jar
+#                                     # on disk, running or not: a leftover old directory
+#                                     # keeps all its CVEs open. Unit lines that hard-code
+#                                     # the old dir (ExecStart/ExecStop/CATALINA_PID...) are
+#                                     # re-pointed at the stable link in a drop-in first.
+#                                     # Kept (with a warning) while anything else (another
+#                                     # unit, a process, a symlink) still uses it. Re-running Apply on an
+#                                     # already-current host retires a leftover CATALINA_HOME.
+#                                     # false = old directory left untouched.
+# TOMCAT_BACKUP_DIR: "/var/backups/samurai-shield/tomcat-update"
+#                                     # root-only (0700); one <dir>-<timestamp>.tar.gz per
+#                                     # retired install; restore command in old_installs.json.
+#                                     # Keep it outside /opt, /srv and /usr/local.
 # SERIAL_BATCH: 1                     # hosts patched at a time
 # SERVICE_CHECK: "on"                 # on | off. Records running services + listening TCP
 #                                     # ports before the change; after Apply (and the Tomcat
