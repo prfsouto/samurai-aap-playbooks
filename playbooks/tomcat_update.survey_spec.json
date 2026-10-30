@@ -67,6 +67,25 @@
       "new_question": true
     },
     {
+      "question_name": "Retire the old install",
+      "question_description": "true: after a verified cutover, archive the superseded Tomcat directory into the backup directory and remove it (scanners keep reporting a version whose directory is still on disk). It is kept, with a warning, while anything still uses it. false: leave it untouched.",
+      "variable": "TOMCAT_RETIRE_OLD_INSTALL",
+      "type": "multiplechoice",
+      "choices": "true\nfalse",
+      "required": false,
+      "default": "true",
+      "new_question": true
+    },
+    {
+      "question_name": "Backup directory for retired installs",
+      "question_description": "Absolute path on the target (root-only, 0700) where each retired install is kept as a tar.gz. Keep it outside /opt, /srv and /usr/local.",
+      "variable": "TOMCAT_BACKUP_DIR",
+      "type": "text",
+      "required": false,
+      "default": "/var/backups/samurai-shield/tomcat-update",
+      "new_question": true
+    },
+    {
       "question_name": "Evidence base directory",
       "question_description": "Base directory on the target where the structured evidence files are written.",
       "variable": "EVIDENCE_BASE_DIR",

@@ -48,8 +48,7 @@
 #      stable indirection path (<parent>/current), created once and
 #      re-pointed on every subsequent Apply via `ln -sfn` — the first Apply
 #      against a host "adopts" its unmanaged install into this convention;
-#      every later Apply is a pure symlink flip. The OLD version directory
-#      is left on disk untouched. If the cutover fails at any point from the
+#      every later Apply is a pure symlink flip. If the cutover fails at any point from the
 #      service stop onward, the playbook automatically re-points the link
 #      back at the old version and restarts it before failing the host
 #      (bedin #89 B1) — a stuck "service down" was never acceptable.
@@ -62,6 +61,19 @@
 #      ServerInfo.properties straight out of lib/catalina.jar, so a
 #      compromised Tomcat user cannot ride a writable bin/version.sh or
 #      bin/setenv.sh into a root shell during a routine Check (bedin #89 B9).
+#   6. The superseded install is then retired: archived (tar.gz, owners and
+#      modes kept) into TOMCAT_BACKUP_DIR, read back, and removed. Leaving
+#      it on disk kept every CVE of the old version open, because scanners
+#      find a Tomcat by its lib/catalina.jar on disk, running or not. Unit
+#      lines that hard-code the old directory (ExecStart/ExecStop/
+#      CATALINA_PID/PIDFile/...) are first re-pointed at <parent>/current-
+#      <SERVICE_NAME> in a second drop-in (samurai-tomcat-paths.conf, only
+#      when every re-pointed path exists in the live install; daemon-reload,
+#      no restart). It is kept, with a warning, while anything else still
+#      uses it (an EnvironmentFile, another unit, a process, a symlink); a
+#      re-run of Apply on an already-current host retires leftovers from
+#      earlier patches. TOMCAT_RETIRE_OLD_INSTALL=false keeps the old
+#      behaviour (old directory left untouched).
 #
 # Stages:
 #   1. Build dynamic in-memory inventory from HOSTNAMES (localhost play).
@@ -95,6 +107,9 @@
     samurai_allow_downgrade_raw: "{{ (ALLOW_DOWNGRADE | default('') | string | trim) or 'false' }}"
     samurai_stock_webapps_raw: >-
       {{ (TOMCAT_STOCK_WEBAPPS | default('') | string | trim) or 'docs,examples,host-manager,manager' }}
+    samurai_retire_old_install_raw: "{{ (TOMCAT_RETIRE_OLD_INSTALL | default('') | string | trim) or 'true' }}"
+    samurai_backup_dir_raw: >-
+      {{ (TOMCAT_BACKUP_DIR | default('') | string | trim) or '/var/backups/samurai-shield/tomcat-update' }}
   tasks:
     - name: "Validate HOSTNAMES is provided"
       ansible.builtin.fail:
@@ -132,6 +147,16 @@
         msg: "Invalid ALLOW_DOWNGRADE '{{ samurai_allow_downgrade_raw }}'. Allowed values: false, true."
       when: samurai_allow_downgrade_raw | lower not in ['false', 'true']
 
+    - name: "Validate TOMCAT_RETIRE_OLD_INSTALL is a boolean"
+      ansible.builtin.fail:
+        msg: "Invalid TOMCAT_RETIRE_OLD_INSTALL '{{ samurai_retire_old_install_raw }}'. Allowed values: true, false."
+      when: samurai_retire_old_install_raw | lower not in ['false', 'true']
+
+    - name: "Validate TOMCAT_BACKUP_DIR is an absolute path other than /"
+      ansible.builtin.fail:
+        msg: "Invalid TOMCAT_BACKUP_DIR '{{ samurai_backup_dir_raw }}': it must be an absolute path other than /."
+      when: samurai_backup_dir_raw is not match('^/') or samurai_backup_dir_raw is match('^/+$')
+
     - name: "Validate TOMCAT_ARTIFACT_URL is provided for Apply"
       ansible.builtin.fail:
         msg: "TOMCAT_ARTIFACT_URL extra-var is required when ACTION=Apply (the exact tar.gz for TARGET_VERSION)."
@@ -160,6 +185,8 @@
         samurai_allow_downgrade: "{{ samurai_allow_downgrade_raw | lower == 'true' }}"
         samurai_stock_webapps: >-
           {{ samurai_stock_webapps_raw.split(',') | map('trim') | reject('equalto', '') | list }}
+        samurai_retire_old_install: "{{ samurai_retire_old_install_raw | lower == 'true' }}"
+        samurai_backup_dir: "{{ samurai_backup_dir_raw | regex_replace('/+$', '') }}"
 
     - name: "Parse HOSTNAMES into a list (tolerant: space OR comma)"
       ansible.builtin.set_fact:
@@ -204,6 +231,8 @@
     tc_artifact_sha512: "{{ hostvars['localhost']['samurai_artifact_sha512'] | default('') }}"
     tc_allow_downgrade: "{{ hostvars['localhost']['samurai_allow_downgrade'] | default(false) }}"
     tc_stock_webapps: "{{ hostvars['localhost']['samurai_stock_webapps'] }}"
+    tc_retire_old_install: "{{ hostvars['localhost']['samurai_retire_old_install'] | default(true) }}"
+    tc_backup_dir: "{{ hostvars['localhost']['samurai_backup_dir'] | default('/var/backups/samurai-shield/tomcat-update') }}"
     EVIDENCE_BASE_DIR: "{{ hostvars['localhost']['EVIDENCE_BASE_DIR'] | default('/var/tmp/samurai-shield/tomcat-update') }}"
 
     samurai_warnings: []
@@ -1263,6 +1292,495 @@
               ansible.builtin.debug:
                 msg: "{{ svc_check_message }}"
 
+        # ------------------------------------------------------------------
+        # Phase 5: retire the superseded install. Scanners find a Tomcat by
+        # walking the disk (any <dir>/lib/catalina.jar under /opt, /srv,
+        # /usr/local), not by asking which one is running: an old version
+        # directory left behind keeps every one of its CVEs open after a
+        # successful patch (vm1/vm2/vm3-samurai, samurai-nvd-scanner
+        # java_components.py). Candidates: the install this run just cut
+        # away from, plus — on a host already adopted — the stale
+        # CATALINA_HOME the caller keeps sending (bedin #89 B7), so a host
+        # patched before this phase existed is cleaned up by a re-run even
+        # when it is already current. A candidate is only removed when
+        # nothing still uses it (the unit's effective properties and its
+        # EnvironmentFiles, any other unit/init/cron/logrotate file, any
+        # process, any symlink beside it) and only after a gzip tar of it
+        # was written OUTSIDE the scanned roots and read back. Anything
+        # that goes wrong here is a warning: the patch itself already
+        # succeeded and the service is up.
+        # ------------------------------------------------------------------
+        - name: "Retire :: superseded install(s)"
+          when: >-
+            (tomcat_adopted | bool)
+            or (tc_action == 'Apply' and (tomcat_update_needed | bool))
+          block:
+            - name: "Retire :: resolve the live install behind the stable indirection path"
+              ansible.builtin.command:
+                argv: [realpath, -e, "{{ tc_link_path }}"]
+              register: tc_live_realpath
+              changed_when: false
+
+            - name: "Retire :: resolve CATALINA_HOME as sent (it may already be gone)"
+              ansible.builtin.command:
+                argv: [realpath, -e, "{{ tc_catalina_home }}"]
+              register: tc_sent_realpath
+              changed_when: false
+              failed_when: false
+
+            - name: "Retire :: list the candidates"
+              ansible.builtin.set_fact:
+                tc_live_dir: "{{ tc_live_realpath.stdout | trim }}"
+                tc_retire_candidates: >-
+                  {{
+                    (([tomcat_current_dir] if (tc_action == 'Apply' and (tomcat_update_needed | bool)) else [])
+                     + ([tc_sent_realpath.stdout | trim] if tc_sent_realpath.rc == 0 else []))
+                    | unique
+                    | reject('equalto', tc_live_realpath.stdout | trim)
+                    | reject('equalto', '')
+                    | list
+                  }}
+
+            # ---- a hand-made unit usually hard-codes the version-named
+            # directory (the lab units: ExecStart=/opt/apache-tomcat-9.0.50/
+            # bin/catalina.sh run, ExecStop=..., CATALINA_PID=.../temp/...).
+            # The adoption drop-in only overrides CATALINA_HOME/BASE, so
+            # systemd keeps starting and stopping the NEW Tomcat through the
+            # OLD bin/ scripts, and the old directory can never go. Every
+            # [Service] line that names a candidate is re-pointed at the
+            # stable indirection path in a second drop-in of our own; each
+            # re-pointed path must exist in the live install, else nothing
+            # is written and the candidate stays. Only daemon-reload: the
+            # running JVM already serves from the link (verified above). --
+            - name: "Retire :: plan the unit lines to re-point at the stable indirection path"
+              ansible.builtin.shell: |
+                set -u
+                dir="/etc/systemd/system/$TC_SVC.service.d"
+                files="$(systemctl show -p FragmentPath -p DropInPaths --value -- "$TC_SVC" 2>/dev/null | tr ' ' '\n' \
+                  | grep -v -x -F -e "$dir/samurai-tomcat-home.conf" -e "$dir/samurai-tomcat-paths.conf" | grep -v '^$')"
+                if [ -z "$files" ]; then
+                  echo "FAIL could not read the unit files of $TC_SVC"
+                  exit 0
+                fi
+                plan="$(printf '%s\n' "$files" | while read -r f; do cat -- "$f"; echo; done | awk '
+                  # whole-path occurrence of p in s (not /data/opt/x, not /opt/x.1)
+                  function bpos(s, p,    off, i, a, b) {
+                    off = 0
+                    while ((i = index(substr(s, off + 1), p)) > 0) {
+                      a = substr(s, off + i + length(p), 1)
+                      b = (off + i > 1) ? substr(s, off + i - 1, 1) : ""
+                      if (a !~ /[A-Za-z0-9._-]/ && b != "/" && b !~ /[A-Za-z0-9._-]/) return off + i
+                      off = off + i
+                    }
+                    return 0
+                  }
+                  function mentions(s,    j) { for (j = 1; j <= n; j++) if (bpos(s, olds[j]) > 0) return 1; return 0 }
+                  function swap(s,    j, i, out) {
+                    for (j = 1; j <= n; j++) {
+                      out = ""
+                      while ((i = bpos(s, olds[j])) > 0) { out = out substr(s, 1, i - 1) link; s = substr(s, i + length(olds[j])) }
+                      s = out s
+                    }
+                    return s
+                  }
+                  BEGIN {
+                    n = split(ENVIRON["TC_OLD"], olds, ":"); link = ENVIRON["TC_LINK"]; bs = sprintf("%c", 92)
+                    nk = split("ExecStartPre ExecStart ExecStartPost ExecReload ExecStop ExecStopPost Environment PIDFile WorkingDirectory", keys, " ")
+                    for (j = 1; j <= nk; j++) want[keys[j]] = 1
+                    single["PIDFile"] = 1; single["WorkingDirectory"] = 1
+                  }
+                  {
+                    t = $0; sub(/^[[:space:]]+/, "", t); sub(/[[:space:]]+$/, "", t)
+                    if (substr(t, 1, 1) == "[") { sect = t; next }
+                    if (sect != "[Service]" || t == "" || substr(t, 1, 1) == "#" || substr(t, 1, 1) == ";") next
+                    eq = index(t, "="); if (eq == 0) next
+                    k = substr(t, 1, eq - 1); sub(/[[:space:]]+$/, "", k)
+                    if (!(k in want)) next
+                    v = substr(t, eq + 1); sub(/^[[:space:]]+/, "", v)
+                    if (substr(v, length(v), 1) == bs) { print "FAIL the " k "= line of the unit continues on the next line; re-point it by hand"; next }
+                    if (v == "") { cnt[k] = 0; next }
+                    if (k in single) cnt[k] = 0
+                    cnt[k]++; val[k, cnt[k]] = v
+                  }
+                  END {
+                    for (j = 1; j <= nk; j++) {
+                      k = keys[j]; m = 0
+                      for (x = 1; x <= cnt[k]; x++) if (mentions(val[k, x])) m = 1
+                      if (!m) continue
+                      print "KEY " k
+                      # Exec*= is a list: reset it, then restate every entry.
+                      # Environment= is not reset (that would drop the
+                      # adoption drop-in): later assignments win per variable.
+                      if (k != "Environment" && !(k in single)) print "DROPIN " k "="
+                      for (x = 1; x <= cnt[k]; x++)
+                        if (k != "Environment" || mentions(val[k, x])) print "DROPIN " k "=" swap(val[k, x])
+                    }
+                  }')"
+                [ -n "$plan" ] && printf '%s\n' "$plan"
+                # Each re-pointed executable must exist in the live install...
+                printf '%s\n' "$plan" | grep '^DROPIN Exec' | while IFS= read -r l; do
+                  v="${l#*=}"
+                  while case "$v" in [-@:+!]*) true ;; *) false ;; esac; do v="${v#?}"; done
+                  exe="${v%% *}"
+                  case "$exe" in
+                    "$TC_LINK"/*) [ -x "$exe" ] || echo "FAIL $exe (re-pointed from the unit) does not exist in the live install" ;;
+                  esac
+                done
+                # ...and every other re-pointed path, or at least its directory.
+                printf '%s\n' "$plan" | grep '^DROPIN ' | sed 's/^DROPIN [A-Za-z]*=//' | tr ' "=' '\n\n\n' | grep -- "^$TC_LINK/" \
+                  | sort -u | while read -r p; do
+                      [ -e "$p" ] || [ -d "$(dirname "$p")" ] || echo "FAIL $p (re-pointed from the unit): neither it nor its directory exists in the live install"
+                    done
+                exit 0
+              args:
+                executable: /bin/bash
+              environment:
+                TC_OLD: "{{ tc_retire_candidates | join(':') }}"
+                TC_LINK: "{{ tc_link_path }}"
+                TC_SVC: "{{ tc_service_name }}"
+              register: tc_unit_plan
+              changed_when: false
+              when: tc_retire_candidates | length > 0
+
+            - name: "Retire :: read the unit re-point plan"
+              ansible.builtin.set_fact:
+                tc_unit_keys: "{{ tc_unit_plan.stdout_lines | default([]) | select('match', '^KEY ') | map('regex_replace', '^KEY ', '') | list }}"
+                tc_unit_lines: "{{ tc_unit_plan.stdout_lines | default([]) | select('match', '^DROPIN ') | map('regex_replace', '^DROPIN ', '') | list }}"
+                tc_unit_fail: >-
+                  {{ (tc_unit_plan.stdout_lines | default([]) | select('match', '^FAIL ') | map('regex_replace', '^FAIL ', '') | list)
+                     + ([('re-point plan failed: ' ~ (tc_unit_plan.stderr | default('') | trim))]
+                        if (tc_unit_plan.rc | default(0)) != 0 else []) }}
+
+            - name: "Retire :: re-point the unit lines at the stable indirection path"
+              ansible.builtin.copy:
+                dest: "/etc/systemd/system/{{ tc_service_name }}.service.d/samurai-tomcat-paths.conf"
+                mode: '0644'
+                content: |
+                  # Managed by SamurAI Shield (tomcat_update_with_evidence.yml): the lines
+                  # of this unit that named a superseded Tomcat install, re-pointed at
+                  # {{ tc_link_path }}. Drop-ins apply in name order, after the unit file.
+                  [Service]
+                  {% for l in tc_unit_lines %}
+                  {{ l }}
+                  {% endfor %}
+              register: tc_unit_write
+              when:
+                - tc_action == 'Apply'
+                - tc_retire_old_install | bool
+                - tc_unit_lines | length > 0
+                - tc_unit_fail | length == 0
+
+            - name: "Retire :: reload systemd after re-pointing the unit (no restart: the JVM already serves the link)"
+              ansible.builtin.systemd:
+                daemon_reload: true
+              when: tc_unit_write is changed
+
+            - name: "Retire :: check that nothing still uses each candidate"
+              ansible.builtin.shell: |
+                set -u
+                cand="$TC_CAND"
+                # 0 when stdin mentions the candidate as a whole path (so
+                # /opt/apache-tomcat-9.0.5 never matches .../9.0.50).
+                mentions() {
+                  awk 'BEGIN { p = ENVIRON["TC_CAND"] }
+                       { s = $0; while ((i = index(s, p)) > 0) { c = substr(s, i + length(p), 1); if (c !~ /[A-Za-z0-9._-]/) { found = 1 }; s = substr(s, i + 1) } }
+                       END { exit !found }'
+                }
+                if [ ! -d "$cand" ] || [ -L "$cand" ]; then
+                  echo "KEEP not a real directory"
+                  exit 0
+                fi
+                [ -f "$cand/lib/catalina.jar" ] || echo "KEEP no lib/catalina.jar under it (not recognized as a Tomcat install)"
+                # Effective properties: a drop-in Environment= that overrode
+                # the old CATALINA_HOME of the base unit no longer shows; an
+                # ExecStart=<old>/bin/startup.sh still does (the old bin/ is
+                # what systemd runs, even with CATALINA_HOME on the link).
+                # TC_IGNORE_KEYS: on Check, the keys Apply would re-point.
+                refs=""
+                while IFS= read -r line; do
+                  k="${line%%=*}"
+                  case " $TC_IGNORE_KEYS " in *" $k "*) continue ;; esac
+                  printf '%s\n' "$line" | mentions && refs="$refs $k"
+                done < <(systemctl show -- "$TC_SVC" 2>/dev/null)
+                [ -n "$refs" ] && echo "KEEP the $TC_SVC unit still references it in:$refs"
+                systemctl show -p EnvironmentFiles --value -- "$TC_SVC" 2>/dev/null | awk 'NF {print $1}' | sed 's/^-//' \
+                  | while read -r f; do
+                      [ -r "$f" ] && mentions < "$f" && echo "KEEP EnvironmentFile $f of $TC_SVC references it"
+                    done
+                own="$(systemctl show -p FragmentPath -p DropInPaths --value -- "$TC_SVC" 2>/dev/null | tr ' ' '\n')"
+                grep -rIlsF -- "$cand" /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system /run/systemd/system \
+                    /etc/init.d /etc/sysconfig /etc/default /etc/crontab /etc/cron.d /var/spool/cron /etc/logrotate.d 2>/dev/null \
+                  | while read -r f; do
+                      printf '%s\n' "$own" | grep -qxF -- "$f" && continue
+                      mentions < "$f" && echo "KEEP $f references it"
+                    done
+                # This check and its ancestors (the Ansible module, and the
+                # whole controller when it runs on the host itself, whose
+                # -e CATALINA_HOME=<old> is on its command line) do not count.
+                skip=" $$ "
+                a="$$"
+                while [ -n "$a" ] && [ "$a" -gt 1 ]; do
+                  a="$(awk '/^PPid:/ {print $2}' "/proc/$a/status" 2>/dev/null)"
+                  skip="$skip$a "
+                done
+                for p in /proc/[0-9]*; do
+                  pid="${p##*/}"
+                  case "$skip" in *" $pid "*) continue ;; esac
+                  for l in "$p/cwd" "$p/exe" "$p/root" "$p"/fd/*; do
+                    t="$(readlink "$l" 2>/dev/null)" || continue
+                    case "$t" in
+                      "$cand"|"$cand"/*) echo "KEEP process $pid ($(cat "$p/comm" 2>/dev/null)) has $t open"; break ;;
+                    esac
+                  done
+                  tr '\0' '\n' < "$p/cmdline" 2>/dev/null | mentions \
+                    && echo "KEEP process $pid ($(cat "$p/comm" 2>/dev/null)) has it on its command line"
+                done
+                find "$(dirname "$cand")" -maxdepth 1 -type l 2>/dev/null | while read -r l; do
+                  [ "$(readlink -f "$l")" = "$cand" ] && echo "KEEP symlink $l points to it"
+                done
+                echo "SIZE_KB $(du -sk -- "$cand" 2>/dev/null | awk '{print $1}')"
+                exit 0
+              args:
+                executable: /bin/bash
+              environment:
+                TC_CAND: "{{ item }}"
+                TC_SVC: "{{ tc_service_name }}"
+                TC_IGNORE_KEYS: >-
+                  {{ (tc_unit_keys | join(' '))
+                     if (tc_action != 'Apply' and (tc_retire_old_install | bool) and tc_unit_fail | length == 0) else '' }}
+              loop: "{{ tc_retire_candidates }}"
+              register: tc_retire_guard
+              changed_when: false
+
+            - name: "Retire :: classify the candidates"
+              ansible.builtin.set_fact:
+                tc_retire_plan: >-
+                  {%- set ns = namespace(out=[]) -%}
+                  {%- for r in tc_retire_guard.results | default([]) -%}
+                  {%- set lines = r.stdout_lines | default([]) -%}
+                  {%- set keep = lines | select('match', '^KEEP ') | map('regex_replace', '^KEEP ', '') | unique | list -%}
+                  {%- if (r.rc | default(1)) != 0 -%}
+                  {%- set keep = keep + ['the usage check itself failed: ' ~ (r.stderr | default('') | trim)] -%}
+                  {%- endif -%}
+                  {%- if tc_unit_fail | length > 0 -%}
+                  {%- set keep = keep + ['the unit could not be re-pointed at ' ~ tc_link_path ~ ': ' ~ (tc_unit_fail | join('; '))] -%}
+                  {%- endif -%}
+                  {%- if (tc_live_dir ~ '/').startswith(r.item ~ '/') -%}
+                  {%- set keep = keep + ['it contains the live install ' ~ tc_live_dir] -%}
+                  {%- endif -%}
+                  {%- if (tc_backup_dir ~ '/').startswith(r.item ~ '/') or (evidence_dir ~ '/').startswith(r.item ~ '/') -%}
+                  {%- set keep = keep + ['it contains TOMCAT_BACKUP_DIR or the evidence directory'] -%}
+                  {%- endif -%}
+                  {%- set size = lines | select('match', '^SIZE_KB ') | map('regex_replace', '^SIZE_KB ', '') | first | default('0') -%}
+                  {%- set ns.out = ns.out + [{'path': r.item, 'size_kb': size | int, 'keep_reasons': keep,
+                                              'archive': tc_backup_dir ~ '/' ~ (r.item | basename) ~ '-' ~ execution_timestamp ~ '.tar.gz'}] -%}
+                  {%- endfor -%}
+                  {{ ns.out }}
+
+            - name: "Retire :: decide what is removed in this run"
+              ansible.builtin.set_fact:
+                tc_retire_go: >-
+                  {{ (tc_retire_plan | rejectattr('keep_reasons') | list)
+                     if (tc_action == 'Apply' and (tc_retire_old_install | bool)) else [] }}
+
+            - name: "Retire :: warn about every superseded install that has to stay"
+              ansible.builtin.set_fact:
+                samurai_warnings: >-
+                  {{ samurai_warnings + ['OLD TOMCAT INSTALL KEPT on ' ~ inventory_hostname ~ ': ' ~ item.path
+                     ~ ' is superseded by ' ~ tc_live_dir ~ ' but was not removed because: '
+                     ~ (item.keep_reasons | join('; '))
+                     ~ '. Vulnerability scanners keep reporting it until it is gone; fix the reference and re-run'
+                     ~ ' ACTION=Apply (it retires leftovers even when the version is already current).'] }}
+              loop: "{{ tc_retire_plan | selectattr('keep_reasons') | list }}"
+              loop_control:
+                label: "{{ item.path }}"
+              when:
+                - tc_action == 'Apply'
+                - tc_retire_old_install | bool
+
+            - name: "Retire :: create the backup directory (root only)"
+              ansible.builtin.file:
+                path: "{{ tc_backup_dir }}"
+                state: directory
+                owner: root
+                group: root
+                mode: '0700'
+              when: tc_retire_go | length > 0
+
+            - name: "Retire :: read the free space where the backups go"
+              ansible.builtin.command:
+                argv: [df, -P, -k, "{{ tc_backup_dir }}"]
+              register: tc_backup_df
+              changed_when: false
+              when: tc_retire_go | length > 0
+
+            # The uncompressed size is the upper bound of the archive: never
+            # fill the disk to save a directory nobody runs anymore.
+            - name: "Retire :: fail when the backups might not fit"
+              ansible.builtin.fail:
+                msg: >-
+                  {{ tc_backup_dir }} has {{ tc_backup_df.stdout_lines[-1].split()[3] }} KB free; the
+                  superseded install(s) take {{ tc_retire_go | map(attribute='size_kb') | sum }} KB
+                  uncompressed. Nothing was removed.
+              when:
+                - tc_retire_go | length > 0
+                - (tc_backup_df.stdout_lines[-1].split()[3] | int) <= (tc_retire_go | map(attribute='size_kb') | sum)
+
+            - name: "Retire :: archive each superseded install (owners and modes kept)"
+              ansible.builtin.command:
+                argv:
+                  - tar
+                  - --create
+                  - --gzip
+                  - "--file={{ item.archive }}"
+                  - "--directory={{ item.path | dirname }}"
+                  - --
+                  - "{{ item.path | basename }}"
+              loop: "{{ tc_retire_go }}"
+              loop_control:
+                label: "{{ item.path }}"
+
+            - name: "Retire :: read each archive back (gzip stream and tar index intact)"
+              ansible.builtin.shell: |
+                set -o pipefail
+                tar --list --gzip --file="$TC_ARCHIVE" | wc -l
+              args:
+                executable: /bin/bash
+              environment:
+                TC_ARCHIVE: "{{ item.archive }}"
+              loop: "{{ tc_retire_go }}"
+              loop_control:
+                label: "{{ item.archive }}"
+              register: tc_retire_verify
+              changed_when: false
+              failed_when: tc_retire_verify.rc != 0 or (tc_retire_verify.stdout | trim | int) < 1
+
+            - name: "Retire :: checksum each archive"
+              ansible.builtin.stat:
+                path: "{{ item.archive }}"
+                checksum_algorithm: sha256
+                get_checksum: true
+              loop: "{{ tc_retire_go }}"
+              loop_control:
+                label: "{{ item.archive }}"
+              register: tc_retire_archive_stat
+
+            - name: "Retire :: restrict each archive to root"
+              ansible.builtin.file:
+                path: "{{ item.archive }}"
+                owner: root
+                group: root
+                mode: '0600'
+              loop: "{{ tc_retire_go }}"
+              loop_control:
+                label: "{{ item.archive }}"
+
+            - name: "Retire :: mark that removal started (archives are kept from here on)"
+              ansible.builtin.set_fact:
+                tc_retire_removal_started: true
+              when: tc_retire_go | length > 0
+
+            - name: "Retire :: remove each superseded install"
+              ansible.builtin.file:
+                path: "{{ item.path }}"
+                state: absent
+              loop: "{{ tc_retire_go }}"
+              loop_control:
+                label: "{{ item.path }}"
+          rescue:
+            # Before the removal started the archives are just copies of
+            # directories still on disk: drop them. Once it started, an
+            # archive may be the only copy left of a half-removed tree.
+            - name: "Retire failed :: remove the archives written by this run"
+              ansible.builtin.file:
+                path: "{{ item.archive }}"
+                state: absent
+              loop: "{{ tc_retire_go | default([]) }}"
+              loop_control:
+                label: "{{ item.archive }}"
+              ignore_errors: true
+              when: not (tc_retire_removal_started | default(false))
+
+            - name: "Retire failed :: record the warning"
+              ansible.builtin.set_fact:
+                tc_retire_error: "{{ ansible_failed_result.msg | default('unknown error') }}"
+                samurai_warnings: >-
+                  {{ samurai_warnings + ['OLD TOMCAT INSTALL NOT RETIRED on ' ~ inventory_hostname
+                     ~ ' (the patch itself succeeded; the job was NOT marked as failed because of this): '
+                     ~ (ansible_failed_result.msg | default('unknown error'))
+                     ~ ((' Backups already written are kept under ' ~ tc_backup_dir ~ '.')
+                        if (tc_retire_removal_started | default(false)) else '')] }}
+          always:
+            - name: "Retire :: confirm which superseded installs are gone"
+              ansible.builtin.stat:
+                path: "{{ item.path }}"
+                get_checksum: false
+              loop: "{{ tc_retire_go | default([]) }}"
+              loop_control:
+                label: "{{ item.path }}"
+              register: tc_retire_after
+
+            - name: "Retire :: record the outcome"
+              ansible.builtin.set_fact:
+                tc_unit_repointed:
+                  dropin: "{{ ('/etc/systemd/system/' ~ tc_service_name ~ '.service.d/samurai-tomcat-paths.conf')
+                              if (tc_unit_write | default({}) is changed) else 'not_written' }}"
+                  keys: "{{ tc_unit_keys | default([]) if (tc_unit_write | default({}) is changed) else [] }}"
+                  lines: "{{ tc_unit_lines | default([]) if (tc_unit_write | default({}) is changed) else [] }}"
+                  problems: "{{ tc_unit_fail | default([]) }}"
+                tc_old_installs_retired: >-
+                  {%- set ns = namespace(out=[]) -%}
+                  {%- for r in tc_retire_after.results | default([]) -%}
+                  {%- if r.stat is defined and not r.stat.exists -%}
+                  {%- set sha = (tc_retire_archive_stat.results | default([]) | selectattr('item.path', 'equalto', r.item.path)
+                                 | map(attribute='stat.checksum') | first | default('unknown')) -%}
+                  {%- set ns.out = ns.out + [{'path': r.item.path, 'size_kb': r.item.size_kb, 'backup': r.item.archive,
+                                              'backup_sha256': sha,
+                                              'restore': 'tar --extract --gzip --preserve-permissions --file=' ~ r.item.archive
+                                                         ~ ' --directory=' ~ (r.item.path | dirname)}] -%}
+                  {%- endif -%}
+                  {%- endfor -%}
+                  {{ ns.out }}
+                tc_old_installs_kept: >-
+                  {%- set ns = namespace(out=[]) -%}
+                  {%- set gone = tc_retire_after.results | default([]) | selectattr('stat', 'defined')
+                                 | rejectattr('stat.exists') | map(attribute='item.path') | list -%}
+                  {%- for c in tc_retire_plan | default([]) -%}
+                  {%- if c.path not in gone -%}
+                  {%- set why = c.keep_reasons
+                                or (['ACTION=Check (read-only): would be archived to ' ~ c.archive ~ ' and removed on Apply'
+                                     ~ ((', after re-pointing ' ~ (tc_unit_keys | join(', ')) ~ ' of the ' ~ tc_service_name ~ ' unit at ' ~ tc_link_path)
+                                        if (tc_unit_keys | default([]) | length > 0) else '')]
+                                    if tc_action != 'Apply' else [])
+                                or (['TOMCAT_RETIRE_OLD_INSTALL=false'] if not (tc_retire_old_install | bool) else [])
+                                or ['retirement failed: ' ~ (tc_retire_error | default('unknown error'))] -%}
+                  {%- set ns.out = ns.out + [{'path': c.path, 'size_kb': c.size_kb, 'reasons': why}] -%}
+                  {%- endif -%}
+                  {%- endfor -%}
+                  {{ ns.out }}
+
+            - name: "Write old_installs.json"
+              ansible.builtin.copy:
+                dest: "{{ evidence_dir }}/old_installs.json"
+                mode: '0640'
+                content: >-
+                  {{ {'live_install': tc_live_dir | default('unknown'), 'backup_dir': tc_backup_dir,
+                      'unit_repointed': tc_unit_repointed,
+                      'retired': tc_old_installs_retired, 'kept': tc_old_installs_kept} | to_nice_json }}
+              ignore_errors: true
+
+            - name: "Retire :: result"
+              ansible.builtin.debug:
+                msg: >-
+                  {%- set ns = namespace(out=[]) -%}
+                  {%- for r in tc_old_installs_retired -%}
+                  {%- set ns.out = ns.out + ['RETIRED ' ~ r.path ~ ' (backup ' ~ r.backup ~ ', sha256 ' ~ r.backup_sha256 ~ ')'] -%}
+                  {%- endfor -%}
+                  {%- for k in tc_old_installs_kept -%}
+                  {%- set ns.out = ns.out + ['KEPT ' ~ k.path ~ ': ' ~ (k.reasons | join('; '))] -%}
+                  {%- endfor -%}
+                  {{ ns.out or ['no superseded Tomcat install found on ' ~ inventory_hostname] }}
+
       rescue:
         - name: "Capture rescue error"
           ansible.builtin.set_fact:
@@ -1307,6 +1825,9 @@
               custom_webapps_migrated: "{{ tomcat_custom_webapps | default([]) }}"
               extra_libs_migrated: "{{ tomcat_extra_libs | default([]) }}"
               rollback_outcome: "{{ tomcat_rollback_outcome | default('not_applicable') }}"
+              old_installs_retired: "{{ tc_old_installs_retired | default([]) }}"
+              old_installs_kept: "{{ tc_old_installs_kept | default([]) }}"
+              unit_repointed: "{{ tc_unit_repointed | default({'dropin': 'not_written', 'keys': [], 'lines': [], 'problems': []}) }}"
               service_check: "{{ svc_check_result | default({'status': ('disabled' if not (svc_check_enabled | bool) else 'not_run')}) }}"
               evidence_dir: "{{ evidence_dir if (evidence_dir_ready | default(false)) else 'not_created' }}"
               unreachable: "{{ samurai_unreachable | default(false) | bool }}"
