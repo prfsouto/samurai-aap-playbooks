@@ -55,6 +55,8 @@ ACTION: "Check"
 #                                     # come back. What stays down is a warning with the
 #                                     # start error (job not failed). Same contract as the
 #                                     # other evidence playbooks.
-# SERVICE_SETTLE_SECONDS: 120         # max wait for services to come back by themselves
+# SERVICE_SETTLE_SECONDS: 120         # max wait for services to come back by themselves,
+#                                     # and for the TCP ports that were listening before
+#                                     # (a JVM binds them long after systemd says active)
 # SERVICE_IGNORE: ""                  # csv of service names (trailing * = prefix) or TCP ports
 # EVIDENCE_BASE_DIR: "/var/tmp/samurai-shield/java-library-patch"
