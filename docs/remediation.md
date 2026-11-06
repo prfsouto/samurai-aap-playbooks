@@ -2,6 +2,14 @@
 
 Use the playbook catalog to choose the target and mode, then check the required inputs and evidence for that playbook. [Back to the repository guide](../README.md).
 
+## Lab candidates
+
+Candidates in this section have their own applicability and evidence. They are
+separate from the AAP Job Template catalog.
+
+- [DLA-4855-1 for Debian 12 amd64](../playbooks/remediation_candidates/debian12_brotli_dla_4855/README.md)
+  updates the installed Brotli shared library using the verified Debian artifact.
+
 ## linux_yum_update_with_evidence.yml
 
 Performs controlled yum/dnf update operations on Red Hat-like Linux systems with pre-checks, post-checks, evidence collection and structured JSON output.

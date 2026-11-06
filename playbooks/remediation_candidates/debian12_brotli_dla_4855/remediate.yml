@@ -1,0 +1,158 @@
+---
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 AxisOps Ltd (GB08681761)
+# Adapted from the upstream Debian upgrade and reread steps. This candidate
+# selects one verified local Debian artifact and checks the transaction scope.
+- name: Update Debian 12 libbrotli1 for DLA-4855-1 in the lab
+  hosts: samurai_remediation_lab
+  gather_facts: false
+  vars:
+    brotli_action: "{{ ACTION | default('Check') }}"
+    brotli_fixed_version: "1.0.9-2+deb12u1"
+    brotli_asset_dir: /var/tmp/samurai-advisory-assets
+    brotli_asset_path: "{{ brotli_asset_dir }}/libbrotli1_1.0.9-2+deb12u1_amd64.deb"
+    brotli_asset_sha256: e27b3d655fa6fadd7a56f706687e94573c0af68b7d6df394a32a381a3a6c6d8b
+    brotli_apt_argv:
+      - /usr/bin/apt-get
+      - install
+      - --only-upgrade
+      - --no-remove
+      - --no-install-recommends
+      - -o
+      - Dir::Etc::sourcelist=/dev/null
+      - -o
+      - Dir::Etc::sourceparts=/dev/null
+      - -o
+      - Dir::Cache::pkgcache=
+      - -o
+      - Dir::Cache::srcpkgcache=
+      - -o
+      - Dpkg::Options::=--force-confold
+      - "{{ brotli_asset_path }}"
+
+  tasks:
+    - name: Require one explicitly selected lab host and a supported action
+      ansible.builtin.assert:
+        that:
+          - ansible_play_hosts_all | length == 1
+          - brotli_action in ['Check', 'Apply']
+
+    - name: Gather platform facts
+      ansible.builtin.setup:
+        gather_subset: ["!all", "!min", distribution, architecture]
+
+    - name: Require Debian 12 on x86_64
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['distribution'] == 'Debian'
+          - ansible_facts['distribution_major_version'] == '12'
+          - ansible_facts['architecture'] == 'x86_64'
+
+    - name: Observe the installed package before the change
+      ansible.builtin.import_tasks: observe.yml
+
+    - name: Retain the baseline version and comparison
+      ansible.builtin.set_fact:
+        brotli_version_before: "{{ brotli_observed.stdout.split('|')[2] }}"
+        brotli_floor_met_before: "{{ brotli_version_check.rc == 0 }}"
+
+    - name: Apply the pinned update
+      when:
+        - brotli_action == 'Apply'
+        - not ansible_check_mode
+        - not brotli_floor_met_before
+      become: true
+      environment:
+        LC_ALL: C
+        DEBIAN_FRONTEND: noninteractive
+        NEEDRESTART_SUSPEND: "1"
+      block:
+        - name: Refuse package holds or nonstandard selection states
+          ansible.builtin.assert:
+            that: brotli_observed.stdout.split('|')[1] == 'install'
+
+        - name: Inspect the protected staging directory
+          ansible.builtin.stat:
+            path: "{{ brotli_asset_dir }}"
+            follow: false
+          register: brotli_staging
+
+        - name: Require a root-owned private staging directory
+          ansible.builtin.assert:
+            that:
+              - brotli_staging.stat.isdir | default(false)
+              - brotli_staging.stat.uid == 0
+              - brotli_staging.stat.mode == '0700'
+
+        - name: Inspect the staged Debian package
+          ansible.builtin.stat:
+            path: "{{ brotli_asset_path }}"
+            follow: false
+            checksum_algorithm: sha256
+          register: brotli_asset
+
+        - name: Require the exact vendor artifact in the protected directory
+          ansible.builtin.assert:
+            that:
+              - brotli_asset.stat.isreg | default(false)
+              - brotli_asset.stat.uid == 0
+              - brotli_asset.stat.nlink == 1
+              - brotli_asset.stat.mode in ['0400', '0600']
+              - brotli_asset.stat.checksum == brotli_asset_sha256
+
+        - name: Read the package's automatic installation marker
+          ansible.builtin.command:
+            argv: [/usr/bin/apt-mark, showauto, "libbrotli1:amd64"]
+          register: brotli_auto_before
+          changed_when: false
+
+        - name: Simulate the offline transaction
+          ansible.builtin.command:
+            argv: "{{ brotli_apt_argv + ['--simulate'] }}"
+          register: brotli_plan
+          changed_when: false
+
+        - name: Require an upgrade of only the installed Brotli library
+          ansible.builtin.assert:
+            that:
+              - >-
+                brotli_plan.stdout_lines | select('match', '^(Inst|Conf|Remv|Purg) ')
+                | list | length == 2
+              - brotli_plan.stdout is search('(?m)^Inst libbrotli1 \[')
+              - brotli_plan.stdout is search('(?m)^Conf libbrotli1 \(')
+
+        - name: Upgrade the installed library using the verified artifact
+          ansible.builtin.command:
+            argv: "{{ brotli_apt_argv + (['--mark-auto'] if brotli_auto_before.stdout else []) + ['-y'] }}"
+          changed_when: true
+
+        - name: Verify the package's automatic installation marker
+          ansible.builtin.command:
+            argv: [/usr/bin/apt-mark, showauto, "libbrotli1:amd64"]
+          register: brotli_auto_after
+          changed_when: false
+          failed_when: brotli_auto_after.rc != 0 or brotli_auto_after.stdout != brotli_auto_before.stdout
+
+    - name: Observe the installed package after the change
+      ansible.builtin.include_tasks: observe.yml
+      when: brotli_action == 'Apply' and not ansible_check_mode and not brotli_floor_met_before
+
+    - name: Require the advisory floor after Apply
+      ansible.builtin.assert:
+        that: brotli_version_check.rc == 0
+      when: brotli_action == 'Apply' and not ansible_check_mode
+
+    - name: Publish package evidence for the lab run
+      ansible.builtin.set_stats:
+        aggregate: false
+        per_host: true
+        data:
+          samurai_lab_brotli:
+            cve: CVE-2026-111497
+            advisory: DLA-4855-1
+            package: libbrotli1:amd64
+            version_before: "{{ brotli_version_before }}"
+            version_after: "{{ brotli_observed.stdout.split('|')[2] }}"
+            vendor_floor: "{{ brotli_fixed_version }}"
+            package_floor_met: "{{ brotli_version_check.rc == 0 }}"
+            runtime_verified: false

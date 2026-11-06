@@ -1,0 +1,51 @@
+---
+schema_version: 1
+component: debian12_brotli_dla_4855
+cve: CVE-2026-111497
+advisory: https://security-tracker.debian.org/tracker/DLA-4855-1
+status: lab_candidate
+upstream:
+  repository: https://github.com/axisops/CVE-2026-111497
+  tag: samp/v1.0.3
+  commit: 0e61195290643c324cd179b71954fa0389a78fd6
+  file: brotli_decoder_mitigation/files/brotli_decoder_mitigator.py
+  source: https://github.com/axisops/CVE-2026-111497/blob/0e61195290643c324cd179b71954fa0389a78fd6/brotli_decoder_mitigation/files/brotli_decoder_mitigator.py#L490-L525
+  sha256: 3f12dfb858530cd5bdaac063e8f0dbc6cd3916f7ac5d976d9594aed1abd336e2
+  author: Richard Stubbs
+  copyright: Copyright (c) 2026 AxisOps Ltd (GB08681761)
+  license: MIT
+  license_file: LICENSE
+  license_sha256: 7b60c635252ada72190e69e085ad55131b4ba4236998ff8c61af98705bdadf56
+  tests: https://github.com/axisops/CVE-2026-111497/blob/0e61195290643c324cd179b71954fa0389a78fd6/tests/test_brotli_decoder_mitigator.py
+  evidence: Command construction with a stand-in package manager and dpkg version comparison.
+adaptation:
+  files: [remediate.yml, observe.yml]
+  changes:
+    - Reexpress the Debian upgrade-only flow in Ansible.
+    - Pin the official security artifact and check the offline APT transaction.
+    - Re-read installed package state without collecting process data or restarting services.
+  dependencies: [ansible-core, apt-get, apt-mark, dpkg, dpkg-query]
+  runtime_scope: Debian 12 bookworm amd64 with libbrotli1 already installed
+validation:
+  environment: Debian 12.15 amd64 in disposable rootless Podman without a network
+  image: docker.io/library/python@sha256:4c92ffcde4dd6f1ff72a24518f49fd4990b27134987dfa31a733badde66df9f8
+  python: 3.14.6
+  ansible_core: 2.21.2
+  baseline_version: 1.0.9-2
+  result_version: 1.0.9-2+deb12u1
+  proved:
+    - Official security index signature and artifact checksum.
+    - Check and Ansible check mode preserve the installed version.
+    - Refusal of an invalid checksum, a held package, and a package marked for reinstallation.
+    - Only the intended package version changed, with manual and automatic APT markers preserved.
+    - Repeat Apply made no changes.
+    - A fresh process compressed and decompressed a Brotli payload.
+  pending: [AAP execution environment, existing workload, recovery]
+artifact:
+  name: libbrotli1_1.0.9-2+deb12u1_amd64.deb
+  source_package: brotli
+  vendor: Debian
+  packaging_commit: 8c0571703a911d674fed3a8e1e38c18c276f2131
+  package_metadata: https://packages.debian.org/bookworm/amd64/libbrotli1/download
+  url: https://security.debian.org/debian-security/pool/updates/main/b/brotli/libbrotli1_1.0.9-2+deb12u1_amd64.deb
+  sha256: e27b3d655fa6fadd7a56f706687e94573c0af68b7d6df394a32a381a3a6c6d8b
