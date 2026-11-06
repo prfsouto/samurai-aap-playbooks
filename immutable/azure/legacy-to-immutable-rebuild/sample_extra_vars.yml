@@ -4,8 +4,7 @@
 # ----------------------------------------------------------------------------
 # Copy this file as a launch-time extra-vars payload for the AAP Workflow
 # Template. Replace every placeholder enclosed in <...>. Never commit a
-# populated copy of this file with real subscription IDs, Git tokens or
-# credentials — it is only an example.
+# populated copy of this example with real subscription IDs or credentials.
 # ============================================================================
 
 # ---------------------------------------------------------------------------
@@ -36,16 +35,11 @@ ssh_username: "<user>"
 # winrm_username: "<user>"
 
 # ---------------------------------------------------------------------------
-# Artifact + Git output
+# Private artifact output
 # ---------------------------------------------------------------------------
 # Local working directory on the AAP execution environment. Each step writes
-# its outputs under this path; step 7 then pushes them to Git.
+# its outputs under this path. Use a private persistent mount for retention.
 artifact_output_dir: "/tmp/samurai/legacy-to-immutable-rebuild/<vm-name>"
-
-git_repo_url: "https://github.com/<org>/<repo>.git"
-git_branch: "main"
-# git_token is intentionally NOT set here. It must come from an AAP Source
-# Control credential or from the GIT_TOKEN env-var.
 
 # ---------------------------------------------------------------------------
 # Safety gates

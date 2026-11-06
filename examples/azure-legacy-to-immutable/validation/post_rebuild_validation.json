@@ -1,0 +1,9 @@
+{
+  "azure_status": "passed",
+  "generated_at": "2026-01-01T00:05:00Z",
+  "os_reachable": true,
+  "overall_status": "passed",
+  "resource_group": "example-rg",
+  "subscription_id": "00000000-0000-0000-0000-000000000000",
+  "vm_name": "example-vm"
+}
