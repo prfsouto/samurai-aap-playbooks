@@ -1,0 +1,31 @@
+---
+# SPDX-License-Identifier: MIT
+- name: Read the native Debian package record
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/dpkg-query
+      - --show
+      - "--showformat=${db:Status-Status}|${db:Status-Want}|${Version}|${source:Package}|${db:Status-Eflag}"
+      - libbrotli1:amd64
+    expand_argument_vars: false
+  register: brotli_observed
+  changed_when: false
+  check_mode: false
+
+- name: Require an installed package from the Brotli source package
+  ansible.builtin.assert:
+    that:
+      - brotli_observed.stdout is match('^installed\|(?:install|hold)\|[0-9][0-9A-Za-z.+:~\-]*\|brotli\|ok$')
+
+- name: Compare the installed package with the advisory floor
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/dpkg
+      - --compare-versions
+      - "{{ brotli_observed.stdout.split('|')[2] }}"
+      - ge
+      - "{{ brotli_fixed_version }}"
+  register: brotli_version_check
+  changed_when: false
+  failed_when: brotli_version_check.rc not in [0, 1]
+  check_mode: false
