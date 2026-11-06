@@ -62,8 +62,8 @@ registry, workflow history) and never executes any remediation locally.
    [6] 06_generate_terraform_from_vm.yml     (read-only)
               │  → generated-iac/*.tf + tfvars.example
               ▼
-   [7] 07_commit_artifacts_to_git.yml        (mutating: Git only)
-              │  → push inventory/managed-servers/<id>-<vm>/
+   [7] 07_commit_artifacts_to_git.yml        (read-only)
+              │  → record Git publication disabled
               ▼
        Workflow complete
 ```
@@ -89,15 +89,13 @@ the payload server-side and forwards it to AAP.
 | `winrm_username`               | conditional | SamurAI Shield  | Required when `os_connection_type=winrm`.                                              |
 | `dry_run`                      | optional | UI toggle          | Default `true`. Step 4 only mutates Azure when `dry_run=false`.                       |
 | `confirm_destructive_action`   | optional | UI toggle          | Default `false`. Step 4 only mutates Azure when this is `true`.                       |
-| `git_repo_url`                 | optional | SamurAI Shield     | If absent, step 7 will fail; previous steps still produce artifacts.                  |
-| `git_branch`                   | optional | SamurAI Shield     | Default `main`.                                                                        |
 
 ---
 
 ## 4. Outputs
 
 All outputs are written under `{{ artifact_output_dir }}` on the AAP
-execution environment, and step 7 commits them to Git.
+execution environment. Use an approved private persistent mount for retention.
 
 ```
 artifact_output_dir/
@@ -125,8 +123,8 @@ artifact_output_dir/
     └── README.md
 ```
 
-In Git, the same tree appears under
-`inventory/managed-servers/<managed_server_id>-<azure_vm_name>/`.
+The public repository contains only
+[synthetic evidence examples](../../../../examples/azure-legacy-to-immutable/).
 
 ---
 
@@ -204,32 +202,19 @@ Renders Jinja templates under `templates/terraform/` into
 `generated-iac/`. Output is explicitly marked as a baseline and contains
 `# TODO: review` markers next to fields that depend on tenant policy.
 
-### Step 7 — Commit artifacts to Git (mutating: Git only)
+### Step 7 — Record Git publication disabled (read-only)
 
-- Shallow-clones the repo.
-- Copies the artifacts under
-  `inventory/managed-servers/<id>-<vm>/`.
-- Commits with the message
-  `Add legacy Azure VM rebuild baseline for <vm_name>`.
-- Pushes.
-- Removes the local working copy.
-
-The Git token is loaded from `extra_vars.git_token` or from the
-`GIT_TOKEN` env var, used in-memory only and `no_log: true` is set on
-every task that touches it.
+Existing Job Templates retain this playbook path. The step reports
+`samurai_git_committed: false` and `samurai_evidence_publication: disabled`.
+It leaves the evidence in the execution environment.
 
 ---
 
 ## 6. Security decisions
 
-- **No secrets in artifacts.** Every JSON, Markdown and Terraform file
-  produced by the flow is free of admin passwords, SSH keys, WinRM
-  passwords and Git tokens. The Terraform baseline deliberately omits
-  `admin_password`.
-- **`no_log: true`** is applied to every task that handles credentials.
-- **OS facts gathering avoids application data.** Only system-level
-  artifacts are collected (packages, services, ports). No user data,
-  no application logs, no DB content.
+- **Evidence is private.** Baselines, reports and generated Terraform may
+  contain host, network and cloud resource details. Keep them out of Git.
+- Supply Azure and machine credentials through AAP credential types.
 - **Least-privilege RBAC** is documented in the README. The flow does not
   require Owner / Subscription Contributor.
 - **Static Public IP is enforced** before any destructive action.
@@ -252,8 +237,8 @@ stage to the next via the filesystem (e.g. playbook 02 reads
 
 The wrapper playbook
 `playbooks/00_full_workflow.yml` imports all 7 playbooks in one Ansible
-run. Single container, single `/tmp/`, artifacts naturally persist.
-Recommended for demos and first-time validation.
+run. One container keeps the artifacts available across stages. Mount private
+persistent storage if the evidence must survive the job.
 
 #### B. Multi-node Workflow Template + Persistent Volume
 
@@ -313,7 +298,6 @@ persistent-volume configuration above.
 | 4     | Delete succeeded, create failed | Manually recreate VM from preserved OS disk; the disk is still in the resource group. Snapshots are the last-resort rollback. |
 | 5     | OS unreachable       | Investigate NSG/firewall; the VM may still be functionally rebuilt. |
 | 6     | Template error       | Re-run step 6 only; idempotent.                            |
-| 7     | Push rejected        | Fix branch protection / token scope; re-run step 7 only.   |
 
 ---
 
@@ -355,8 +339,6 @@ Content-Type: application/json
     "azure_resource_group": "...",
     "azure_vm_name": "...",
     "artifact_output_dir": "/tmp/samurai/legacy-to-immutable-rebuild/<vm>",
-    "git_repo_url": "https://github.com/<org>/<evidence-repo>.git",
-    "git_branch": "main",
     "dry_run": true,
     "confirm_destructive_action": false,
     "os_connection_type": "ssh",
@@ -366,21 +348,16 @@ Content-Type: application/json
 }
 ```
 
-Credentials (Azure SPN, Machine SSH/WinRM, Git PAT) are bound to the AAP
+Azure and machine credentials are bound to the AAP
 Workflow Template via AAP credential types. SamurAI Shield does **not** send
 secret material to AAP.
 
 ### Evidence ingestion
 
-After the workflow finishes, SamurAI Shield can either:
-
-1. Poll AAP for the final `samurai_shield_result` set-stat (preferred for
-   live status), or
-2. Fetch the artifact tree directly from the evidence Git repository at
-   `inventory/managed-servers/<managed_server_id>-<azure_vm_name>/`.
-
-Both modes are supported because every step emits `set_stats` and step 7
-commits the same data to Git.
+Use AAP job status and result stats to follow the execution. For the
+artifact files, use the approved private mount configured as
+`artifact_output_dir`. A temporary execution directory is only available
+for the life of the job.
 
 ### Managed Server detail UI
 
@@ -389,7 +366,6 @@ the UI definition):
 
 - Section *Immutable Infrastructure Engine*
   - Banner with the latest run status (read from workflow history).
-  - Link to the evidence directory in Git.
   - Link to the rendered `validation_report.md` and
     `post_rebuild_validation.md`.
   - Action buttons:
@@ -397,7 +373,7 @@ the UI definition):
       `confirm_destructive_action=false`.
     - *Run real rebuild* — launches with `dry_run=false`,
       `confirm_destructive_action=true` (with an explicit modal confirm).
-    - *Open generated Terraform* — links to `generated-iac/` in Git.
+    - *Open generated Terraform* — uses the generated files from private storage.
 
 ---
 

@@ -10,7 +10,7 @@
 #
 # Each node maps 1:1 to a playbook in ./playbooks/. Edges describe the
 # success path; on_failure is set to halt the workflow because every step is
-# either read-only, mutating-with-rollback (snapshots, Git) or destructive
+# either read-only, mutating-with-rollback (snapshots) or destructive
 # (rebuild) and there is no safe automatic recovery.
 # ============================================================================
 
@@ -19,7 +19,7 @@ description: >-
   Converts a brownfield Azure VM into a governed, validated and IaC-ready
   asset. Read-only baseline → snapshots → identity preservation →
   destructive-gated rebuild → post-rebuild validation → Terraform generation
-  → Git commit.
+  → record that Git publication is disabled.
 
 # ---------------------------------------------------------------------------
 # Inputs the workflow expects from SamurAI Shield (extra_vars).
@@ -35,8 +35,6 @@ inputs:
     - target_host
     - os_connection_type       # ssh | winrm
   optional:
-    - git_repo_url
-    - git_branch
     - dry_run                  # default true
     - confirm_destructive_action  # default false
     - ssh_username
@@ -118,13 +116,12 @@ nodes:
     on_failure: halt
 
   - id: commit_artifacts
-    name: "7. Commit Artifacts To Git"
+    name: "7. Record Git Publication Disabled"
     playbook: "playbooks/07_commit_artifacts_to_git.yml"
-    classification: "mutating (Git)"
+    classification: "read-only"
     description: >-
-      Pushes baseline, snapshots, rebuild result, validation, and the
-      generated Terraform to the SamurAI Shield evidence repository at
-      inventory/managed-servers/<managed_server_id>-<azure_vm_name>/.
+      Preserves the Job Template entry point and reports that Git
+      publication is disabled. Evidence remains under artifact_output_dir.
     on_success: end
     on_failure: halt
 
@@ -137,9 +134,9 @@ classifications:
     - preserve_network
     - validate_rebuild
     - generate_terraform
+    - commit_artifacts
   mutating:
     - create_snapshots
-    - commit_artifacts
   destructive_gated:
     - rebuild_vm
 

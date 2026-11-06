@@ -40,7 +40,7 @@ has its own setup and workflow guide.
 | [`roles/`](roles/) | Reusable tasks, variables, templates, and files loaded by playbooks. |
 | [`workflow_templates/`](workflow_templates/) | Definitions for AAP templates and the campaign callback credential type. |
 | [`packer/`](packer/) and [`shared/`](shared/) | Image-build template and the helper that fingerprints image definitions. |
-| [`immutable/`](immutable/) and [`inventory/`](inventory/) | Azure legacy-to-immutable demonstration and its recorded evidence. |
+| [`immutable/`](immutable/) and [`examples/`](examples/azure-legacy-to-immutable/) | Azure rebuild demonstration and synthetic evidence examples. |
 | [`rulebooks/`](rulebooks/) | Placeholder for event-driven automation. |
 | [`tests/`](tests/) | Python and local Ansible tests for playbook and role behavior. |
 

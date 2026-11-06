@@ -39,7 +39,7 @@ the AAP Workflow Template and forwards `extra_vars`.
 | 4 | `04_rebuild_vm_from_existing_os_disk.yml`| destructive-gated| `rebuild/rebuild_result.json`                     |
 | 5 | `05_post_rebuild_validation.yml`        | read-only        | `validation/post_rebuild_validation.{json,md}`, `diff_report.json` |
 | 6 | `06_generate_terraform_from_vm.yml`     | read-only        | `generated-iac/*.tf`, `terraform.tfvars.example`  |
-| 7 | `07_commit_artifacts_to_git.yml`        | mutating (Git)   | Commit on `inventory/managed-servers/<id>-<vm>/`  |
+| 7 | `07_commit_artifacts_to_git.yml`        | read-only        | Git publication status for existing Job Templates |
 
 The full sequence is documented in [`workflow.yml`](workflow.yml) and in
 [`docs/azure_legacy_to_immutable_rebuild_workflow.md`](docs/azure_legacy_to_immutable_rebuild_workflow.md).
@@ -141,8 +141,6 @@ playbooks — `Microsoft.Compute/virtualMachines/{read,deallocate/action,delete,
 
 - **Azure** credential type (service principal or managed identity).
 - **Machine** credential (SSH key for Linux **or** WinRM user for Windows).
-- **Source Control** credential for the Git repository where artifacts are
-  committed (only required if step 7 is run).
 
 ---
 
@@ -219,27 +217,20 @@ iteration — see the *Future work* section in `docs/`.
 
 ## Artifact versioning
 
-Step 7 commits the artifacts produced by all previous steps to the Git
-repository at:
+Step 7 reports that Git publication is disabled. Artifacts are written under
+`artifact_output_dir` in the AAP execution environment. To retain them beyond
+the job, use an approved private persistent mount at that path.
 
-```
-inventory/managed-servers/<managed_server_id>-<azure_vm_name>/
-```
-
-This path is structured to match the SamurAI Shield Managed Server detail
-view, so the application can fetch evidence directly from Git.
+The repository contains [synthetic examples](../../../examples/azure-legacy-to-immutable/)
+for documentation and testing.
 
 ---
 
 ## Security notes
 
-- Secrets (Git tokens, Azure SPN secrets, SSH/WinRM passwords) are never
-  written to JSON, Markdown, Terraform or stdout. They must be supplied via
-  AAP credentials or environment variables.
-- The generated Terraform omits all sensitive fields and uses comments to
-  flag values that the operator must review (`admin_username`, `subnet_id`,
-  `image_reference`, etc.).
-- `no_log: true` is set on every task that handles tokens or passwords.
+- Supply Azure and machine credentials through AAP credential types.
+- Treat generated JSON, reports and Terraform as private operational data.
+  They can identify hosts, networks and cloud resources.
 
 ---
 
