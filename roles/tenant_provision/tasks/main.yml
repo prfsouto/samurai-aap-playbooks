@@ -1,5 +1,7 @@
 ---
-# Provisioning of one tenant (ADR 0031): Vault precondition, tenant file in Git, wait for ArgoCD, report.
+# Provisioning of one tenant (ADR 0031, decision 12): this job only writes the tenant file to Git and reports the commit.
+# The Vault precondition is checked by the remediation-engine before the launch and the convergence of the ArgoCD
+# Application is read by the engine afterwards: neither system is reachable from the AAP, and the AAP holds no token for them.
 # Endpoint, repository and branch come from the credential (environment), never from launch variables, so nobody who can
 # launch the template can point the GitHub App JWT at another host. The tokens are masked by the modules themselves
 # (no_log in the argument spec), so a failure keeps its reason in the job output.
@@ -27,14 +29,6 @@
     - tenant_admin_full_name
   loop_control: {label: "{{ item }}"}
 
-- name: Check the Vault precondition (read-only)
-  samurai_vault_precondition:
-    addr: "{{ lookup('ansible.builtin.env', 'SAMURAI_VAULT_ADDR') }}"
-    token: "{{ lookup('ansible.builtin.env', 'SAMURAI_VAULT_TOKEN') }}"
-    tenant_internal_id: "{{ tenant_internal_id }}"
-    ca_file: "{{ lookup('ansible.builtin.env', 'SAMURAI_VAULT_CA_FILE') }}"
-  register: tenant_provision_vault
-
 - name: Commit the tenant file
   samurai_tenant_file:
     tenant_internal_id: "{{ tenant_internal_id }}"
@@ -52,17 +46,6 @@
     commit_message: "feat(tenants): provision {{ tenant_environment }}/{{ tenant_internal_id }} (job {{ tenant_provision_job_id }}, correlation {{ samurai_execution_id }})"
   register: tenant_provision_file
 
-- name: Wait for the ArgoCD Application to be Synced and Healthy (read-only)
-  samurai_argocd_wait:
-    server: "{{ lookup('ansible.builtin.env', 'SAMURAI_ARGOCD_SERVER') }}"
-    token: "{{ lookup('ansible.builtin.env', 'SAMURAI_ARGOCD_TOKEN') }}"
-    project: "{{ lookup('ansible.builtin.env', 'SAMURAI_ARGOCD_PROJECT') | default('tenants', true) }}"
-    ca_file: "{{ lookup('ansible.builtin.env', 'SAMURAI_ARGOCD_CA_FILE') }}"
-    name: "tenant-{{ tenant_internal_id }}"
-    timeout_seconds: "{{ tenant_provision_argocd_timeout_seconds | int }}"
-    interval_seconds: "{{ tenant_provision_argocd_interval_seconds | int }}"
-  register: tenant_provision_argocd
-
 - name: Report the result to the Execution Center
   ansible.builtin.set_stats:
     per_host: false
@@ -75,6 +58,3 @@
         attempt_key: "{{ tenant_provision_attempt_key }}"
         commit_sha: "{{ tenant_provision_file.commit_sha }}"
         file_changed: "{{ tenant_provision_file.changed }}"
-        application: "{{ tenant_provision_argocd.application }}"
-        sync: "{{ tenant_provision_argocd.sync }}"
-        health: "{{ tenant_provision_argocd.health }}"
