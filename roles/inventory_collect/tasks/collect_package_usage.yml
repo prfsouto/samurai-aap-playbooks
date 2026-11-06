@@ -26,6 +26,8 @@
       no_log: true
       tags: [inventory_collect, collect, package_usage]
 
+    # O recibo v1 calcula a identidade da sonda no argv. Preserve o lançador
+    # legado quando o binding não trouxer seletor.
     - name: "[inventory_collect] Read package usage of running units (read-only)"
       ansible.builtin.command:
         argv:
@@ -33,14 +35,69 @@
           - -c
           - "{{ lookup('file', role_path + '/files/collect_rhel_package_usage.py') }}"
         stdin: "{{ inventory_collect_package_usage_request | to_json }}"
-      # Teto da sonda inteira (unidades 60 s, dependentes reversos 30 s, dimensões 30 s + 10 s de prazo
-      # duro). Leitura presa sem interrupção (NFS parado) estoura aqui e cai no rescue, sem recibo.
       timeout: 300
-      register: inventory_collect_package_usage_raw
+      register: inventory_collect_package_usage_legacy_raw
       changed_when: false
       failed_when: false
       no_log: true
-      when: inventory_collect_package_usage_bound | bool
+      when:
+        - inventory_collect_package_usage_bound | bool
+        - inventory_collect_package_usage_request.expected_probe_sha256 is not defined
+      tags: [inventory_collect, collect, package_usage]
+
+    # A sonda viaja no stdin com o request, não no argv: argumento acima de MAX_ARG_STRLEN (131072 bytes) não
+    # executa. O lançador em ``-c`` só repõe o request no stdin e executa o texto com ``PROBE_TEXT``, de onde
+    # sai a identidade do recibo (o mesmo ``lookup('file')``, igual a ``PROBE_SHA256``). Nada é gravado no alvo.
+    - name: "[inventory_collect] Read package usage with the v2 probe"
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_facts.python.executable }}"
+          - -c
+          # Literal, não variável: extra_vars não troca o código que roda no alvo.
+          - >-
+            import io,json,sys;d=json.load(sys.stdin);sys.stdin=io.StringIO(json.dumps(d['request']));
+            exec(compile(d['probe'],'collect_rhel_package_usage_v2.py','exec'),{'__name__':'__main__','PROBE_TEXT':d['probe']})
+        stdin: >-
+          {{ {'probe': lookup('file', role_path + '/files/collect_rhel_package_usage_v2.py'),
+              'request': inventory_collect_package_usage_request} | to_json }}
+      # Teto da sonda inteira (unidades 60 s, dependentes reversos 30 s, dimensões 30 s + 10 s de prazo
+      # duro; na candidata B, o sucessor 90 s, dos quais 60 s para os imports Python). Leitura presa sem interrupção (NFS parado) estoura aqui e cai no rescue, sem recibo.
+      timeout: 300
+      register: inventory_collect_package_usage_v2_raw
+      changed_when: false
+      failed_when: false
+      no_log: true
+      when:
+        - inventory_collect_package_usage_bound | bool
+        - inventory_collect_package_usage_request.expected_probe_sha256 is defined
+        - inventory_collect_package_usage_request.expected_probe_sha256 is string
+        - inventory_collect_package_usage_request.expected_probe_sha256 == '415c26e8d9830a8aac30f420a1654098c730b4cdac41db033badab898a410586'
+        - >-
+          inventory_collect_package_usage_request.successor_runtime is not defined
+          or (
+            inventory_collect_package_usage_request.purpose | default('') != 'source_omission_evidence'
+            and inventory_collect_package_usage_request.privileged_measurement is not defined
+            and inventory_collect_package_usage_request.execution_plan_id is integer
+            and inventory_collect_package_usage_request.execution_plan_id > 0
+            and inventory_collect_package_usage_request.candidate_execution_id is string
+            and inventory_collect_package_usage_request.candidate_execution_id | trim | length > 0
+            and inventory_collect_package_usage_request.managed_server_id is integer
+            and inventory_collect_package_usage_request.managed_server_id > 0
+            and inventory_collect_package_usage_request.target_host | default('') == inventory_hostname
+          )
+        - >-
+          lookup('file', role_path + '/files/collect_rhel_package_usage_v2.py') | hash('sha256')
+          == inventory_collect_package_usage_request.expected_probe_sha256
+      tags: [inventory_collect, collect, package_usage]
+
+    - name: "[inventory_collect] Refuse an unsupported package usage probe selector"
+      ansible.builtin.set_fact:
+        inventory_collect_package_usage_error: "package usage probe selector refused; receipt not merged"
+      when:
+        - inventory_collect_package_usage_bound | bool
+        - inventory_collect_package_usage_request.expected_probe_sha256 is defined
+        - inventory_collect_package_usage_v2_raw is skipped
+      no_log: true
       tags: [inventory_collect, collect, package_usage]
 
     # ``privilege`` registra o privilégio MEDIDO (euid da sonda), o marcador que veio no request e o job do
@@ -58,6 +115,11 @@
                 }
               })
             }) }}
+      vars:
+        inventory_collect_package_usage_raw: >-
+          {{ inventory_collect_package_usage_legacy_raw
+             if inventory_collect_package_usage_request.expected_probe_sha256 is not defined
+             else inventory_collect_package_usage_v2_raw }}
       when:
         - inventory_collect_package_usage_bound | bool
         - inventory_collect_package_usage_raw is defined

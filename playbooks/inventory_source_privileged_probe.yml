@@ -22,6 +22,7 @@
           - request.purpose | default('') == 'source_omission_evidence'
           - request.candidate_execution_id is not defined
           - request.execution_plan_id is not defined
+          - request.successor_runtime is not defined
           - request.samurai_execution_id | default('') == samurai_execution_id
           - (request.organization_id | default(-1) | string) == (organization_id | string)
           - request.target_host | default('') == target_host
