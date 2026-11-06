@@ -1,0 +1,632 @@
+# Remediation and vulnerability validation
+
+Use the playbook catalog to choose the target and mode, then check the required inputs and evidence for that playbook. [Back to the repository guide](../README.md).
+
+## linux_yum_update_with_evidence.yml
+
+Performs controlled yum/dnf update operations on Red Hat-like Linux systems with pre-checks, post-checks, evidence collection and structured JSON output.
+
+Supported actions:
+
+- `Check`: validates the host and lists available updates without changing packages.
+- `Apply`: applies yum/dnf updates and collects before/after evidence.
+
+A host that fails a gate or the update is recovered by `rescue` so its
+`summary.json` is still written, and a last play re-fails it after the
+consolidated JSON is out, so the PLAY RECAP grades it failed. The re-fail is not
+in the per-host play: with `serial: 1`, a failing host there would stop the rest
+of the wave. For the same reason, fact gathering and the evidence directory run
+inside that `rescue` block. An unreachable host is recorded
+(`unreachable: true` in its summary) instead of aborting the batch, and the last
+play tries to reach it again, so a host that is still down shows as
+`unreachable` in the PLAY RECAP. `started_at` comes from the execution node's
+clock (UTC), like `finished_at`. The long, repo-bound tasks (`check-update`,
+the update itself) also tolerate a dropped connection and turn it into a
+failure that `rescue` handles. If `summary.json` cannot be written, the host
+ends `failed` instead of failing inside `always`. In both cases the wave goes
+on. A connection drop in any other, short task still stops the wave. The apt
+playbook does the same, for its index refreshes and the upgrade.
+
+**Service check (`SERVICE_CHECK`, default `on`).** Before the change (in
+`Check` and `Apply`), the playbook records the running services (systemd units,
+read with `systemctl --plain`, except `static` ones activated on demand) and the
+listening TCP ports with the
+process that owns each one. That second list also covers applications that are
+not services, such as a `java -jar` started by a script. After `Apply` and the
+reboot, it waits up to `SERVICE_SETTLE_SECONDS` (default 120) for those
+services to come back, starts again whatever did not, and compares:
+
+- everything back: `SERVICES VALIDATED ... as before the change` in the job
+  output, plus a note listing the services the playbook had to start;
+- something still down: `WARNING: SERVICES NOT AS BEFORE THE CHANGE`, one line
+  per service (with the error from the start attempt) or port, asking the
+  operator to check why. **The job does not fail because of it**: the items also
+  go to `warnings` in the summary.
+
+The messages are plain ASCII English, so they read the same in the AAP job
+output and in any log viewer that decodes it.
+
+The result goes to `service_check` in `summary.json` and in the consolidated
+JSON, to `services_before.json` / `services_check.json` in the evidence
+directory, and play 3 prints one line per host. A unit that was already failed
+before the change is reported apart (`failed_services_before`) and not blamed on
+the update. A port counts as lost only if it is gone and its process now listens
+on fewer ports than before, so dynamic ports that move on reboot (RPC,
+`rpc.statd`) are tolerated, while one of two applications sharing a process name
+(`java`) going down is still caught. `SERVICE_IGNORE` takes names (trailing `*` = prefix) or ports to
+leave out. Any unexpected error inside the check also becomes a warning instead
+of failing the host. The failed-units list (`failed_services_after`) is now
+collected after the reboot, too.
+
+## linux_yum_targeted_package_update_with_evidence.yml
+
+The **targeted** sibling of the yum playbook. It updates only the packages
+named in `PACKAGES` (e.g. `httpd` or `httpd,mod_ssl`) and never runs a
+full-system `yum update`. It exists to close a scope mismatch: when the
+remediation intent is "patch the Apache component", the generic playbook's
+whole-system update is refused by the SamurAI Shield AI evaluation.
+
+Same shape as the generic playbook: dynamic inventory from `HOSTNAMES`, one host
+at a time (`serial: 1`, `any_errors_fatal`), evidence under
+`/var/tmp/samurai-shield/yum-targeted-update/<host>/<timestamp>`, rescue/always
+so `summary.json` is written even when the host fails, and a consolidated
+`samurai_shield_result` JSON block on stdout.
+
+Supported actions:
+
+- `Check`: `yum check-update <packages>` for the named packages only
+  (rc 100 = update available, not an error). Nothing is changed.
+- `Apply`: `yum update -y <packages>` restricted to the list, then re-queries
+  the installed versions.
+
+Scope rules enforced by the playbook:
+
+1. `PACKAGES` is required; plain package names only — globs, wildcards and
+   version specs are rejected so the scope can never widen.
+2. A target package that is **not installed** fails the host. The playbook
+   updates, it never installs.
+3. The central evidence is `target_packages_diff.txt` /
+   `summary.json.target_package_diff`: per target, the installed version
+   before, the version `check-update` offered, the version after, and whether it
+   changed. Dependencies pulled in by the targeted update are listed separately
+   as `dependency_packages_updated`.
+
+Reboot follows the two-source rule: the engine's lowercase `allow_reboot` wins
+over the survey's `ALLOW_REBOOT`, and `summary.json` records the winner as
+`allow_reboot_source`. `reboot_required_before` / `reboot_required_after` are
+`required`, `not_required` or `unknown`.
+
+Survey: [linux_yum_targeted_package_update.survey_spec.json](../playbooks/linux_yum_targeted_package_update.survey_spec.json).
+
+## linux_apt_update_with_evidence.yml
+
+The Debian-family counterpart of the yum playbook — **Ubuntu** is the primary
+target, Debian works too. Same shape: dynamic inventory from `HOSTNAMES`,
+pre-checks, optional upgrade, post-checks, evidence files under
+`/var/tmp/samurai-shield/apt-update/<host>/<timestamp>` and a consolidated
+`samurai_shield_result` JSON block on stdout.
+
+Supported actions:
+
+- `Check`: refreshes the apt cache and **simulates** the upgrade (`apt-get -s`),
+  reporting what would change. It downloads package indexes and installs no
+  packages.
+- `Apply`: performs the upgrade, then re-checks (package diff, dpkg health,
+  failed units, pending reboot, kernel) and optionally reboots.
+
+What differs from the yum playbook, because apt is not yum:
+
+1. **`security` mode uses `unattended-upgrade`.** Debian/Ubuntu have no
+   `apt --security`; the security pocket is selected by
+   `Unattended-Upgrade::Allowed-Origins`. Like the yum playbook with
+   `--security`, this one **refuses to fall back** to a full upgrade — if
+   `/usr/bin/unattended-upgrade` is missing the run fails with a clear message.
+2. **`EXCLUDE_PACKAGES` maps to `apt-mark hold`.** apt has no `--exclude`, so the
+   listed packages are held for the run and then unheld — except any package the
+   operator had **already** held, which stays held.
+3. **`APT_UPGRADE_MODE` (default `upgrade`)** runs `apt-get upgrade
+   --with-new-pkgs`: it installs new dependencies (so kernel meta-packages do
+   move) but **never removes** a package. `dist-upgrade` is the full resolver and
+   *may remove* packages — opt in deliberately.
+4. **`/boot` is gated in MB, not percent** (`MIN_FREE_MB_BOOT`, default 200). A
+   512 MB `/boot` at 84% has ~80 MB free — not enough for a new kernel +
+   initramfs, and a kernel upgrade that fails mid-transaction can leave the host
+   unbootable.
+5. **apt/dpkg locks are a hard gate.** Ubuntu runs `apt-daily` and
+   `unattended-upgrades` on timers; the playbook refuses to start when a lock is
+   actively held rather than colliding with them.
+6. **dpkg health is checked after Apply** — a half-configured dpkg state is the
+   apt-specific failure that a zero exit code can still hide.
+
+The normal remediation call only needs `HOSTNAMES` + `ACTION`. See
+[linux_apt_update.sample_extra_vars.yml](../playbooks/linux_apt_update.sample_extra_vars.yml)
+for the full contract and
+[linux_apt_update.survey_spec.json](../playbooks/linux_apt_update.survey_spec.json)
+for the Job Template survey (apply it the same way as the [Windows survey](#job-template-survey)).
+
+Reboot follows the same two-source rule as the Windows playbook: the engine's
+lowercase `allow_reboot` wins over the survey's `ALLOW_REBOOT`, and
+`summary.json` records which one won as `allow_reboot_source`.
+
+## oracle_rac_patch_with_evidence.yml
+
+Rolling patch of Oracle Grid Infrastructure (GI) + all Oracle Database homes on a
+Real Application Cluster (RAC), using `opatchauto` + `datapatch`. Nodes are patched
+**one at a time** (`serial: 1`) so the cluster stays available, and every node is
+returned to the exact state it was found in.
+
+Safety model ("deliver the environment exactly as it was found"):
+
+1. **Health gate** — refuses to start if the cluster is not fully healthy, so a
+   degraded cluster is never turned into an outage.
+2. **Baseline capture** — records every database instance, listener and service
+   that is ONLINE on the local node before patching.
+3. **Patch** — stages/unzips the patch, always runs `opatchauto apply -analyze`
+   (read-only prereq/conflict check), and in Apply mode runs `opatchauto apply`
+   (RAC-aware: stops the local node's resources, patches GI + all DB homes, and
+   restarts them).
+4. **datapatch** — on the last node of the rolling sequence by default, applies
+   the SQL payload of the RU to each database (idempotent, run once per DB).
+5. **Restore + re-validate** — brings back anything from the baseline that did
+   not come back automatically, then re-checks. If the node cannot be returned
+   to its baseline, the play fails **before** touching the next node
+   (`any_errors_fatal: true`), so a bad node never cascades cluster-wide.
+
+Supported actions:
+
+- `Check`: stages and extracts the patch, then runs `opatchauto apply -analyze`
+  to check prerequisites and conflicts before any patch is applied.
+- `Apply`: full rolling patch, `datapatch`, and baseline restore/validation.
+
+The patch mechanism assumes: privilege escalation configured (opatchauto runs as
+root, crsctl/srvctl as the GI owner, datapatch as each DB home owner), `unzip`
+available on the nodes, a rolling-installable RU/RUR, and OPatch already meeting
+the patch's minimum version. See
+[oracle_rac_patch.sample_extra_vars.yml](../playbooks/oracle_rac_patch.sample_extra_vars.yml)
+for the full extra-vars contract, and the header of the playbook for details.
+
+## windows_update_with_evidence.yml
+
+Controlled Windows Update run on Windows Server targets, reached over WinRM/PSRP.
+Same shape as the Linux update playbook: pre-checks, optional install, post-checks,
+evidence files under `C:\ProgramData\samurai-shield\windows-update\<host>\<timestamp>`
+and a consolidated `samurai_shield_result` JSON block on stdout.
+
+Supported actions:
+
+- `Check`: searches Windows Update and lists what is applicable. Nothing is
+  downloaded or installed.
+- `Apply`: installs the updates found, re-checks the host (hotfix diff, pending
+  reboot, remaining updates, stopped automatic services) and optionally reboots.
+
+Safety model:
+
+1. **Gates before touching anything** — refuses to run when the OS is not
+   Windows, when the Windows Update service is missing/disabled, or when the
+   system drive has less than `MIN_FREE_GB` (default 5 GB) free.
+2. **Reboot is the playbook's decision, never the module's** — `win_updates` is
+   always called with `reboot: false`. The host is rebooted only when reboot is
+   allowed *and* it actually reports a pending reboot; otherwise it is left
+   pending and `reboot_required_after=required` is reported in the JSON. The "allowed"
+   flag has two sources: the SamurAI engine injects a lowercase `allow_reboot`
+   from the governed job, which **takes precedence**; the uppercase `ALLOW_REBOOT`
+   is the survey/manual knob (and the fallback default `false`). `summary.json`
+   records which source won as `allow_reboot_source` (`governed` | `survey` |
+   `default`). The coalescing keys on "defined", not "truthy", so a governed
+   `allow_reboot=false` is honoured as an explicit *no* rather than falling
+   through to the survey default.
+3. **Drivers are opt-in** — the default categories are
+   `SecurityUpdates,CriticalUpdates,UpdateRollups,Updates`. Drivers, Feature
+   Packs and Service Packs are only installed if `WU_CATEGORIES` asks for them.
+4. **Serial by default** (`SERIAL_BATCH=1`) so a wave never takes a whole fleet
+   down at once.
+5. **A failed host fails in the PLAY RECAP** — the `rescue` recovers a failing
+   host so `summary.json` is still written, and a last play re-fails it once the
+   consolidated JSON is out. The engine grades each host by its recap line and
+   ignores `localhost`, so without that re-fail a failed update would count as a
+   success. It runs in its own play, not right after the block, because with
+   `serial: 1` a host failing inside play 2 stops the rest of the wave.
+6. **One bad host never stops the wave** — fact gathering and the gates in
+   item 1 run inside the same `rescue` block, so a rejected host gets a
+   `status: failed` summary and the next host still runs. An unreachable host
+   is recorded (`unreachable: true` in its summary) instead of aborting the
+   batch; the last play tries to reach it again, so a host that is still down
+   shows as `unreachable` in the PLAY RECAP, not as a task failure. The same
+   applies to a host that drops during a `win_updates` call, and a host whose
+   `summary.json` cannot be written ends `failed`. A connection drop in any
+   other, short task still stops the wave.
+7. **Services back as they were** — same service check as the Linux
+   playbooks (`SERVICE_CHECK`, see the yum section), comparing the running
+   automatic-start services and the listening TCP ports before the change and
+   after the reboot. What did not come back is started again with
+   `win_service`; what stays down is a warning, never a job failure.
+   `SERVICE_SETTLE_SECONDS` defaults to 180 here, because delayed-start services
+   come up about 2 minutes after boot. Per-user service instances (`Name_1a2b3c`)
+   and services that stop by design (Windows Update, BITS, licensing, update
+   agents) are left out by default.
+
+The normal remediation call only needs `HOSTNAMES` + `ACTION`. Everything else
+(`ALLOW_REBOOT`, `WU_CATEGORIES`, `EXCLUDE_KB`, `WU_SERVER_SELECTION`,
+`BECOME_SYSTEM`, `LOG_LEVEL`, connection overrides, …) is optional with a working
+default — see
+[windows_update.sample_extra_vars.yml](../playbooks/windows_update.sample_extra_vars.yml)
+for the full contract and the header of the playbook for details.
+
+### Job Template survey
+
+[windows_update.survey_spec.json](../playbooks/windows_update.survey_spec.json) is the
+survey definition for the Job Template, kept in git so it is versioned and
+reviewable. From the repository root, use the command below. If the AAP
+certificate is signed by a private CA, pass its certificate with `--cacert`.
+
+```bash
+curl -X POST \
+  -H "Authorization: Bearer $AAP_TOKEN" -H "Content-Type: application/json" \
+  -d @playbooks/windows_update.survey_spec.json \
+  https://<aap-host>/api/v2/job_templates/<ID>/survey_spec/
+```
+
+Then enable **Prompt on launch → Survey** on the Job Template.
+
+Two reasons the survey matters beyond convenience:
+
+- `HOSTNAMES` is recognized by SamurAI Shield as a target-entry field, so it is
+  **hidden from the operator form and auto-filled from the governed asset** — it
+  is never typed by hand. The remediation engine also re-asserts it server-side,
+  so a value set anywhere else is ignored.
+- A survey takes precedence over the dashboard's heuristic playbook parse, which
+  otherwise scrapes internal `set_fact` names out of the YAML and sends them as
+  extra-vars — and extra-vars outrank `set_fact`, which breaks the run.
+
+Because AAP sends a blank optional survey answer as an **empty string** (not as
+an absent variable), every optional var is resolved with
+`(X | default('') | trim) or <default>` rather than a plain `| default()`.
+
+### AAP setup checklist
+
+Suggested order: check the Execution Environment first, since it is the only
+step that can require building an image. Then validate with `ACTION=Check`
+against a single host before allowing `Apply`.
+
+**1. Execution Environment.** The `winrm` connection plugin needs the **`pywinrm`**
+Python library, and `ansible-galaxy` cannot install Python dependencies — so
+`requirements.yml` does not cover this. If the EE lacks it, no Job Template
+setting can compensate; a custom EE is required.
+
+```bash
+podman run --rm <ee-image> python3 -c "import winrm; print(winrm.__version__)"
+podman run --rm <ee-image> ansible-galaxy collection list ansible.windows
+```
+
+`awx-ee` normally ships both; `ee-minimal` ships neither. `WIN_CONNECTION=psrp`
+needs `pypsrp` instead, and Kerberos auth needs `requests-kerberos`.
+
+**2. Project.** Sync the project after merging (or enable *Update Revision on
+Launch*). The root `requirements.yml` IS honoured — the controller stats
+`roles/requirements.yml`, `collections/requirements.yml` **and** the root
+`requirements.yml`, installing the last one with `ansible-galaxy install -r`,
+which handles roles and collections alike. It only runs when
+**Settings → Jobs → Enable Collection(s) Download** is on.
+
+**3. Credential.** A Machine credential whose user belongs to the local
+Administrators group on the targets. It injects `ansible_user` /
+`ansible_password`; the playbook's `add_host` pins only the transport, never
+credentials.
+
+**4. Job Template.**
+
+| Field | Value |
+| --- | --- |
+| Playbook | `playbooks/windows_update_with_evidence.yml` |
+| Inventory | any (e.g. `samurai_managed`) — required by AAP, but the playbook builds its own inventory and the targets need not be in it |
+| Credentials | the Windows Machine credential |
+| `ask_variables_on_launch` | **`true`** |
+| `survey_enabled` | `true`, plus the survey spec above |
+| Timeout | `0`, or well above a full update run |
+| `job_slice_count` | **`1`** |
+
+```bash
+curl -X PATCH \
+  -H "Authorization: Bearer $AAP_TOKEN" -H "Content-Type: application/json" \
+  -d '{"ask_variables_on_launch": true, "survey_enabled": true, "timeout": 0, "job_slice_count": 1}' \
+  https://<aap-host>/api/v2/job_templates/<ID>/
+```
+
+Two settings there are load-bearing:
+
+- **`ask_variables_on_launch: true`** — the remediation engine launches with
+  `{"extra_vars": json.dumps(...)}`. Without this flag the Controller *silently
+  discards* the extra-vars and reports them under `ignored_fields` — no error.
+  `HOSTNAMES` would never arrive and the job would end with "no hosts to target".
+- **`job_slice_count: 1`** — slicing partitions the *Job Template inventory*,
+  which this playbook ignores: play 1 runs on `localhost` and re-adds every host
+  from `HOSTNAMES` in **every** slice. With 3 slices, all 3 would patch the whole
+  fleet concurrently. Use the playbook's `SERIAL_BATCH` for batching instead.
+
+**Do NOT enable "Privilege Escalation" on the template.** It adds a global
+`--become`; combined with a Windows inventory that carries
+`ansible_become_method=runas`, the `runas` become plugin then loads on the
+`localhost` bootstrap play and fails with *"required ... become plugin: runas
+setting: become_user"*. The playbook declares `become` per task (`runas` /
+SYSTEM) and defensively pins `become: false` on every play, so an accidental
+global become no longer breaks it — but leaving the checkbox off is still the
+correct configuration.
+
+**5. Windows targets** (outside AAP). A WinRM listener reachable from the
+execution node on the port the playbook connects to. The default is **HTTPS
+5986**; `winrm quickconfig` only creates the **HTTP 5985** listener and opens
+5985 — an HTTPS listener plus a firewall rule for 5986 must be set up
+explicitly (see the header of `windows_update.sample_extra_vars.yml` for the
+`WIN_PORT` / `WIN_TRANSPORT` overrides if you must fall back to 5985/HTTP).
+Because the target hosts are built with `add_host`, they do NOT inherit
+connection vars from the AAP inventory — any `WIN_PORT` override must arrive as
+an extra-var (JT extra-vars or the mapping's `extra_vars_template`), not via the
+inventory. Also required: `wuauserv` not disabled (the playbook refuses to run
+otherwise) and enough free space on the system drive.
+
+**6. SamurAI Shield.** Point the playbook mapping at the new Job Template id. Do
+**not** put `HOSTNAMES` in the mapping's `extra_vars_template`: the engine always
+derives it from the governed asset and the merge only fills keys it has not already
+set, so the value is silently discarded.
+
+## tomcat_update_with_evidence.yml
+
+Controlled patch of a **self-managed Apache Tomcat** installation — not an
+rpm/dpkg package. This is the real shape found in the SamurAI Shield lab
+hosts (`vm1-samurai`/`vm2-samurai` run Tomcat 9.0.50 at
+`/opt/apache-tomcat-9.0.50`, outside any package manager), so none of the
+yum/apt playbooks above can touch it. Same evidence/service-check discipline
+as those playbooks — explicit template requested by the product owner: the
+`SERVICE_CHECK` block (running services + listening TCP ports, before vs.
+after, auto-restart of what did not come back, warning instead of job
+failure) is reused with the identical contract names
+(`SERVICE_CHECK`/`SERVICE_IGNORE`/`SERVICE_SETTLE_SECONDS`).
+
+**Patch strategy — symlink cutover** ("deliver the environment exactly as it
+was found", same philosophy as `oracle_rac_patch_with_evidence.yml`):
+
+1. `CATALINA_HOME` is whatever the systemd service references **today** — a
+   symlink, or (the common case) a real version-named directory. The
+   playbook detects which; it is never assumed. Once a host has been
+   patched once, the **stable indirection path** (below) — not the raw
+   `CATALINA_HOME` value the caller keeps sending — becomes the source of
+   truth, so a caller that never updates its stored value does not read a
+   permanently frozen old directory on every later run.
+2. The new version is downloaded (checksum-verified, never installed
+   without one, to a per-run random temp path that is removed afterwards)
+   and extracted into a **sibling** directory
+   (`apache-tomcat-<TARGET_VERSION>`), never on top of the old one.
+3. `conf/`, custom webapps (anything not in the stock Tomcat set — `ROOT`
+   is never stock: it is the single most common thing an operator
+   customizes) and any extra jars under `lib/` (e.g. a JDBC driver an
+   operator added) are migrated from the old install into the new one.
+   Only the migrated paths get their ownership touched — everything else
+   keeps the new version's own stock ownership/permissions.
+4. A systemd drop-in (`<service>.service.d/samurai-tomcat-home.conf`) points
+   `CATALINA_HOME`/`CATALINA_BASE` at a stable indirection path
+   (`<parent>/current-<SERVICE_NAME>` — named by service, not a bare
+   `current`, so it can never be confused with an unrelated product or
+   Tomcat instance sharing that parent directory), created once and
+   re-pointed via `ln -sfn` on every later Apply — the **first** Apply
+   against a host "adopts" its unmanaged install into this convention, and
+   only when THIS service's own drop-in confirms the link is really its
+   own; every later Apply is a pure symlink flip. The stage (download/extract/migrate) and the
+   cutover (stop/link/start/verify) run as two separate steps: a failure
+   while staging — before anything in the running service was touched —
+   never triggers a restart. If the cutover itself fails at any point from
+   the service stop onward, the playbook **automatically rolls back**:
+   repoints the link at the old version and restarts it, before failing the
+   host — a stuck "service down" is never an acceptable outcome of a failed
+   patch.
+5. After the restart, the playbook confirms the **live process** — not just
+   the files on disk — is actually serving the new version, by reading the
+   running PID's `-Dcatalina.base` straight out of `/proc`. Version reads
+   (Check included) never execute any vendor script: they parse
+   `ServerInfo.properties` directly out of `lib/catalina.jar`, read-only.
+6. The **superseded install is retired**: archived as a `tar.gz` (owners and
+   modes kept) into `TOMCAT_BACKUP_DIR` (default
+   `/var/backups/samurai-shield/tomcat-update`, root-only), read back, and
+   only then removed. Scanners find a Tomcat by its `lib/catalina.jar` on
+   disk, running or not, so an old directory left behind kept every CVE of
+   the old version open after a successful patch (vm1/vm2/vm3-samurai,
+   9.0.50 → 9.0.121). A hand-made unit usually hard-codes the old
+   directory — the lab units do: `ExecStart=/opt/apache-tomcat-9.0.50/bin/catalina.sh run`,
+   `ExecStop=…`, `CATALINA_PID=…/temp/tomcat.pid` — so systemd kept starting
+   and stopping the new Tomcat through the old `bin/` scripts. Those
+   `[Service]` lines (`Exec*`, `Environment`, `PIDFile`,
+   `WorkingDirectory`) are first re-pointed at `<parent>/current-<SERVICE_NAME>`
+   in a second drop-in, `samurai-tomcat-paths.conf`, written only when every
+   re-pointed path exists in the live install, followed by a
+   `daemon-reload` (no restart: the JVM already serves from the link). The
+   old directory is then **kept, with a warning**, while anything else
+   still uses it: the unit's effective properties, its `EnvironmentFile`,
+   any other unit/init/cron/logrotate file, a process, or a symlink beside it. A
+   re-run of `Apply` on an already-current, adopted host retires the stale
+   `CATALINA_HOME` the caller still sends, which cleans up hosts patched
+   before this step existed. `old_installs.json` in the evidence directory
+   lists what was retired (with the backup's SHA-256 and the restore
+   command) and what was kept, and why; `Check` lists what `Apply` would
+   retire. `TOMCAT_RETIRE_OLD_INSTALL=false` leaves the old directory
+   untouched.
+
+Supported actions:
+
+- `Check`: read-only. Reports the installed version vs `TARGET_VERSION` and
+  a services/ports baseline. Nothing is downloaded, nothing changes.
+- `Apply`: downloads + verifies the artifact, stages it, migrates
+  conf/webapps/libs, cuts the symlink over, restarts the service, confirms
+  the **live process** converged on `TARGET_VERSION`, and rolls back
+  automatically if any of that fails.
+
+Extra-vars contract — `HOSTNAMES`, `CATALINA_HOME`, `SERVICE_NAME` and
+`TARGET_VERSION` are always required (never guessed, including the version —
+no "latest"); `TOMCAT_ARTIFACT_URL` + `TOMCAT_ARTIFACT_SHA512` are required
+only when `ACTION=Apply`; a `TARGET_VERSION` older than what is installed, or
+on a different major.minor line, is refused unless `ALLOW_DOWNGRADE=true`
+(downgrade only — a cross-line jump is always refused, conf/webapps
+migration is only validated within one line). See
+[tomcat_update.sample_extra_vars.yml](../playbooks/tomcat_update.sample_extra_vars.yml)
+for the full contract and
+[tomcat_update.survey_spec.json](../playbooks/tomcat_update.survey_spec.json)
+for the Job Template survey.
+
+Validated against real Apache Tomcat 9.0.100 → 9.0.106 artifacts (extraction
+naming, conf/webapps/libs migration, ROOT handling, symlink resolution),
+against the full extra-vars/unreachable-host pipeline with
+`ansible-playbook`, and with a real `ACTION=Check` run against the actual
+lab hosts (`vm1-samurai`/`vm2-samurai`) through a disposable AAP Job
+Template. A live `ACTION=Apply` run against `vm1-samurai` through a disposable AAP Job
+Template (`9.0.50` → `9.0.121`, with the `-Dcatalina.base` live-process
+verification confirming the new install) was also executed and succeeded; the
+lab host had no systemd unit for Tomcat, so a minimal one was created for that
+test.
+
+> [!NOTE]
+> Scope boundary: this playbook patches the **Tomcat server component**
+> (the binary, bundled libraries, container config). It does **not** patch a
+> vulnerable Java library embedded inside a deployed webapp's own
+> `WEB-INF/lib` (e.g. an app-bundled log4j jar) — that is a separate,
+> per-app/per-jar operation, covered by
+> [java_library_patch_with_evidence.yml](#java_library_patch_with_evidenceyml)
+> below.
+
+## java_library_patch_with_evidence.yml
+
+Replaces a vulnerable **Java library (`.jar`)** found anywhere inside a
+directory tree — a server's own `lib/` (e.g. `tomcat_update_with_evidence.yml`
+left a jar there untouched on purpose, see its scope boundary above) or a
+webapp's `WEB-INF/lib/` — **unified**: both are just paths under the same
+`SEARCH_ROOT`, with no separate logic for one or the other. Design doc:
+[issue #93](https://github.com/prfsouto/samurai-aap-playbooks/issues/93).
+Born from a real finding
+([issue #92](https://github.com/prfsouto/samurai-aap-playbooks/issues/92)):
+`log4j-core-2.14.1.jar` (Log4Shell, CVE-2021-44228) survived the Tomcat patch
+on `vm1-samurai` because it sat loose in Tomcat's own `lib/`, migrated as a
+"legitimate extra jar an operator added" — `tomcat_update_with_evidence.yml`
+has no way to tell a legitimate extra jar from a vulnerable one, by design.
+
+**This playbook carries no CVE database and never decides a jar is
+vulnerable.** It receives exactly what to find (`JAR_NAME_PATTERN`) and what
+to replace it with (`NEW_JAR_URL`/`NEW_JAR_SHA512`/`NEW_JAR_FILENAME`) — the
+same externally-supplied-target model `TARGET_VERSION` already uses in
+`tomcat_update_with_evidence.yml`. The product (scan + CVE + playbook
+mapping) decides what is vulnerable and which version is the fix; Ansible
+only executes.
+
+**Patch strategy — stage + cutover** (same "deliver the environment exactly
+as it was found" philosophy as `tomcat_update_with_evidence.yml` /
+`oracle_rac_patch_with_evidence.yml`):
+
+1. `Check` (read-only) finds every file under `SEARCH_ROOT` whose basename
+   matches `JAR_NAME_PATTERN` and lists each one (path, size, sha512).
+   Nothing changes.
+2. `Apply :: stage` — service untouched: downloads `NEW_JAR_URL` to a per-run
+   random temp path (checksum-verified against `NEW_JAR_SHA512`, never
+   installed without one) and locates every match that is **not** already
+   converged (the idempotency rule — a location counts as converged only when
+   its basename is `NEW_JAR_FILENAME` **and** its sha512 equals
+   `NEW_JAR_SHA512`, so a broad `JAR_NAME_PATTERN` like `log4j-core-*.jar`
+   does not loop on the jar it just installed on a previous run, while a
+   vulnerable jar that merely carries the target name is still replaced).
+   A failure here — bad URL, checksum mismatch — never touches the service.
+3. `Apply :: cutover` — stops `SERVICE_NAME`, **renames** (never deletes)
+   each old jar to `<name>.bak-<timestamp>` in place, copies the replacement
+   to every matched location, restarts the service, confirms it reports
+   active. If any step from the service stop onward fails, the rescue
+   restores every renamed backup and restarts the service before re-raising
+   — a host is never left with the service down just because the cutover
+   failed.
+4. Post-check confirms the replacement jar is present with the correct
+   checksum at every patched location, plus the reused `SERVICE_CHECK`
+   block. Unlike Tomcat (whose `-Dcatalina.base` proves which tree the live
+   JVM loaded), there is no generic equivalent of "which jar a JVM loaded"
+   without assuming a specific application server — file-presence +
+   checksum + service-health is the practical substitute.
+
+Supported actions:
+
+- `Check`: read-only. Lists every match of `JAR_NAME_PATTERN` under
+  `SEARCH_ROOT`. Nothing is downloaded, nothing changes.
+- `Apply`: downloads + verifies the replacement jar, backs up and replaces
+  every matched location, restarts the service, confirms the replacement is
+  in place, and rolls back automatically if any of that fails.
+
+Extra-vars contract — `HOSTNAMES`, `SEARCH_ROOT`, `JAR_NAME_PATTERN` and
+`SERVICE_NAME` are always required; `NEW_JAR_URL` + `NEW_JAR_SHA512` +
+`NEW_JAR_FILENAME` are required only when `ACTION=Apply`. See
+[java_library_patch.sample_extra_vars.yml](../playbooks/java_library_patch.sample_extra_vars.yml)
+for the full contract and
+[java_library_patch.survey_spec.json](../playbooks/java_library_patch.survey_spec.json)
+for the Job Template survey.
+
+Validated locally against real `log4j-core-2.14.1.jar` → `2.17.1.jar`
+artifacts downloaded from Maven Central, against a directory tree with the
+jar present in **both** a server `lib/`-style location and a webapp
+`WEB-INF/lib`-style location (proving the unification), through a real
+systemd service (`ansible.builtin.systemd`, user-scope locally): `Check`
+lists both locations; `Apply` patches both, restarts the service, and
+confirms it is active; a second `Apply` on an already-patched tree correctly
+reports `already_current` with no service restart (idempotency); a cutover
+failure (induced via a read-only target directory) triggers the automatic
+rollback, restoring both original jars and the service, which is confirmed
+active again; a stage failure (induced via a deliberately wrong checksum)
+never touches the service at all. A live `ACTION=Apply` run through AAP against
+`vm1-samurai`'s own surviving `log4j-core-2.14.1.jar` (the exact #92 finding,
+`SEARCH_ROOT=/opt/current-tomcat`, replaced by `log4j-core-2.17.1.jar`) also
+succeeded; a following `Check` confirmed the new jar's sha512 and the service
+active. The first run through AAP showed that the AAP execution environment's
+`find` has no `checksum_algorithm` (ansible-core older than 2.19), so the
+sha512 of each match comes from `stat`.
+
+## vulnerability_validation/linux_rpm_package.yml
+
+Read-only **package version collector** for SamurAI Shield vulnerability
+validation (ADR-0021). It is the playbook behind the `samurai_validation_package`
+job template; the engine checks this exact path in the live template before every
+launch, so the path and the name are a contract. The name says "rpm" for
+historical reasons — the same playbook covers the **RedHat** and **Debian**
+families (`package_facts` with `manager: auto` reads rpmdb or dpkg).
+
+It observes ONE package on ONE host and publishes the structured facts in the
+job artifact via `set_stats` (`samurai_validation`, envelope
+`samurai.aap_validation_collector/v1`, plus `samurai_execution_id`). It never
+compares versions, never consults advisories and never concludes anything — the
+verdict belongs to the product's deterministic engine.
+
+Read-only by construction: the only modules used are `assert`, `add_host`,
+`setup`, `package_facts`, `stat`, `set_fact` and `set_stats` — the subset the
+`linux-deb-package-validation` / `linux-rpm-package-validation` templates declare.
+No `shell`/`command`, no package or service module, no file writes, no network.
+Every task that touches the host has `changed_when: false`; a missing package
+manager becomes `package_installed: unknown`, never an install.
+
+Inputs are extra-vars injected by the product at launch (a survey with the same
+names works for manual runs): `samurai_execution_id`, `validation_organization_id`,
+`validation_asset_id`, `validation_vulnerability_id`, `validation_target_host`,
+`validation_package_name`, and optionally `validation_attempt_id` and
+`validation_package_architecture` (multiarch disambiguation);
+`validation_service_name` is accepted and ignored. Play 1 validates them on
+`localhost` (fail-closed, numeric IDs, package-name allowlist) and registers the
+target with `add_host`; play 2 collects on it with `gather_facts: true`. The job
+template inventory is irrelevant.
+
+Per-family behaviour (any other family fails closed):
+
+| Fact | Debian (Ubuntu) | RedHat |
+| --- | --- | --- |
+| `collector.validation_template_id` | `linux-deb-package-validation` | `linux-rpm-package-validation` |
+| `facts.observed_evr` | the dpkg version verbatim (e.g. `5.40.1-7ubuntu0.2`, `1:2.3-4`); `epoch`/`release` are `null` | `[epoch:]version-release` assembled from the rpm fields |
+| `facts.reboot_required` | `/var/run/reboot-required` exists → `true`/`false` | `unknown` |
+| `facts.package_architecture` | e.g. `amd64` | e.g. `x86_64` |
+
+When the package is installed in more than one architecture and no
+`validation_package_architecture` was given, `architecture_ambiguous` is `true`
+and no instance is picked — the engine fails closed instead of guessing.
+
+Survey for manual runs (the governed path injects everything as extra-vars):
+[linux_rpm_package.survey_spec.json](../playbooks/vulnerability_validation/linux_rpm_package.survey_spec.json)
+— the six required inputs only; the optional ones arrive as extra-vars from the
+engine. Apply it the same way as the [Windows survey](#job-template-survey) and keep **Prompt on
+launch → Extra variables** enabled on the Job Template, otherwise the engine's
+extra-vars are discarded. The Job Template needs only a machine (SSH) credential; its inventory
+is not used.

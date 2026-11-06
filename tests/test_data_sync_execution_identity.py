@@ -20,7 +20,8 @@ def test_volume_execution_identity_survives_controller_extra_var_precedence(tmp_
     for value in ("volume-one-seed", "volume-two-seed", "volume-one-final"):
         task = deepcopy(selected)
         task["vars"] = {"data_sync_item": {"replication_execution_id": value, "source_volume_stable_id": "vol-source"},
-                        "data_sync_item_destination_volume": "vol-destination", "data_sync_destination_resolution": {"stdout": "/dev/test serial"}}
+                        "data_sync_item_destination_volume": "vol-destination",
+                        "data_sync_resolved_device": {"name": "/dev/test", "serial": "voldestination"}}
         tasks.extend([task, {"ansible.builtin.assert": {"that": [f"{identity_name} == '{value}'", "samurai_execution_id == 'candidate-attempt'"]}}])
     entry = yaml.safe_load((ROOT / "roles/data_sync/tasks/main.yml").read_text())
     initializer = next(task for task in entry if task.get("name") == "[data_sync] Initialize the scalar copy execution identity")

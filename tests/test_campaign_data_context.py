@@ -15,7 +15,7 @@ ENV = NativeEnvironment(undefined=StrictUndefined)
 
 def test_cloud_source_consumes_the_observed_candidate_context():
     replacement = {"instance_id": "i-0123456789abcdef0", "region": "us-east-2",
-                   "describe_instances": {"Placement": {"AvailabilityZone": "us-east-2b"}}}
+                   "availability_zone": "us-east-2b"}
     values = {key: ENV.from_string(expr).render(replacement=replacement)
               for key, expr in CONTEXT["ansible.builtin.set_fact"].items()}
     assert values == {"instance_id": replacement["instance_id"], "data_sync_cloud_region": "us-east-2",
@@ -35,10 +35,10 @@ def test_stateless_campaign_does_not_require_data_context():
     assert ENV.compile_expression(CONTEXT["when"])(data_sync_destination_intents=[]) is False
 
 
-@pytest.mark.parametrize("field", ["instance_id", "region", "describe_instances"])
+@pytest.mark.parametrize("field", ["instance_id", "region", "availability_zone"])
 def test_incomplete_candidate_cannot_supply_copy_context(field):
     replacement = {"instance_id": "i-0123456789abcdef0", "region": "us-east-2",
-                   "describe_instances": {"Placement": {"AvailabilityZone": "us-east-2b"}}}
+                   "availability_zone": "us-east-2b"}
     del replacement[field]
     with pytest.raises(UndefinedError):
         for expr in CONTEXT["ansible.builtin.set_fact"].values():

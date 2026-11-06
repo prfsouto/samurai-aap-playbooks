@@ -1,6 +1,8 @@
 from pathlib import Path
 
+import pytest
 import yaml
+from jinja2 import Environment, StrictUndefined
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -19,17 +21,22 @@ def walk(value):
             yield from walk(nested)
 
 
-def test_preparation_excludes_cutover_and_decommission_roles():
-    roles = [node["ansible.builtin.include_role"]["name"] for node in walk(tasks()) if "ansible.builtin.include_role" in node]
-    assert roles == ["aws_replacement", "data_sync", "bootstrap", "validation", "data_sync", "bootstrap"]
-    assert "cutover" not in roles and "decommission" not in roles
+@pytest.mark.parametrize("provider", ["aws", "azure"])
+def test_preparation_excludes_cutover_and_decommission_roles(provider):
+    env = Environment(undefined=StrictUndefined)
+    roles = [
+        env.from_string(node["ansible.builtin.include_role"]["name"]).render(samurai_destination_provider=provider)
+        for node in walk(tasks()) if "ansible.builtin.include_role" in node
+    ]
+    assert roles == [f"{provider}_replacement", "data_sync", "bootstrap", "validation", "data_sync", "bootstrap", "data_sync"]
 
 
 def test_copy_cannot_start_before_ssh_guard_and_seed_authorization():
     block = tasks()[1]["block"]
     guard = next(i for i, task in enumerate(block) if task.get("name", "").startswith("Refuse data operations"))
     seed = next(i for i, task in enumerate(block) if task.get("name") == "Open and perform seed")
-    validation = next(i for i, task in enumerate(block) if task.get("name") == "Validate the candidate")
+    validation = next(i for i, task in enumerate(block)
+                      if task.get("ansible.builtin.include_role", {}).get("name") == "validation")
     final = next(i for i, task in enumerate(block) if task.get("name") == "Open and perform final delta")
     assert guard < seed < validation < final
     assert "ansible_connection == 'ssh'" in block[guard]["ansible.builtin.assert"]["that"]
@@ -38,7 +45,8 @@ def test_copy_cannot_start_before_ssh_guard_and_seed_authorization():
 
 
 def test_private_key_cleanup_is_in_the_always_path():
-    cleanup = tasks()[1]["always"][0]["ansible.builtin.include_tasks"]
+    cleanup = next(task["ansible.builtin.include_tasks"] for task in tasks()[1]["always"]
+                   if task.get("name") == "Remove private candidate access from the execution container")
     assert cleanup["file"] == "tasks/campaign_candidate_key_cleanup.yml"
     assert cleanup["apply"]["delegate_to"] == "localhost"
 
