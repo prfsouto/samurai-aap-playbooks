@@ -1,0 +1,40 @@
+name: Validate playbooks
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+
+      - name: Install validation dependencies
+        env:
+          ANSIBLE_COLLECTIONS_PATH: ${{ runner.temp }}/ansible-collections
+        run: |
+          python -m pip install -r tests/requirements.txt
+          ansible-galaxy collection install -r requirements.yml -p "$ANSIBLE_COLLECTIONS_PATH"
+          echo "ANSIBLE_COLLECTIONS_PATH=$ANSIBLE_COLLECTIONS_PATH" >> "$GITHUB_ENV"
+
+      - name: Check remediation and RPM evidence playbook syntax
+        run: |
+          ansible-playbook -i 'localhost,' --syntax-check \
+            playbooks/*_with_evidence.yml \
+            playbooks/vulnerability_validation/linux_rpm_package.yml
+
+      - name: Run repository tests
+        run: python -m pytest -q -n 0 tests
