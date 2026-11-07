@@ -209,11 +209,14 @@ EDGE_CAP = 1200
 KERNEL_NAMES = ("kernel", "kernel-core", "kernel-modules")
 UNIT_KINDS = ("service", "timer", "socket")
 
-# Primeiro caractere alfanumérico: nome que começa com "-" nunca vira opção de systemctl.
-UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@_.:-]{0,127}\.(service|timer|socket)$")
-SERVICE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@_.:-]{0,127}\.service$")
+# Primeiro caractere alfanumérico: nome que começa com "-" nunca vira opção de systemctl. O escape ``\xNN`` do
+# systemd (``systemd-fsck@dev-disk-by\x2duuid-….service``) é um caractere do nome; o nome vai como argv, sem shell.
+_UNIT_CHAR = r"(?:[A-Za-z0-9@_.:-]|\\x[0-9a-f]{2})"
+_INSTANCE_CHAR = r"(?:[A-Za-z0-9_.:-]|\\x[0-9a-f]{2})"
+UNIT_RE = re.compile(r"^[A-Za-z0-9]" + _UNIT_CHAR + r"{0,127}\.(service|timer|socket)$")
+SERVICE_RE = re.compile(r"^[A-Za-z0-9]" + _UNIT_CHAR + r"{0,127}\.service$")
 MODEL_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9_.:-]{0,126})@\.service$")
-INSTANCE_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9_.:-]{0,126})@[A-Za-z0-9][A-Za-z0-9_.:-]{0,126}\.service$")
+INSTANCE_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9_.:-]{0,126})@[A-Za-z0-9]" + _INSTANCE_CHAR + r"{0,126}\.service$")
 MODEL_INSTANCE = "samurai-probe-model"
 PATH_RE = re.compile(r"^/[A-Za-z0-9._/+@-]{1,255}$")
 EXEC_PATH_RE = re.compile(r"path=([^ ;}]+)")
@@ -3924,6 +3927,16 @@ def _successor_request(request):
 
 
 RPM_VERIFY_FLAGS_RE = re.compile(r"^([.SM5DLUGTP?]{9}|missing)\s+([cdglr]?)\s*(/.*)$")
+#: Flag do ``rpm -V`` que muda o arquivo (tamanho, modo, digest, dispositivo, link, dono, grupo, capacidades) ou que o
+#: rpm não conseguiu conferir (``?``). Só o mtime (``T``) não muda o conteúdo assinado: o ``.repo`` do RHUI na AWS vem
+#: com ``.......T.`` e é o arquivo íntegro do fornecedor.
+RPM_VERIFY_CONTENT_FLAGS = frozenset("SM5DLUGP?")
+
+
+def _content_changed(verified, path):
+    """O ``rpm -V`` mostra o arquivo ausente ou com conteúdo, tamanho, modo, dono ou link diferente do pacote."""
+    flags = (verified.get(path) or (None,))[0]
+    return flags is not None and (flags == "missing" or any(flag in RPM_VERIFY_CONTENT_FLAGS for flag in flags))
 RPM_KEY_RE = re.compile(r"Key ID ([0-9a-f]{16})")
 PGP_ARMOR_RE = re.compile(r"-----BEGIN PGP PUBLIC KEY BLOCK-----(.*?)-----END PGP PUBLIC KEY BLOCK-----", re.S)
 MAX_VENDOR_UNDECIDABLE = 500
@@ -4085,7 +4098,8 @@ class _VendorTrust:
                 owner = self.owners.package(path)
                 info = self.package(owner) if owner else None
                 verified = self.verify(owner) if owner else None
-                if info and info["key"] == release["key"] and verified is not None and _usrmerge(path) not in verified:
+                if (info and info["key"] == release["key"] and verified is not None
+                        and not _content_changed(verified, _usrmerge(path))):
                     continue  # ``.repo`` íntegro do fornecedor
                 try:
                     text, _ = self.fs.read(path, FILE_LIMIT)
@@ -4110,7 +4124,8 @@ class _VendorTrust:
                 owner = self.owners.package(path)
                 info = self.package(owner) if owner else None
                 verified = self.verify(owner) if owner else None
-                if not info or info["key"] != release["key"] or verified is None or _usrmerge(path) in verified:
+                if (not info or info["key"] != release["key"] or verified is None
+                        or _content_changed(verified, _usrmerge(path))):
                     continue
                 try:
                     text, _ = self.fs.read(path, FILE_LIMIT)
@@ -4138,7 +4153,7 @@ class _VendorTrust:
         verified = self.verify(owner)
         if verified is None:
             return None, "rpm_verify_unmeasured"
-        if _usrmerge(real) in verified:
+        if _content_changed(verified, _usrmerge(real)):
             return None, "file_modified"
         # Repositório de origem: gravado, não exigido (a assinatura pela chave da release é a prova). Assinado pela
         # chave do fornecedor mas instalado de repositório de terceiro é contradição: fica no estrito.
