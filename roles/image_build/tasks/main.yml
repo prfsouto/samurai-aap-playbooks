@@ -1226,6 +1226,50 @@
         mode: "0644"
   tags: [image_build, describe]
 
+# Scriptlets dos pacotes que saíram do rpmdb no build (família RPM): o guest
+# devolve os scriptlets medidos antes do Ansible e o histórico do dnf; aqui o
+# classificador da sonda de B (inventory_collect) diz, por NEVRA que saiu, se foi
+# medido e que spool pode escrever. Opcional: template sem a medição não exporta
+# o pacote, e falha do classificador não derruba o build (a N5 fica not_proven).
+- name: "[image_build] Classify the scriptlets of packages that left the rpmdb in the build"
+  when:
+    - image_build_provider == 'packer'
+    - >-
+      image_build_cloud_provider == 'aws'
+      or 'build-removed-scriptlets.json' in (image_build_artifact_write_urls | default({}))
+  block:
+    - name: "[image_build] Look for the scriptlet archive exported by Packer"
+      ansible.builtin.stat:
+        path: "{{ image_build_sbom_export_dir }}/build-scriptlets.tar.gz"
+      register: image_build_removed_scriptlets_archive
+      changed_when: false
+
+    - name: "[image_build] Write build-removed-scriptlets.json"
+      when: image_build_removed_scriptlets_archive.stat.exists
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ role_path }}/files/build_removed_scriptlets.py"
+          - --archive
+          - "{{ image_build_sbom_export_dir }}/build-scriptlets.tar.gz"
+          - --probe
+          - "{{ role_path }}/../inventory_collect/files/collect_rhel_package_usage_v2.py"
+          - --expected-probe-sha256
+          - "e9b3f0b3389709ac0c194dfff8affa33d3b96ff79851cd1b718acc6f11ae643e"
+          - --output
+          - "{{ image_build_run_dir }}/build-removed-scriptlets.json"
+      register: image_build_removed_scriptlets_run
+      changed_when: true
+      failed_when: false
+
+    - name: "[image_build] Mark the removed-package scriptlets as measured"
+      when:
+        - image_build_removed_scriptlets_archive.stat.exists
+        - (image_build_removed_scriptlets_run.rc | default(1)) == 0
+      ansible.builtin.set_fact:
+        image_build_removed_scriptlets_generated: true
+  tags: [image_build, evidence]
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Evidence upload — every artifact goes to the org-scoped S3 prefix with an
 # EXPLICIT SSE-KMS header pair (issue #1711: the bucket policy denies any
@@ -1242,7 +1286,8 @@
       register: image_build_evidence_stats
       loop: >-
         {{ ['build.log', 'sbom.cyclonedx.json', 'scan.grype.json', 'describe_images.json']
-           + (['platform-inventory.json'] if (image_build_platform_inventory_generated | default(false)) else []) }}
+           + (['platform-inventory.json'] if (image_build_platform_inventory_generated | default(false)) else [])
+           + (['build-removed-scriptlets.json'] if (image_build_removed_scriptlets_generated | default(false)) else []) }}
       loop_control:
         label: "{{ item }}"
 
@@ -1341,6 +1386,13 @@
           uri: "s3://{{ image_build_evidence_s3_bucket }}/{{ image_build_evidence_s3_prefix }}/platform-inventory.json"
           sha256: "{{ image_build_evidence_sha256['platform-inventory.json'] }}"
           package_count: "{{ image_build_platform_json.packages | length }}"
+
+    - name: "[image_build] Reference the removed-package scriptlets"
+      when: image_build_removed_scriptlets_generated | default(false)
+      ansible.builtin.set_fact:
+        removed_scriptlets:
+          uri: "s3://{{ image_build_evidence_s3_bucket }}/{{ image_build_evidence_s3_prefix }}/build-removed-scriptlets.json"
+          sha256: "{{ image_build_evidence_sha256['build-removed-scriptlets.json'] }}"
   tags: [image_build, evidence]
 
 - name: "[image_build] Record stub evidence references (control plane reproves these)"
@@ -1382,6 +1434,7 @@
       cve_scan: "{{ cve_scan }}"
       describe_images: "{{ describe_images }}"
       platform_inventory: "{{ platform_inventory | default({}) }}"
+      removed_scriptlets: "{{ removed_scriptlets | default({}) }}"
       build_started_at: "{{ build_started_at }}"
       build_finished_at: "{{ build_finished_at }}"
       recipe_fingerprint_declared: "{{ recipe_fingerprint_declared }}"
