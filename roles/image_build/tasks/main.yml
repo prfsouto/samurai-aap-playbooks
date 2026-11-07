@@ -1254,6 +1254,8 @@
           - "{{ image_build_sbom_export_dir }}/build-scriptlets.tar.gz"
           - --probe
           - "{{ role_path }}/../inventory_collect/files/collect_rhel_package_usage_v2.py"
+          - --expected-probe-sha256
+          - "e9b3f0b3389709ac0c194dfff8affa33d3b96ff79851cd1b718acc6f11ae643e"
           - --output
           - "{{ image_build_run_dir }}/build-removed-scriptlets.json"
       register: image_build_removed_scriptlets_run
