@@ -191,6 +191,7 @@ import re
 import shlex
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import threading
@@ -288,6 +289,17 @@ SCRIPTLET_RUNNERS = frozenset({"sudo", "su", "runuser", "nohup", "nice", "ionice
 SCRIPTLET_KEYWORDS = frozenset({"if", "then", "else", "elif", "fi", "do", "done", "while", "until", "for", "in", "!",
                                 "{", "}", "case", "esac"})
 EXECUTABLE_PREFIXES = ("/usr/bin/", "/usr/sbin/", "/usr/libexec/")
+# Biblioteca do requerente que o carregador abre: ELF direto na pasta de bibliotecas. Cada DT_NEEDED dela precisa
+# existir em B; a sonda lê os bytes e resolve o soname como o ``ld.so`` (RPATH/RUNPATH, ``/etc/ld.so.conf``, pasta
+# padrão da classe), sem executar nada.
+LIBRARY_RE = re.compile(r"^/usr/lib(?:64)?/[^/]+\.so(?:\.[0-9]+)*$")
+# Módulo Python do requerente: só se conta. O ``sys.path`` com ``site`` não se mede sem rodar código do host.
+PYTHON_LIBRARY_RE = re.compile(r"^/usr/lib(?:64)?/python3[.0-9]*/site-packages/.+\.py$")
+MAX_REQUIRER_LIBRARIES = 32
+LIBRARY_READ_LIMIT = 64 << 20
+LD_SO_CONF = "/etc/ld.so.conf"
+MAX_LD_SO_CONF_FILES = 64
+LOADER_DEFAULT_DIRS = {1: ("/usr/lib",), 2: ("/usr/lib64",)}  # classe ELF -> pasta padrão do x86 (32 e 64 bits)
 # Multicall do coreutils-single: cada comando é um script ``#!/usr/bin/coreutils --coreutils-prog-shebang=<nome>``.
 COREUTILS_SHEBANG = "--coreutils-prog-shebang="
 COREUTILS_PACKAGES = frozenset({"coreutils-single", "coreutils"})
@@ -2419,6 +2431,11 @@ class HostFiles:
 
     def read(self, path, limit):
         """(texto, cortado). Dispositivo e FIFO nem são abertos; O_NONBLOCK cobre a troca entre stat e open."""
+        data, cut = self.read_bytes(path, limit)
+        return data.decode("utf-8", "replace"), cut
+
+    def read_bytes(self, path, limit):
+        """(bytes, cortado), com as mesmas garantias de ``read``: o ELF se lê sem decodificar."""
         if not stat.S_ISREG(_host_call(os.stat, path).st_mode):
             raise NotRegularFile(path)
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC)
@@ -2435,7 +2452,7 @@ class HostFiles:
         finally:
             os.close(fd)
         data = b"".join(chunks)
-        return data[:limit].decode("utf-8", "replace"), len(data) > limit
+        return data[:limit], len(data) > limit
 
     def identity(self):
         return {"pid": os.getpid(), "session": os.getsid(0), "euid": os.geteuid()}
@@ -2446,6 +2463,79 @@ def _usrmerge(path):
         if path.startswith(legacy):
             return merged + path[len(legacy):]
     return path
+
+
+def _elf_identity(data):
+    """``(classe, máquina)`` do cabeçalho ELF; ``None`` quando não é ELF ou o cabeçalho não se lê."""
+    if data[:4] != b"\x7fELF" or data[4:5] not in (b"\x01", b"\x02") or data[5:6] not in (b"\x01", b"\x02"):
+        return None
+    try:
+        machine = struct.unpack_from("<H" if data[5:6] == b"\x01" else ">H", data, 18)[0]
+    except struct.error:
+        return None
+    return (2 if data[4:5] == b"\x02" else 1), machine
+
+
+def _elf_dynamic(data):
+    """``{"class", "machine", "needed", "search"}`` do ELF (``search``: RUNPATH, ou RPATH sem RUNPATH, como o
+    ``ld.so``); ``None`` quando não é ELF; ``ValueError`` quando é ELF e a seção dinâmica não se lê inteira."""
+    if data[:4] != b"\x7fELF":
+        return None
+    elf_class, encoding = data[4:5], data[5:6]
+    if elf_class not in (b"\x01", b"\x02") or encoding not in (b"\x01", b"\x02"):
+        raise ValueError("elf_header_unknown")
+    wide, end = elf_class == b"\x02", "<" if encoding == b"\x01" else ">"
+    try:
+        machine = struct.unpack_from(end + "H", data, 18)[0]
+        phoff = struct.unpack_from(end + ("Q" if wide else "I"), data, 32 if wide else 28)[0]
+        phentsize, phnum = struct.unpack_from(end + "HH", data, 54 if wide else 42)
+        loads, dynamic = [], None
+        for index in range(phnum):
+            offset = phoff + index * phentsize
+            if wide:
+                kind, _, p_offset, vaddr, _, filesz, _ = struct.unpack_from(end + "IIQQQQQ", data, offset)
+            else:
+                kind, p_offset, vaddr, _, filesz, _ = struct.unpack_from(end + "IIIIII", data, offset)
+            if kind == 1:
+                loads.append((vaddr, p_offset, filesz))
+            elif kind == 2:
+                dynamic = (p_offset, filesz)
+        result = {"class": 2 if wide else 1, "machine": machine, "needed": [], "search": []}
+        if dynamic is None:
+            return result  # estático: não abre biblioteca
+        size, layout = (16, end + "qQ") if wide else (8, end + "iI")
+        needed, strtab, rpath, runpath = [], None, [], []
+        for offset in range(dynamic[0], dynamic[0] + dynamic[1] - size + 1, size):
+            tag, value = struct.unpack_from(layout, data, offset)
+            if tag == 0:
+                break
+            if tag == 1:
+                needed.append(value)
+            elif tag == 5:
+                strtab = value
+            elif tag == 15:
+                rpath.append(value)
+            elif tag == 29:
+                runpath.append(value)
+        if strtab is None:
+            raise ValueError("elf_strtab_absent")
+        base = next((p_offset + strtab - vaddr for vaddr, p_offset, filesz in loads
+                     if vaddr <= strtab < vaddr + filesz), None)
+        if base is None:
+            raise ValueError("elf_strtab_unmapped")
+
+        def text(index):
+            start = base + index
+            stop = data.find(b"\x00", start)
+            if start >= len(data) or stop < 0:
+                raise ValueError("elf_string_cut")
+            return data[start:stop].decode("utf-8")
+
+        result["needed"] = [text(index) for index in needed]
+        result["search"] = [part for index in (runpath or rpath) for part in text(index).split(":") if part]
+        return result
+    except (struct.error, UnicodeDecodeError) as exc:
+        raise ValueError("elf_dynamic_unread") from exc
 
 
 class _Paths:
@@ -4205,6 +4295,7 @@ class _SuccessorScan:
         self.vendor_trusted, self.trust_refused, self.workload_scanned = [], [], []
         self.workload_seen, self.scripts = set(), {}
         self.interpreter_scripts, self.interpreter_seen, self.interpreter_contexts = {}, set(), set()
+        self.loader_conf_read, self.loader_conf = False, None  # ``/etc/ld.so.conf`` lido uma vez por coleta
 
     def expired(self):
         if time.monotonic() > self.deadline:
@@ -5437,10 +5528,11 @@ class _SuccessorScan:
                          next_elapse_epoch=int(observed + monotonic / 1000000.0 - monotonic_now))
         return entry
 
-    def _executable_files(self, name):
-        """Arquivos do requerente em ``EXECUTABLE_PREFIXES``, pela lista inteira do ``rpm -ql`` lida linha a linha (a
-        lista do ``python3-pip`` passa de 100 KB, acima do teto de ``run``). ``None`` quando não se lê inteira."""
-        files, state = [], {"bad": False}
+    def _requirer_files(self, name):
+        """Executáveis, bibliotecas e módulos Python do requerente, pela lista inteira do ``rpm -ql`` lida linha a
+        linha (a lista do ``python3-pip`` passa de 100 KB, acima do teto de ``run``). ``None`` quando não se lê
+        inteira."""
+        files, state = {"executables": [], "libraries": [], "python_modules": 0}, {"bad": False}
 
         def on_line(line):
             path = line.strip()
@@ -5448,8 +5540,14 @@ class _SuccessorScan:
                 return
             if not path.startswith("/"):
                 state["bad"] = True
-            elif _usrmerge(path).startswith(EXECUTABLE_PREFIXES):
-                files.append(path)
+                return
+            merged = _usrmerge(path)
+            if merged.startswith(EXECUTABLE_PREFIXES):
+                files["executables"].append(path)
+            elif LIBRARY_RE.match(merged):
+                files["libraries"].append(path)
+            elif PYTHON_LIBRARY_RE.match(merged):
+                files["python_modules"] += 1
 
         receipt = self.stream(["rpm", "-ql", "--", name], on_line)
         if receipt.get("rc") != 0 or receipt.get("truncated") or state["bad"]:
@@ -5457,14 +5555,15 @@ class _SuccessorScan:
         return files
 
     def requirer(self, name):
-        """Executáveis do requerente em B, com o ``#!`` lido. ``complete`` só com a lista inteira lida."""
-        entry = {"package": name, "installed": _installed(name, self.run), "executables": [], "complete": False}
-        files = self._executable_files(name) if entry["installed"] else None
-        if entry["installed"] is None or (entry["installed"] and files is None):
+        """Executáveis do requerente em B, com o ``#!`` lido, e as bibliotecas ELF com cada DT_NEEDED resolvido.
+        ``complete`` só com a lista inteira lida; ``python_modules`` conta os módulos que a sonda não mede."""
+        entry = {"package": name, "installed": _installed(name, self.run), "executables": [], "libraries": [],
+                 "python_modules": 0, "complete": False}
+        listed = self._requirer_files(name) if entry["installed"] else None
+        if entry["installed"] is None or (entry["installed"] and listed is None):
             self.reasons.add("requirer_files_unavailable")
+        files = listed["executables"] if listed is not None else None
         for path in files or ():
-            if not _usrmerge(path).startswith(EXECUTABLE_PREFIXES):
-                continue
             try:
                 mode = self.fs.mode(path)
             except FileNotFoundError:
@@ -5480,10 +5579,126 @@ class _SuccessorScan:
             if self.expired():
                 return entry  # lista não terminada: ``complete`` fica falso e ``time_budget`` vai a ``reasons``
             entry["executables"].append(self.program(path, f"requirer:{name}:{path}"))
-        entry["complete"] = files is not None
-        if files is not None:
-            self.scanned["requirer_executables"].add(name)
+        if listed is None:
+            return entry
+        entry["python_modules"] = listed["python_modules"]
+        if not self.requirer_libraries(entry, listed["libraries"]):
+            return entry
+        entry["complete"] = True
+        self.scanned["requirer_executables"].add(name)
+        if entry["libraries"]:
+            self.scanned["requirer_libraries"].add(name)
         return entry
+
+    def requirer_libraries(self, entry, paths):
+        """Biblioteca ELF do requerente (o arquivo, uma vez por ``realpath``): cada DT_NEEDED com o arquivo que o
+        carregador abriria em B e o dono dele. ``False`` quando a lista não termina (ilegível, teto ou tempo)."""
+        seen = set()
+        for path in paths:
+            try:
+                mode = self.fs.mode(path)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                self.reasons.add("requirer_library_unreadable")
+                return False
+            real = self.paths.final(path)
+            if not stat.S_ISREG(mode) or real in seen:
+                continue
+            seen.add(real)
+            if len(entry["libraries"]) >= MAX_REQUIRER_LIBRARIES:
+                self.reasons.add("requirer_libraries_over_limit")
+                return False
+            if self.expired():
+                return False
+            try:
+                data, cut = self.fs.read_bytes(real, LIBRARY_READ_LIMIT)
+                elf = _elf_dynamic(data)
+            except (OSError, ValueError):
+                self.reasons.add("requirer_library_unreadable")
+                return False
+            if elf is None:
+                continue  # não é ELF (script de ligação do ``ld``): o carregador não abre
+            if cut:
+                self.reasons.add("requirer_library_over_size")
+                return False
+            entry["libraries"].append({
+                "path": path, "resolved_path": real, "owner": self.owner(real),
+                "needed": [self.needed(soname, real, elf) for soname in elf["needed"]]})
+        return True
+
+    def needed(self, soname, library, elf):
+        """Arquivo que o ``ld.so`` abriria para o soname, da mesma classe e máquina, e o dono dele; ``path`` nulo
+        quando nenhuma pasta tem o soname, ``reason`` quando a busca não se decide."""
+        found = {"soname": soname, "path": None, "owner": None}
+        origin = library.rsplit("/", 1)[0] or "/"
+        search = [part.replace("${ORIGIN}", origin).replace("$ORIGIN", origin) for part in elf["search"]]
+        if "/" in soname or any("$" in part or not part.startswith("/") for part in search):
+            found["reason"] = "loader_search_unresolved"
+            return found
+        conf = self.loader_dirs()
+        if conf is None:
+            found["reason"] = "ld_so_conf_unread"
+            return found
+        for directory in search + conf + list(LOADER_DEFAULT_DIRS.get(elf["class"], ())):
+            candidate = directory.rstrip("/") + "/" + soname
+            if not self.fs.is_file(candidate):
+                continue
+            real = self.paths.final(candidate)
+            try:
+                identity = _elf_identity(self.fs.read_bytes(real, 20)[0])
+            except OSError:
+                identity = None
+            if identity != (elf["class"], elf["machine"]):
+                continue  # o ``ld.so`` pula arquivo de outra classe ou máquina
+            found["path"], found["owner"] = real, self.owner(real)
+            return found
+        return found
+
+    def loader_dirs(self):
+        """Pastas de ``/etc/ld.so.conf`` com ``include`` (glob relativo a ``/etc``), na ordem; ``None`` quando a
+        configuração não se lê inteira."""
+        if self.loader_conf_read:
+            return self.loader_conf
+        self.loader_conf_read, self.loader_conf = True, self._loader_conf()
+        return self.loader_conf
+
+    def _loader_conf(self):
+        dirs, pending, read = [], [LD_SO_CONF], 0
+        while pending:
+            path = pending.pop(0)
+            read += 1
+            if read > MAX_LD_SO_CONF_FILES:
+                return None
+            try:
+                text, cut = self.fs.read(path, FILE_LIMIT)
+            except FileNotFoundError:
+                if path == LD_SO_CONF:
+                    continue
+                return None
+            except OSError:
+                return None
+            if cut:
+                return None
+            for line in text.splitlines():
+                words = line.split("#", 1)[0].replace(",", " ").replace(":", " ").split()
+                if not words or words[0] == "hwcap":
+                    continue
+                if words[0] == "include":
+                    for pattern in words[1:]:
+                        pattern = pattern if pattern.startswith("/") else "/etc/" + pattern
+                        directory, glob = pattern.rsplit("/", 1)
+                        try:
+                            names = self.fs.listdir(directory)
+                        except FileNotFoundError:
+                            continue
+                        except OSError:
+                            return None
+                        pending.extend(directory + "/" + name for name in sorted(names)
+                                       if fnmatch.fnmatchcase(name, glob))
+                    continue
+                dirs.extend(word for word in words if word.startswith("/") and word not in dirs)
+        return dirs
 
     def crontabs(self):
         """Texto dos crontabs do sistema e dos scripts de ``/etc/cron.*``, lido uma vez, sem comentário."""
