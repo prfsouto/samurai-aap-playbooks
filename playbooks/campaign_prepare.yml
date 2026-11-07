@@ -176,6 +176,11 @@
                 campaign_data_sync_final_generation: "{{ campaign_open_stage.json.generation | int }}"
             - ansible.builtin.include_role:
                 name: data_sync
+            - name: "Start a fresh filesystem identity list for this member's FINAL copy"
+              ansible.builtin.set_fact:
+                campaign_data_sync_final_destination_identities: []
+              when: not (samurai_candidate_windows | bool)
+
             - name: "Mount each replicated filesystem after final copy"
               ansible.builtin.include_role:
                 name: bootstrap
@@ -183,6 +188,8 @@
               loop: "{{ data_sync_items }}"
               loop_control:
                 loop_var: data_sync_guard_item
+              vars:
+                campaign_collect_final_destination_identity: true
               when: not (samurai_candidate_windows | bool)
 
             - name: "Verify Windows B stayed offline after final delta"
