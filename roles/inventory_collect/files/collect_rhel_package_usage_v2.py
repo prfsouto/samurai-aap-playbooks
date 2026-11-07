@@ -3909,7 +3909,13 @@ def _successor_request(request):
     if not isinstance(checks, list) or not 0 < len(checks) <= MAX_SUCCESSOR_CHECKS:
         return []
     for check in checks:
-        if not isinstance(check, dict) or not _names_match([check.get("package"), check.get("successor")], PACKAGE_RE):
+        if not isinstance(check, dict) or not _names_match([check.get("package")], PACKAGE_RE):
+            return []
+        if check.get("path_owner") is True:
+            # Dono do caminho: sem sucessor nomeado; B mede o dono de cada caminho pedido (reference_owners).
+            if check.get("successor") is not None:
+                return []
+        elif not _names_match([check.get("successor")], PACKAGE_RE):
             return []
         if not all(_names_match(check.get(key, []), pattern) for key, pattern in (
                 ("units", UNIT_RE), ("reference_paths", PATH_RE), ("requirers", PACKAGE_RE))):
@@ -5588,9 +5594,11 @@ class _SuccessorScan:
         self.touched, self.exec_children, self.exec_cache = [], {}, {}  # fontes tocadas, por programa (R10-1)
         self.dead_command_branches = []
         self.outside()  # o ambiente das unidades (EnvironmentFile) vale para o programa das unidades pedidas também
-        result = {"package": check["package"], "successor": check["successor"],
+        successor = check.get("successor")
+        result = {"package": check["package"], "successor": successor, "path_owner": check.get("path_owner") is True,
                   "root_installed": _installed(check["package"], self.run),
-                  "successor_installed": _installed(check["successor"], self.run), "units": [], "requirers": []}
+                  "successor_installed": _installed(successor, self.run) if successor else None,
+                  "units": [], "requirers": []}
         for name in check.get("units", []):
             if not self.expired():
                 result["units"].append(self.unit(name))
