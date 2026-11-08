@@ -184,6 +184,7 @@ import base64
 import collections
 import fnmatch
 import datetime
+import errno
 import hashlib
 import json
 import os
@@ -4117,7 +4118,7 @@ class _VendorTrust:
         self.run, self.fs, self.owners, self.paths = run, fs, owners, paths
         self.history_path = history_path or DNF_HISTORY
         self._release, self._packages, self._verify, self._history, self._repos = None, {}, {}, None, None
-        self._foreign = None
+        self._foreign, self.foreign_unread = None, False
 
     def release(self):
         """Pacote ``system-release``, versão, chave que o assina e se a chave está importada (``gpg-pubkey``)."""
@@ -4200,12 +4201,16 @@ class _VendorTrust:
 
     def foreign_repositories(self):
         """Seções dos ``.repo`` de terceiro: arquivo sem dono, de pacote que a chave da release não assina, ou alterado
-        no ``rpm -V``. Repositório sem ``.repo`` (o do build da imagem, ``@commandline``) não é identificável."""
+        no ``rpm -V``. Repositório sem ``.repo`` (o do build da imagem, ``@commandline``) não é identificável.
+        ``.repo`` ou diretório que não se lê deixa ``foreign_unread``: o conjunto não está completo."""
         if self._foreign is None:
             self._foreign = set()
             try:
                 names = self.fs.listdir(REPO_DIR)
+            except FileNotFoundError:
+                return self._foreign
             except OSError:
+                self.foreign_unread = True
                 return self._foreign
             release = self.release()
             for name in names:
@@ -4220,7 +4225,10 @@ class _VendorTrust:
                     continue  # ``.repo`` íntegro do fornecedor
                 try:
                     text, _ = self.fs.read(path, FILE_LIMIT)
+                except FileNotFoundError:
+                    continue
                 except OSError:
+                    self.foreign_unread = True
                     continue
                 self._foreign.update(match.group(1).strip() for match in re.finditer(r"(?m)^\[([^\]]+)\]", text))
         return self._foreign
@@ -4278,6 +4286,9 @@ class _VendorTrust:
         repository = origin.get("repository")
         if repository is not None and repository in self.foreign_repositories():
             return None, "vendor_signature_foreign_repo"
+        if repository is not None and self.foreign_unread:
+            # Um ``.repo`` que não se lê pode declarar este repositório: a contradição não foi descartada.
+            return None, "foreign_repositories_unread"
         state = ("vendor" if repository in self.vendor_repositories() else
                  "unmeasured" if repository is None else "unidentified")
         return {"path": path, "resolved_path": real, "package": owner, "nevra": info["nevra"], "key": info["key"],
@@ -4443,11 +4454,14 @@ class _SuccessorScan:
             for loaded in script.loaded:
                 # Arquivo carregado com ``.``: o resolvedor já o leu junto; a referência literal dele também conta.
                 if loaded["path"] not in self.loaded_cited:
-                    self.loaded_cited.add(loaded["path"])
                     try:
                         content, _ = self.fs.read(loaded["path"], FILE_LIMIT)
                     except OSError:
+                        # Sem o texto, as referências literais dele não foram buscadas: indecidível, nunca "nada cita".
+                        entries.append(_undecided_entry(source, "loaded_file_unreadable", loaded["path"],
+                                                        origin=loaded["path"]))
                         continue
+                    self.loaded_cited.add(loaded["path"])
                     self.cite_literal(_script_text(content), "loaded:" + loaded["path"])
             for item in script.command_items():
                 if item["kind"] == "interpreter":
@@ -6125,12 +6139,16 @@ class _SuccessorScan:
 
     def reference_owner(self, path):
         """Dono em B do caminho de referência da raiz e do arquivo que ele resolve (``realpath``): a N5 só ignora a
-        referência quando os dois existem e são de outro pacote instalado. Caminho ausente ou consulta sem resposta
-        fica ``null`` (a referência conta)."""
+        referência quando os dois existem e são de outro pacote instalado. Dono sem resposta fica ``null`` (a referência
+        conta). Só ``FileNotFoundError``/``NotADirectoryError`` provam ausência; outro erro de leitura deixa ``exists``
+        ``null`` com ``error``, e a N5 conta o caminho como não medido, não como ausente."""
         try:
             self.fs.mode(path)
-        except OSError:
+        except (FileNotFoundError, NotADirectoryError):
             return {"path": path, "exists": False, "owner": None, "resolved_path": None, "resolved_owner": None}
+        except OSError as exc:
+            return {"path": path, "exists": None, "owner": None, "resolved_path": None, "resolved_owner": None,
+                    "error": errno.errorcode.get(exc.errno, "OSError") if exc.errno else "OSError"}
         resolved = self.paths.final(path)
         return {"path": path, "exists": True, "owner": self.owners.package(path), "resolved_path": resolved,
                 "resolved_owner": self.owners.package(resolved)}
