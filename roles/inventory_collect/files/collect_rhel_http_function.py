@@ -16,6 +16,8 @@ SCHEMA = "samurai.rhel_http_function_observation/v1"
 SCOPE = "Local HTTP endpoint and its registered systemd units"
 SUBJECTS = ("httpd.service", "nginx.service")
 URI = "http://127.0.0.1/"
+#: Caminhos registrados além da raiz, servidos por conteúdo de pacote (``/manual/`` vem do httpd-manual).
+EXTRA_URIS = ("http://127.0.0.1/manual/",)
 UNIT_FIELDS = ("Id", "LoadState", "ActiveState", "SubState", "UnitFileState")
 BODY_LIMIT = 1048576
 UNIT_LIMIT = 16384
@@ -81,6 +83,7 @@ def collect(uri=URI):
     value.update(observation_state="observed", units=units)
     if any(fields["LoadState"] == "loaded" and fields["ActiveState"] == "active" for fields in units.values()):
         value["http"] = http(uri)
+        value["http_paths"] = [http(extra) for extra in EXTRA_URIS]
     else:
         value["http"] = {"uri": uri, "measured": False, "reason": "unit_not_active"}
     return value
