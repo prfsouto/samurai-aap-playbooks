@@ -4746,7 +4746,10 @@ class _SuccessorScan:
                 names = self.fs.listdir(site_dir)
             except OSError:
                 return None, "site_directory_unreadable"
-            for name in sorted(name for name in names if name.endswith(".pth") and not name.startswith(".")):
+            if any(name.endswith(".pth") and name.startswith(".") for name in names):
+                # ``.pth`` oculto só é pulado com a correção gh-113659 (3.9.19, 3.11.8… ou backport do fornecedor).
+                return None, "site_hidden_pth_unproven"
+            for name in sorted(name for name in names if name.endswith(".pth")):
                 try:
                     text, cut = self.fs.read(site_dir.rstrip("/") + "/" + name, FILE_LIMIT)
                 except OSError:
