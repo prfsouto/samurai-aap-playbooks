@@ -297,6 +297,9 @@ LIBRARY_RE = re.compile(r"^/usr/lib(?:64)?/[^/]+\.so(?:\.[0-9]+)*$")
 # Módulo Python do requerente: só se conta. O ``sys.path`` com ``site`` não se mede sem rodar código do host.
 PYTHON_LIBRARY_RE = re.compile(r"^/usr/lib(?:64)?/python3[.0-9]*/site-packages/.+\.py$")
 MAX_REQUIRER_LIBRARIES = 32
+#: Módulos Python de um requerente medidos pelo fechamento de imports (o oauthlib do RHEL 9 tem 64).
+MAX_REQUIRER_PYTHON_MODULES = 512
+PYTHON_SITE_MODULE_RE = re.compile(r"^/usr/lib(?:64)?/python(3\.[0-9]+)/site-packages/(.+)\.py$")
 LIBRARY_READ_LIMIT = 64 << 20
 LD_SO_CONF = "/etc/ld.so.conf"
 MAX_LD_SO_CONF_FILES = 64
@@ -5596,7 +5599,7 @@ class _SuccessorScan:
         """Executáveis, bibliotecas e módulos Python do requerente, pela lista inteira do ``rpm -ql`` lida linha a
         linha (a lista do ``python3-pip`` passa de 100 KB, acima do teto de ``run``). ``None`` quando não se lê
         inteira."""
-        files, state = {"executables": [], "libraries": [], "python_modules": 0}, {"bad": False}
+        files, state = {"executables": [], "libraries": [], "python_modules": 0, "python_paths": []}, {"bad": False}
 
         def on_line(line):
             path = line.strip()
@@ -5612,11 +5615,40 @@ class _SuccessorScan:
                 files["libraries"].append(path)
             elif PYTHON_LIBRARY_RE.match(merged):
                 files["python_modules"] += 1
+                files["python_paths"].append(path)
 
         receipt = self.stream(["rpm", "-ql", "--", name], on_line)
         if receipt.get("rc") != 0 or receipt.get("truncated") or state["bad"]:
             return None
         return files
+
+    def requirer_python(self, name, paths):
+        """Módulos Python do requerente pelo mesmo fechamento de imports dos scripts: cada ``site-packages`` com o
+        interpretador da mesma versão e o ``sys.path`` com ``site`` emulado (``-I``). Um script sintético importa
+        cada módulo pelo nome; resolução, referência à raiz e indecidível seguem o contrato de sempre, com a origem
+        ``requirer:<pacote>:``. ``False`` quando não mede (caminho fora do layout ou acima do teto)."""
+        groups = {}
+        for path in paths:
+            match = PYTHON_SITE_MODULE_RE.match(_usrmerge(path))
+            if match is None:
+                self.reasons.add("requirer_python_layout_unproven")
+                return False
+            parts = match.group(2).split("/")
+            if parts[-1] == "__init__":
+                parts = parts[:-1]
+            if parts and all(part.isidentifier() for part in parts):
+                groups.setdefault("/usr/bin/python" + match.group(1), set()).add(".".join(parts))
+        if sum(len(names) for names in groups.values()) > MAX_REQUIRER_PYTHON_MODULES:
+            self.reasons.add("requirer_python_modules_over_limit")
+            return False
+        for interp, names in sorted(groups.items()):
+            source = f"requirer:{name}:{interp}"
+            text = "".join(f"import {module}\n" for module in sorted(names))
+            with self.rooted(source):
+                entries = self.python_program(interp, "I", None, text, source, {})
+            if entries:
+                self.undecided("", source, shell=False, extra=entries)
+        return True
 
     def requirer(self, name):
         """Executáveis do requerente em B, com o ``#!`` lido, e as bibliotecas ELF com cada DT_NEEDED resolvido.
@@ -5648,6 +5680,8 @@ class _SuccessorScan:
         entry["python_modules"] = listed["python_modules"]
         if not self.requirer_libraries(entry, listed["libraries"]):
             return entry
+        if listed["python_paths"]:
+            entry["python_modules_measured"] = self.requirer_python(name, listed["python_paths"])
         entry["complete"] = True
         self.scanned["requirer_executables"].add(name)
         if entry["libraries"]:
