@@ -126,15 +126,15 @@
   when: (ansible_facts.service_mgr | default('')) == 'systemd'
   tags: [inventory_collect, collect, functional]
 
-# Contrato observável da aplicação httpd: o mesmo leitor roda em A (gera o
-# contrato) e em B (compara). Não inicia nem configura serviço.
-- name: "[inventory_collect] Observe the local httpd endpoint (read-only, RHEL)"
+# Contrato observável da aplicação HTTP (httpd ou nginx): o mesmo leitor roda
+# em A (gera o contrato) e em B (compara). Não inicia nem configura serviço.
+- name: "[inventory_collect] Observe the local HTTP endpoint (read-only, RHEL)"
   ansible.builtin.command:
     argv:
       - "{{ ansible_facts.python.executable }}"
       - -c
-      - "{{ lookup('file', role_path + '/files/collect_rhel_httpd_function.py') }}"
-  register: inventory_collect_rhel_httpd
+      - "{{ lookup('file', role_path + '/files/collect_rhel_http_function.py') }}"
+  register: inventory_collect_rhel_http
   changed_when: false
   failed_when: false
   when:
@@ -191,16 +191,16 @@
            else false }}
   tags: [inventory_collect, collect, functional]
 
-- name: "[inventory_collect] Record the local httpd observation (RHEL)"
+- name: "[inventory_collect] Record the local HTTP observation (RHEL)"
   ansible.builtin.set_fact:
     inventory_collect_functional: >-
-      {{ inventory_collect_functional | combine({'rhel_httpd_observation':
-           (inventory_collect_rhel_httpd.stdout | from_json)
-           if (inventory_collect_rhel_httpd.rc | default(1)) == 0
-           else {'schema_version': 'samurai.rhel_httpd_function_observation/v1', 'observation_state': 'unavailable'}}) }}
+      {{ inventory_collect_functional | combine({'rhel_http_observation':
+           (inventory_collect_rhel_http.stdout | from_json)
+           if (inventory_collect_rhel_http.rc | default(1)) == 0
+           else {'schema_version': 'samurai.rhel_http_function_observation/v1', 'observation_state': 'unavailable'}}) }}
   when:
-    - inventory_collect_rhel_httpd is defined
-    - not (inventory_collect_rhel_httpd.skipped | default(false) | bool)
+    - inventory_collect_rhel_http is defined
+    - not (inventory_collect_rhel_http.skipped | default(false) | bool)
   tags: [inventory_collect, collect, functional]
 
 # The chassis tag selects the metadata probe; it does not authorize cloud mutation.
