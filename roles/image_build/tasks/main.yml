@@ -1255,7 +1255,7 @@
           - --probe
           - "{{ role_path }}/../inventory_collect/files/collect_rhel_package_usage_v2.py"
           - --expected-probe-sha256
-          - "f717c6d062c28c30fae4e35112f77a3e5ff0f174383f988d5fcad61022e059ef"
+          - "a9e2bdfd20be8f49073a00acdd709565f53a12e171c917b2dc39dedf6e68e7b3"
           - --output
           - "{{ image_build_run_dir }}/build-removed-scriptlets.json"
       register: image_build_removed_scriptlets_run
