@@ -1,8 +1,8 @@
-"""Bounded read-only observation of the local httpd endpoint.
+"""Bounded read-only observation of the local HTTP endpoint and its registered units.
 
-Não inicia, recarrega nem configura serviço. Lê o estado da unit e, só com ela
-ativa, faz um GET local sem proxy e sem seguir redirecionamento. Compatível com o
-Python da plataforma do RHEL 8 (3.6).
+Não inicia, recarrega nem configura serviço. Lê o estado das unidades registradas e,
+só com alguma ativa, faz um GET local sem proxy e sem seguir redirecionamento.
+Compatível com o Python da plataforma do RHEL 8 (3.6).
 """
 import hashlib
 import json
@@ -12,18 +12,18 @@ import sys
 import urllib.error
 import urllib.request
 
-SCHEMA = "samurai.rhel_httpd_function_observation/v1"
-SCOPE = "Local httpd endpoint and httpd.service unit"
-SUBJECT = "httpd.service"
+SCHEMA = "samurai.rhel_http_function_observation/v1"
+SCOPE = "Local HTTP endpoint and its registered systemd units"
+SUBJECTS = ("httpd.service", "nginx.service")
 URI = "http://127.0.0.1/"
 UNIT_FIELDS = ("Id", "LoadState", "ActiveState", "SubState", "UnitFileState")
 BODY_LIMIT = 1048576
 UNIT_LIMIT = 16384
 
 
-def unit():
+def unit(subject):
     argv = ["timeout", "--signal=KILL", "8", "systemctl", "show", "--no-pager",
-            "--property=" + ",".join(UNIT_FIELDS), SUBJECT]
+            "--property=" + ",".join(UNIT_FIELDS), subject]
     try:
         process = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                  env=dict(os.environ, LC_ALL="C"), timeout=10)
@@ -37,7 +37,7 @@ def unit():
         if not separator or name in fields or name not in UNIT_FIELDS:
             return None
         fields[name] = value
-    return fields if set(fields) == set(UNIT_FIELDS) else None
+    return fields if set(fields) == set(UNIT_FIELDS) and fields.get("Id") == subject else None
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -74,12 +74,12 @@ def http(uri=URI):
 def collect(uri=URI):
     value = {"schema_version": SCHEMA, "scope": SCOPE, "configuration_writes": 0, "service_mutations": 0,
              "complete_application_function": False}
-    fields = unit()
-    if fields is None or fields.get("Id") != SUBJECT:
+    units = {subject: unit(subject) for subject in SUBJECTS}
+    if any(fields is None for fields in units.values()):
         value["observation_state"] = "unavailable"
         return value
-    value.update(observation_state="observed", unit=fields)
-    if fields["LoadState"] == "loaded" and fields["ActiveState"] == "active":
+    value.update(observation_state="observed", units=units)
+    if any(fields["LoadState"] == "loaded" and fields["ActiveState"] == "active" for fields in units.values()):
         value["http"] = http(uri)
     else:
         value["http"] = {"uri": uri, "measured": False, "reason": "unit_not_active"}
