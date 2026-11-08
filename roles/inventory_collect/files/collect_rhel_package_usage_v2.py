@@ -665,6 +665,8 @@ GLOB_NAME_RE = re.compile(r"^[A-Za-z0-9._+@:,=%-]+$")
 PY_IMPORT_MAX_DEPTH = 12
 PY_IMPORT_MAX_MODULES = 4000
 PY_IMPORT_TIME_BUDGET_S = 60
+#: ``stat`` que prova ausência na busca de módulo; ``EINVAL`` é o NUL no caminho (``_host_call``).
+PY_PATH_ABSENT_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.ENAMETOOLONG, errno.EINVAL})
 PY_MODULE_LIMIT = 1 << 20
 PY_PATH_FLAGS = "EIsS"
 PY_MEASURE_CODE = (
@@ -4770,7 +4772,10 @@ class _SuccessorScan:
             return None, "site_packages_unproven"
         path, hooks = list(context["path"]), []
         for site_dir in site_dirs:
-            if not self.python_dir(site_dir):
+            is_dir = self.python_dir(site_dir)
+            if is_dir is None:
+                return None, "site_directory_unreadable"
+            if not is_dir:
                 continue
             if site_dir not in path:
                 path.append(site_dir)
@@ -4799,7 +4804,13 @@ class _SuccessorScan:
                             hooks.append(hook)
                         continue
                     entry = posixpath.normpath(posixpath.join(site_dir, line.rstrip()))
-                    if entry not in path and (self.python_dir(entry) or self.fs.is_file(entry)):
+                    if entry in path:
+                        continue
+                    # ``site.addpackage`` só põe no caminho o que existe; ilegível não decide.
+                    kind = self.python_entry(entry)
+                    if kind is None:
+                        return None, "site_pth_unreadable"
+                    if kind != "absent":
                         path.append(entry)
         context = dict(context, path=path, site_packages=list(site_dirs))
         found = self.python_resolve("sitecustomize", path, context)
@@ -4896,6 +4907,9 @@ class _SuccessorScan:
                 (absolute + "." + name) if absolute else name for name in names if name != "*"]
             for index, target in enumerate(targets):
                 found = self.python_resolve(target, dirs, context)
+                if found[0] == "unreadable":
+                    flag(origin, "python_module_unreadable", target, line, found[1])
+                    continue
                 if found[0] == "missing":
                     if index == 0:
                         flag(origin, "python_import_unresolved", target, line)
@@ -4964,7 +4978,8 @@ class _SuccessorScan:
 
     def python_resolve(self, name, dirs, context):
         """Como o ``PathFinder``: ``("source", arquivo)``, ``("extension", .so)``, ``("builtin", None)``,
-        ``("namespace", None)``, ``("zip"|"compiled", caminho)`` ou ``("missing", None)``."""
+        ``("namespace", None)``, ``("zip"|"compiled", caminho)``, ``("missing", None)`` ou ``("unreadable", caminho)``
+        quando um ``stat`` falhou sem provar ausência."""
         parts = name.split(".")
         if len(parts) == 1 and (name in (context.get("builtin") or ()) or name in (context.get("frozen") or ())):
             return ("builtin", None)
@@ -4979,21 +4994,25 @@ class _SuccessorScan:
                         break
                     continue
                 base = directory.rstrip("/") + "/" + part
-                if self.fs.is_file(base + "/__init__.py"):
-                    hit = ("package", base)
-                elif self.fs.is_file(base + ".py"):
-                    hit = ("module", base + ".py")
-                else:
-                    extension = next((base + suffix for suffix in context.get("suffixes") or (".so",)
-                                      if self.fs.is_file(base + suffix)), None)
-                    if extension:
-                        hit = ("extension", extension)
-                    elif self.fs.is_file(base + ".pyc"):
-                        hit = ("compiled", base + ".pyc")
-                    elif self.python_dir(base):
-                        portions.append(base)
+                # A ordem é a do ``FileFinder``; um ``stat`` que não decide encerra a busca sem prova.
+                candidates = [("package", base + "/__init__.py", base), ("module", base + ".py", base + ".py")]
+                candidates += [("extension", base + suffix, base + suffix)
+                               for suffix in context.get("suffixes") or (".so",)]
+                candidates.append(("compiled", base + ".pyc", base + ".pyc"))
+                for kind, probe, result in candidates:
+                    entry = self.python_entry(probe)
+                    if entry is None:
+                        return ("unreadable", probe)
+                    if entry == "file":
+                        hit = (kind, result)
+                        break
                 if hit:
                     break
+                entry = self.python_entry(base)
+                if entry is None:
+                    return ("unreadable", base)
+                if entry == "dir":
+                    portions.append(base)
             if hit is None:
                 if portions and last:
                     return ("namespace", None)
@@ -5014,11 +5033,26 @@ class _SuccessorScan:
             return ("source", path) if kind == "module" else (kind, path)
         return ("missing", None)
 
-    def python_dir(self, path):
+    def python_entry(self, path):
+        """``"dir"``, ``"file"``, ``"other"``, ``"absent"`` ou ``None`` (não decidido).
+
+        Só erro que prova ausência vira ``"absent"``; o ``PathFinder`` do CPython também trata laço de symlink como
+        ausente. ``EACCES``/``EIO`` e afins não provam nada: a coleta de B roda sem ``become``, e o programa medido
+        pode enxergar o caminho que a sonda não lê."""
         try:
-            return stat.S_ISDIR(self.fs.mode(path))
-        except (OSError, ValueError):
-            return False
+            mode = self.fs.mode(path)
+        except (FileNotFoundError, NotADirectoryError):
+            return "absent"
+        except OSError as exc:
+            return "absent" if exc.errno in PY_PATH_ABSENT_ERRNOS else None
+        if stat.S_ISDIR(mode):
+            return "dir"
+        return "file" if stat.S_ISREG(mode) else "other"
+
+    def python_dir(self, path):
+        """``True``/``False``; ``None`` quando o ``stat`` falhou sem provar ausência."""
+        entry = self.python_entry(path)
+        return None if entry is None else entry == "dir"
 
     def python_parse(self, path, name):
         """``(imports, indecidíveis, __all__, pacote, texto)`` do módulo; ``None`` quando não se lê."""
