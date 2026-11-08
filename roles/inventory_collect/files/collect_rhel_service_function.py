@@ -50,6 +50,35 @@ def properties(path, interface):
                     path, "org.freedesktop.DBus.Properties", "GetAll", "s", interface])
 
 
+BUS_TEXT = ["busctl", "--system", "--auto-start=no", "--allow-interactive-authorization=no"]
+NM = "org.freedesktop.NetworkManager"
+
+
+def network_text(interface, server):
+    """Mesmas leituras do D-Bus sem --json, que o busctl do systemd 239 (RHEL 8) não tem.
+
+    Guarda as saídas como vieram; o controlador interpreta o texto ``TIPO VALOR``.
+    """
+    def ok(receipt):
+        return receipt["rc"] == 0 and not receipt["truncated"]
+
+    lookup = command([*BUS_TEXT, "call", NM, "/org/freedesktop/NetworkManager", NM,
+                      "GetDeviceByIpIface", "s", interface])
+    found = {"lookup_text": lookup}
+    device = re.fullmatch(r'o "(/org/freedesktop/NetworkManager/Devices/[0-9]+)"\n?', lookup["stdout"]) if ok(lookup) else None
+    if device is None:
+        return found
+    config_property = "Ip4Config" if server.version == 4 else "Ip6Config"
+    found["device_text"] = command([*BUS_TEXT, "get-property", NM, device.group(1), f"{NM}.Device",
+                                    "Interface", "Managed", "State", "ActiveConnection", config_property])
+    rows = found["device_text"]["stdout"].splitlines() if ok(found["device_text"]) else []
+    config = re.fullmatch(r'o "(/org/freedesktop/NetworkManager/IP[46]Config/[0-9]+)"', rows[-1]) if len(rows) == 5 else None
+    if config is not None:
+        found["ip_config_text"] = command([*BUS_TEXT, "get-property", NM, config.group(1),
+                                           f"{NM}.IP{server.version}Config", "AddressData"])
+    return found
+
+
 def network(connection):
     parts = connection.split()
     try:
@@ -66,7 +95,9 @@ def network(connection):
                           "GetDeviceByIpIface", "s", interface])
         result = {"route": route, "lookup": lookup,
                   "addresses": command(["ip", "-j", "address", "show", "dev", interface])}
-        device_path = json.loads(lookup["stdout"])["data"][0] if lookup["rc"] == 0 and not lookup["truncated"] else ""
+        if lookup["rc"] != 0 or lookup["truncated"]:
+            return {**result, **network_text(interface, server)}
+        device_path = json.loads(lookup["stdout"])["data"][0]
         if not re.fullmatch(r"/org/freedesktop/NetworkManager/Devices/[0-9]+", device_path):
             return result
         result["device"] = properties(device_path, "org.freedesktop.NetworkManager.Device")
