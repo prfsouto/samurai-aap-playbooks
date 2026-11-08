@@ -187,6 +187,7 @@ import datetime
 import hashlib
 import json
 import os
+import posixpath
 import re
 import shlex
 import signal
@@ -671,6 +672,9 @@ PY_MEASURE_CODE = (
     "'isolated_startup':bool(sys.flags.isolated and sys.flags.no_site and sys.flags.dont_write_bytecode)}))"
 )
 PY_CONTEXT_FIELDS = frozenset({"path", "builtin", "suffixes", "frozen", "base_installation", "isolated_startup"})
+#: ``import site`` com ``-S`` só define funções (``site.main()`` não roda): nenhum ``.pth`` nem ``sitecustomize`` executa.
+PY_SITE_CODE = "import sys,site;print(repr({'site_packages':list(site.getsitepackages()),'no_site':bool(sys.flags.no_site)}))"
+PY_SITE_FIELDS = frozenset({"site_packages", "no_site"})
 PY_CONTEXT_MAX_BYTES = 32768
 PY_ENVIRONMENT = ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE", "PYTHONNOUSERSITE",
                   "PYTHONSAFEPATH", "PYTHONPLATLIBDIR")
@@ -4589,8 +4593,64 @@ class _SuccessorScan:
             return None
         return context
 
+    @staticmethod
+    def parse_site_packages(shown):
+        """Diretórios de ``site.getsitepackages()`` medidos com ``-I -S`` (o ``site.main()`` não rodou)."""
+        output = shown.get("stdout", "")
+        if shown.get("rc") != 0 or shown.get("truncated") or len(output.splitlines()) != 1:
+            return None
+        try:
+            value = ast.literal_eval(output.strip())
+        except (ValueError, SyntaxError, RecursionError):
+            return None
+        if not isinstance(value, dict) or set(value) != PY_SITE_FIELDS or value["no_site"] is not True:
+            return None
+        dirs = value["site_packages"]
+        if not isinstance(dirs, list) or not all(isinstance(path, str) and path.startswith("/") for path in dirs):
+            return None
+        return dirs
+
+    def python_site_context(self, executable, context):
+        """``site`` emulado sem executar hook: diretórios do ``getsitepackages()`` do próprio interpretador e as
+        linhas de caminho dos ``.pth``, na ordem de ``site.addsitedir``. Linha ``import`` em ``.pth`` e
+        ``sitecustomize`` rodam código no início do processo: ``(None, motivo)``."""
+        shown = self.run(["env", "-i", "PATH=/usr/bin:/bin", executable, "-I", "-S", "-B", "-c", PY_SITE_CODE])
+        site_dirs = self.parse_site_packages(shown)
+        if site_dirs is None:
+            return None, "site_packages_unproven"
+        path = list(context["path"])
+        for site_dir in site_dirs:
+            if not self.python_dir(site_dir):
+                continue
+            if site_dir not in path:
+                path.append(site_dir)
+            try:
+                names = self.fs.listdir(site_dir)
+            except OSError:
+                return None, "site_directory_unreadable"
+            for name in sorted(name for name in names if name.endswith(".pth") and not name.startswith(".")):
+                try:
+                    text, cut = self.fs.read(site_dir.rstrip("/") + "/" + name, FILE_LIMIT)
+                except OSError:
+                    return None, "site_pth_unreadable"
+                if cut:
+                    return None, "site_pth_unreadable"
+                for line in text.splitlines():
+                    if line.startswith("#") or not line.strip():
+                        continue
+                    if line.startswith(("import ", "import\t")):
+                        return None, "site_hook_unproven"
+                    entry = posixpath.normpath(posixpath.join(site_dir, line.rstrip()))
+                    if entry not in path and (self.python_dir(entry) or self.fs.is_file(entry)):
+                        path.append(entry)
+        context = dict(context, path=path, site_packages=list(site_dirs))
+        if self.python_resolve("sitecustomize", path, context)[0] != "missing":
+            return None, "site_customize_unproven"
+        return context, None
+
     def python_context(self, interp, flags, environment, script=None):
-        """Mede sem hooks e só admite equivalência quando o workload também desliga site."""
+        """Mede sem hooks. Com ``site`` ligado, emula o ``site`` a partir do interpretador medido, sem site de
+        usuário (``-s``/``-I``), ``.pth`` com código ou ``sitecustomize``."""
         script_dir = None
         if "I" not in flags and script and script.startswith("/"):
             try:
@@ -4603,10 +4663,12 @@ class _SuccessorScan:
         if key not in self.python_contexts:
             context, reason = None, None
             executable = self.paths.final(interp)
+            site = "S" not in flags
             if environment:
                 reason = "python_environment_unproven"
-            elif "S" not in flags:
-                reason = "site_startup_unproven"
+            elif site and "s" not in flags and "I" not in flags:
+                # O site do usuário (``~/.local``) depende de quem roda o processo: não se mede daqui.
+                reason = "user_site_unproven"
             elif "I" not in flags and script_dir is None:
                 reason = "script_path_unproven"
             else:
@@ -4616,7 +4678,9 @@ class _SuccessorScan:
                 context = self.parse_python_context(shown)
                 if context is None:
                     reason = "isolated_context_unproven"
-                elif script_dir is not None:
+                elif site:
+                    context, reason = self.python_site_context(executable, context)
+                if context is not None and script_dir is not None:
                     context["path"] = [script_dir] + context["path"]
             self.python_contexts[key] = context
             if len(self.python_receipt) < MAX_RESOLVED_ENTRIES:

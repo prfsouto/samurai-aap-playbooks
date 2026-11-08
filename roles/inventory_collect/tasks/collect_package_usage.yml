@@ -71,7 +71,7 @@
         - inventory_collect_package_usage_bound | bool
         - inventory_collect_package_usage_request.expected_probe_sha256 is defined
         - inventory_collect_package_usage_request.expected_probe_sha256 is string
-        - inventory_collect_package_usage_request.expected_probe_sha256 == '7852b698faf5901aec17efb7b73f0a2325a2d810e74571f74471af50ca6c294b'
+        - inventory_collect_package_usage_request.expected_probe_sha256 == '6c9b5fb6f5023b1790091b7ceb6431b79e91a87e6ed9863e36dc04df8a536f34'
         - >-
           inventory_collect_package_usage_request.successor_runtime is not defined
           or (
