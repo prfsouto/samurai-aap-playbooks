@@ -678,6 +678,24 @@ PY_CONTEXT_FIELDS = frozenset({"path", "builtin", "suffixes", "frozen", "base_in
 #: ``import site`` com ``-S`` só define funções (``site.main()`` não roda): nenhum ``.pth`` nem ``sitecustomize`` executa.
 PY_SITE_CODE = "import sys,site;print(repr({'site_packages':list(site.getsitepackages()),'no_site':bool(sys.flags.no_site)}))"
 PY_SITE_FIELDS = frozenset({"site_packages", "no_site"})
+#: ``sys.path`` e maquinaria de import depois do ``site`` (só roda quando todo código de início é do fornecedor).
+PY_SITE_RUN_CODE = (
+    "import sys,builtins\n"
+    "q=lambda o:str(getattr(o,'__module__',None) or type(o).__module__)+'.'+str(getattr(o,'__qualname__',None)"
+    " or type(o).__qualname__)\n"
+    "s=lambda m:getattr(m,'__spec__',None)\n"
+    "print(repr({'path':list(sys.path),'meta_path':[q(f) for f in sys.meta_path],"
+    "'path_hooks':[q(h) for h in sys.path_hooks],"
+    "'importers':sorted({q(type(v)) for v in list(sys.path_importer_cache.values())}),"
+    "'import_function':q(builtins.__import__),"
+    "'modules':{n:(str(s(m).name),str(s(m).origin)) if s(m) is not None else None"
+    " for n,m in list(sys.modules.items())},"
+    "'no_site':bool(sys.flags.no_site),'isolated':bool(sys.flags.isolated)}))\n"
+)
+PY_SITE_RUN_FIELDS = frozenset({"path", "meta_path", "path_hooks", "importers", "import_function", "modules",
+                                "no_site", "isolated"})
+#: Finders que o ``site`` cria no ``path_importer_cache`` ao ler um diretório (ou ``None`` para entrada sem finder).
+PY_SITE_PATH_IMPORTERS = frozenset({"_frozen_importlib_external.FileFinder", "builtins.NoneType"})
 PY_CONTEXT_MAX_BYTES = 32768
 PY_ENVIRONMENT = ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE", "PYTHONNOUSERSITE",
                   "PYTHONSAFEPATH", "PYTHONPLATLIBDIR")
@@ -4613,15 +4631,112 @@ class _SuccessorScan:
             return None
         return dirs
 
-    def python_site_context(self, executable, context):
-        """``site`` emulado sem executar hook: diretórios do ``getsitepackages()`` do próprio interpretador e as
-        linhas de caminho dos ``.pth``, na ordem de ``site.addsitedir``. Linha ``import`` em ``.pth`` e
-        ``sitecustomize`` rodam código no início do processo: ``(None, motivo)``."""
+    @staticmethod
+    def parse_site_run(shown, no_site):
+        """Saída de ``PY_SITE_RUN_CODE``: ``sys.path`` e a maquinaria de import (``meta_path``/``path_hooks``)."""
+        output = shown.get("stdout", "")
+        if shown.get("rc") != 0 or shown.get("truncated") or len(output.splitlines()) != 1:
+            return None
+        try:
+            value = ast.literal_eval(output.strip())
+        except (ValueError, SyntaxError, RecursionError):
+            return None
+        if (not isinstance(value, dict) or set(value) != PY_SITE_RUN_FIELDS or value["no_site"] is not no_site
+                or value["isolated"] is not True):
+            return None
+        for name in ("path", "meta_path", "path_hooks", "importers"):
+            if not isinstance(value[name], list) or not all(isinstance(item, str) for item in value[name]):
+                return None
+        if not value["path"] or not all(path.startswith("/") for path in value["path"]):
+            return None
+        modules = value["modules"]
+        if not isinstance(value["import_function"], str) or not isinstance(modules, dict):
+            return None
+        for name, spec in modules.items():
+            if not isinstance(name, str) or not (spec is None or (
+                    isinstance(spec, tuple) and len(spec) == 2 and all(isinstance(item, str) for item in spec))):
+                return None
+        return value
+
+    def site_hook_imports_vendor(self, hook, context):
+        """O hook e cada módulo que ele importa por nome literal são arquivos de pacote do fornecedor íntegro. Do
+        ``.pth`` contam só as linhas ``import`` (as que o ``site`` executa); import dinâmico ou ``exec`` recusa."""
+        if self.trust.trust(self.paths.final(hook))[0] is None:
+            return "site_hook_outside_vendor"
+        try:
+            text, cut = self.fs.read(hook, FILE_LIMIT)
+        except OSError:
+            return "site_hook_unreadable"
+        if cut:
+            return "site_hook_unreadable"
+        if hook.endswith(".pth"):
+            text = "\n".join(line for line in text.splitlines() if line.startswith(("import ", "import\t")))
+        imports, undecided, _ = _python_imports(text)
+        if undecided or imports is None:
+            return "site_hook_unproven"
+        for module, level, _names, _line in imports:
+            found = self.python_resolve(module, context["path"], context) if not level else ("missing", None)
+            if found[0] == "builtin":
+                continue
+            if found[0] not in ("source", "extension") or self.trust.trust(self.paths.final(found[1]))[0] is None:
+                return "site_hook_outside_vendor"
+        return None
+
+    def site_modules_vendor(self, baseline, measured, context):
+        """Todo módulo que o ``site`` carregou (ausente ou diferente na leitura ``-S``) é o que o ``PathFinder``
+        resolve pelo ``sys.path`` medido, em arquivo do fornecedor íntegro, ou é embutido."""
+        for name, spec in sorted(measured["modules"].items()):
+            if name in baseline["modules"] and baseline["modules"][name] == spec:
+                continue
+            if spec is None:
+                return False
+            spec_name, origin = spec
+            found = self.python_resolve(spec_name, measured["path"], context)
+            if origin in ("built-in", "frozen"):
+                if found[0] != "builtin":
+                    return False
+                continue
+            if found[0] not in ("source", "extension") or found[1] != origin:
+                return False
+            if self.trust.trust(self.paths.final(origin))[0] is None:
+                return False
+        return True
+
+    def vendor_site_hooks(self, executable, hooks, context):
+        """``sys.path`` do ``site`` real quando todo código de início é do fornecedor íntegro.
+
+        Antes de rodar: cada ``.pth`` com ``import`` e o ``sitecustomize`` são de pacote do fornecedor com ``rpm -V``
+        limpo, e cada import literal deles também (``site_hook_imports_vendor``). O ``site`` roda em ``env -i`` com
+        ``-I -B``, o mesmo código que todo processo Python do host roda no início. Depois, contra a leitura ``-S``:
+        ``meta_path``, ``path_hooks``, ``__import__`` e os tipos do ``path_importer_cache`` iguais, e todo módulo
+        novo do fornecedor. O hook só pode ter mudado o ``sys.path``, que sai medido; o resto fica sem prova."""
+        for hook in hooks:
+            reason = self.site_hook_imports_vendor(hook, context)
+            if reason is not None:
+                return None, reason
+        command = ["env", "-i", "PATH=/usr/bin:/bin", executable]
+        baseline = self.parse_site_run(self.run(command + ["-I", "-S", "-B", "-c", PY_SITE_RUN_CODE]), True)
+        measured = self.parse_site_run(self.run(command + ["-I", "-B", "-c", PY_SITE_RUN_CODE]), False)
+        if baseline is None or measured is None:
+            return None, "site_run_unproven"
+        same = ("meta_path", "path_hooks", "import_function")
+        if (any(measured[name] != baseline[name] for name in same)
+                or not set(measured["importers"]) <= set(baseline["importers"]) | PY_SITE_PATH_IMPORTERS):
+            return None, "site_import_machinery_changed"
+        if not self.site_modules_vendor(baseline, measured, context):
+            return None, "site_modules_outside_vendor"
+        return dict(context, path=measured["path"], site_hooks=sorted(hooks)), None
+
+    def python_site_context(self, executable, context, allow_vendor_hooks=False):
+        """``site`` emulado: diretórios do ``getsitepackages()`` do próprio interpretador e as linhas de caminho dos
+        ``.pth``, na ordem de ``site.addsitedir``. Linha ``import`` em ``.pth`` e ``sitecustomize`` rodam código no
+        início do processo: só com ambiente do programa vazio e código do fornecedor (``vendor_site_hooks``);
+        senão, ``(None, motivo)``."""
         shown = self.run(["env", "-i", "PATH=/usr/bin:/bin", executable, "-I", "-S", "-B", "-c", PY_SITE_CODE])
         site_dirs = self.parse_site_packages(shown)
         if site_dirs is None:
             return None, "site_packages_unproven"
-        path = list(context["path"])
+        path, hooks = list(context["path"]), []
         for site_dir in site_dirs:
             if not self.python_dir(site_dir):
                 continue
@@ -4642,18 +4757,29 @@ class _SuccessorScan:
                     if line.startswith("#") or not line.strip():
                         continue
                     if line.startswith(("import ", "import\t")):
-                        return None, "site_hook_unproven"
+                        if not allow_vendor_hooks:
+                            return None, "site_hook_unproven"
+                        hook = site_dir.rstrip("/") + "/" + name
+                        if hook not in hooks:
+                            hooks.append(hook)
+                        continue
                     entry = posixpath.normpath(posixpath.join(site_dir, line.rstrip()))
                     if entry not in path and (self.python_dir(entry) or self.fs.is_file(entry)):
                         path.append(entry)
         context = dict(context, path=path, site_packages=list(site_dirs))
-        if self.python_resolve("sitecustomize", path, context)[0] != "missing":
-            return None, "site_customize_unproven"
+        found = self.python_resolve("sitecustomize", path, context)
+        if found[0] != "missing":
+            if not allow_vendor_hooks or found[0] != "source":
+                return None, "site_customize_unproven"
+            hooks.append(found[1])
+        if hooks:
+            return self.vendor_site_hooks(executable, hooks, context)
         return context, None
 
-    def python_context(self, interp, flags, environment, script=None):
+    def python_context(self, interp, flags, environment, script=None, clean_environment=False):
         """Mede sem hooks. Com ``site`` ligado, emula o ``site`` a partir do interpretador medido, sem site de
-        usuário (``-s``/``-I``), ``.pth`` com código ou ``sitecustomize``."""
+        usuário (``-s``/``-I``). ``.pth`` com código ou ``sitecustomize`` só com o programa sem nenhuma variável de
+        ambiente (``clean_environment``) e código do fornecedor (``vendor_site_hooks``): o hook lê o ambiente."""
         script_dir = None
         if "I" not in flags and script and script.startswith("/"):
             try:
@@ -4662,7 +4788,7 @@ class _SuccessorScan:
                 resolved_script = ""
             if resolved_script.startswith("/"):
                 script_dir = resolved_script.rsplit("/", 1)[0] or "/"
-        key = (interp, flags, tuple(sorted(environment.items())), script_dir)
+        key = (interp, flags, tuple(sorted(environment.items())), script_dir, clean_environment)
         if key not in self.python_contexts:
             context, reason = None, None
             executable = self.paths.final(interp)
@@ -4682,7 +4808,8 @@ class _SuccessorScan:
                 if context is None:
                     reason = "isolated_context_unproven"
                 elif site:
-                    context, reason = self.python_site_context(executable, context)
+                    context, reason = self.python_site_context(executable, context,
+                                                               allow_vendor_hooks=clean_environment)
                 if context is not None and script_dir is not None:
                     context["path"] = [script_dir] + context["path"]
             self.python_contexts[key] = context
@@ -4690,7 +4817,7 @@ class _SuccessorScan:
                 self.python_receipt.append({"interpreter": interp, "flags": flags,
                                             "environment": {name: True for name in sorted(environment)},
                                             "sys_path": (context or {}).get("path"), "measured": context is not None,
-                                            "reason": reason})
+                                            "site_hooks": (context or {}).get("site_hooks", []), "reason": reason})
         return self.python_contexts[key]
 
     def python_program(self, interp, flags, script, text, source, env):
@@ -4700,7 +4827,7 @@ class _SuccessorScan:
         if self.trust.trust(self.paths.final(interp))[0] is None:
             # R11-1: a sonda só executa interpretador de pacote do fornecedor íntegro e assinado; o resto nunca roda.
             return [_undecided_entry(source, "python_sys_path_not_measured_untrusted_interpreter", interp, origin=script)]
-        context = self.python_context(interp, flags, environment, script)
+        context = self.python_context(interp, flags, environment, script, clean_environment=not env)
         if context is None:
             return [_undecided_entry(source, "python_sys_path_unmeasured", interp, origin=script)]
         dirs = context["path"]
