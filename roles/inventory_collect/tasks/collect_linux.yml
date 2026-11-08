@@ -126,6 +126,22 @@
   when: (ansible_facts.service_mgr | default('')) == 'systemd'
   tags: [inventory_collect, collect, functional]
 
+# Contrato observável da aplicação httpd: o mesmo leitor roda em A (gera o
+# contrato) e em B (compara). Não inicia nem configura serviço.
+- name: "[inventory_collect] Observe the local httpd endpoint (read-only, RHEL)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_facts.python.executable }}"
+      - -c
+      - "{{ lookup('file', role_path + '/files/collect_rhel_httpd_function.py') }}"
+  register: inventory_collect_rhel_httpd
+  changed_when: false
+  failed_when: false
+  when:
+    - (ansible_facts.distribution | default('')) == 'RedHat'
+    - (ansible_facts.service_mgr | default('')) == 'systemd'
+  tags: [inventory_collect, collect, functional]
+
 - name: "[inventory_collect] Record functional observations"
   ansible.builtin.set_fact:
     inventory_collect_functional:
@@ -173,6 +189,18 @@
            if (inventory_collect_systemd is defined
                and not (inventory_collect_systemd.skipped | default(false) | bool))
            else false }}
+  tags: [inventory_collect, collect, functional]
+
+- name: "[inventory_collect] Record the local httpd observation (RHEL)"
+  ansible.builtin.set_fact:
+    inventory_collect_functional: >-
+      {{ inventory_collect_functional | combine({'rhel_httpd_observation':
+           (inventory_collect_rhel_httpd.stdout | from_json)
+           if (inventory_collect_rhel_httpd.rc | default(1)) == 0
+           else {'schema_version': 'samurai.rhel_httpd_function_observation/v1', 'observation_state': 'unavailable'}}) }}
+  when:
+    - inventory_collect_rhel_httpd is defined
+    - not (inventory_collect_rhel_httpd.skipped | default(false) | bool)
   tags: [inventory_collect, collect, functional]
 
 # The chassis tag selects the metadata probe; it does not authorize cloud mutation.
