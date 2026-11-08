@@ -694,6 +694,8 @@ PY_SITE_RUN_CODE = (
 )
 PY_SITE_RUN_FIELDS = frozenset({"path", "meta_path", "path_hooks", "importers", "import_function", "modules",
                                 "no_site", "isolated"})
+#: Teto da leitura do ``site`` real (inclui ``sys.modules``); acima dele a leitura fica sem prova.
+PY_SITE_RUN_MAX_BYTES = 65536
 #: Finders que o ``site`` cria no ``path_importer_cache`` ao ler um diretório (ou ``None`` para entrada sem finder).
 PY_SITE_PATH_IMPORTERS = frozenset({"_frozen_importlib_external.FileFinder", "builtins.NoneType"})
 PY_CONTEXT_MAX_BYTES = 32768
@@ -4637,6 +4639,8 @@ class _SuccessorScan:
         output = shown.get("stdout", "")
         if shown.get("rc") != 0 or shown.get("truncated") or len(output.splitlines()) != 1:
             return None
+        if len(output.encode("utf-8", "replace")) > PY_SITE_RUN_MAX_BYTES:
+            return None
         try:
             value = ast.literal_eval(output.strip())
         except (ValueError, SyntaxError, RecursionError):
@@ -4658,9 +4662,22 @@ class _SuccessorScan:
                 return None
         return value
 
+    def site_import_vendor(self, name, context, submodule=False):
+        """Cada pacote do caminho de ``name`` (``a``, ``a.b``…) que roda código no import é arquivo do fornecedor.
+        ``submodule``: o último nome veio de ``from pkg import x`` e pode ser só atributo (ausente como arquivo)."""
+        parts = name.split(".")
+        for end in range(1, len(parts) + 1):
+            found = self.python_resolve(".".join(parts[:end]), context["path"], context)
+            if found[0] in ("builtin", "namespace") or (submodule and end == len(parts) and found[0] == "missing"):
+                continue
+            if found[0] not in ("source", "extension") or self.trust.trust(self.paths.final(found[1]))[0] is None:
+                return False
+        return True
+
     def site_hook_imports_vendor(self, hook, context):
-        """O hook e cada módulo que ele importa por nome literal são arquivos de pacote do fornecedor íntegro. Do
-        ``.pth`` contam só as linhas ``import`` (as que o ``site`` executa); import dinâmico ou ``exec`` recusa."""
+        """O hook, cada módulo que ele importa por nome literal (com os pacotes do caminho) e cada submódulo de
+        ``from pkg import x`` são arquivos de pacote do fornecedor íntegro. Do ``.pth`` contam só as linhas ``import``
+        (as que o ``site`` executa); import relativo, dinâmico ou ``exec`` recusa."""
         if self.trust.trust(self.paths.final(hook))[0] is None:
             return "site_hook_outside_vendor"
         try:
@@ -4674,11 +4691,12 @@ class _SuccessorScan:
         imports, undecided, _ = _python_imports(text)
         if undecided or imports is None:
             return "site_hook_unproven"
-        for module, level, _names, _line in imports:
-            found = self.python_resolve(module, context["path"], context) if not level else ("missing", None)
-            if found[0] == "builtin":
-                continue
-            if found[0] not in ("source", "extension") or self.trust.trust(self.paths.final(found[1]))[0] is None:
+        for module, level, names, _line in imports:
+            if "*" in names:
+                return "site_hook_unproven"  # ``import *`` de pacote carrega os submódulos do ``__all__``
+            if level or not module or not self.site_import_vendor(module, context):
+                return "site_hook_outside_vendor"
+            if not all(self.site_import_vendor(module + "." + item, context, submodule=True) for item in names):
                 return "site_hook_outside_vendor"
         return None
 
