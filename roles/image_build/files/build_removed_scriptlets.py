@@ -24,8 +24,13 @@ SNAPSHOT_MEMBER = "scriptlets.txt"
 HISTORY_MEMBER = "history.sqlite"
 HISTORY_BEFORE_MEMBER = "history-before.sqlite"
 HISTORY_BEFORE_ABSENT = "history-before.absent"
-MEMBERS = (SNAPSHOT_MEMBER, HISTORY_MEMBER, HISTORY_BEFORE_MEMBER, HISTORY_BEFORE_ABSENT)
+SPOOL_END_MEMBER = "spool-end.txt"
+SPOOL_END_MARK = "@@samurai-spool-end"
+MEMBERS = (SNAPSHOT_MEMBER, HISTORY_MEMBER, HISTORY_BEFORE_MEMBER, HISTORY_BEFORE_ABSENT, SPOOL_END_MEMBER)
 SPOOL_KEYS = ("at_jobs", "user_crontab_spool")
+SPOOL_DIRS = (("user_crontab_spool", "/var/spool/cron/"), ("at_jobs", "/var/spool/at/"))
+#: Contador de sequência do ``at``: arquivo do spool que não é job.
+AT_SEQUENCE = "/var/spool/at/.SEQ"
 MAX_MEMBER_BYTES = 268435456
 
 
@@ -147,6 +152,38 @@ def read_history(probe, data, baseline=0):
     return summary["transactions"], left, before
 
 
+def read_spool_end(members):
+    """Arquivos do spool de cron e de ``at`` no fim do build (saída de ``ls -1RAp``), por spool.
+
+    ``read`` só com o marcador de fim e rc 0. Cabeçalho de pasta fora dos dois spools, ou nome antes de cabeçalho,
+    deixa a leitura incompleta: nada vira "spool vazio" sem medição. Pasta termina em ``/`` e não é arquivo.
+    """
+    empty = {"read": False, "user_crontab_spool": [], "at_jobs": []}
+    if SPOOL_END_MEMBER not in members:
+        return empty
+    lines = [line for line in members[SPOOL_END_MEMBER].decode("utf-8", "replace").splitlines() if line.strip()]
+    if not lines or lines[-1] != SPOOL_END_MARK + " rc=0":
+        return empty
+    found = {"user_crontab_spool": [], "at_jobs": []}
+    directory, key = None, None
+    for line in lines[:-1]:
+        if line.endswith(":") and line.startswith("/"):
+            directory = line[:-1].rstrip("/") + "/"
+            key = next((name for name, prefix in SPOOL_DIRS if directory.startswith(prefix)), None)
+            if key is None:
+                return empty
+            continue
+        if directory is None:
+            return empty
+        if line.endswith("/"):
+            continue
+        path = directory + line
+        if path != AT_SEQUENCE:
+            found[key].append(path)
+    return {"read": True, "user_crontab_spool": sorted(found["user_crontab_spool"]),
+            "at_jobs": sorted(found["at_jobs"])}
+
+
 def build_document(probe, classifier_sha256, members):
     reasons = []
     blocks, measured = {}, {"packages": 0, "spool_writers": {}}
@@ -185,7 +222,8 @@ def build_document(probe, classifier_sha256, members):
         reasons.append("removed_not_measured")
     return {"schema": SCHEMA, "classifier_sha256": classifier_sha256, "complete": not reasons,
             "reasons": reasons, "transactions": transactions, "snapshot_packages": measured.get("packages", 0),
-            "baseline_transactions": baseline, "left_before_build": before, "removed": removed}
+            "baseline_transactions": baseline, "left_before_build": before, "removed": removed,
+            "spool_at_end": read_spool_end(members)}
 
 
 def main(argv=None):
