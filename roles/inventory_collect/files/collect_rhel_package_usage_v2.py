@@ -4989,7 +4989,10 @@ class _SuccessorScan:
             portions, hit = [], None
             for directory in search:
                 if directory.endswith(".zip"):
-                    if self.fs.is_file(directory):
+                    entry = self.python_entry(directory)
+                    if entry is None:
+                        return ("unreadable", directory)
+                    if entry == "file":
                         hit = ("zip", directory)
                         break
                     continue
