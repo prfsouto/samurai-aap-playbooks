@@ -5636,8 +5636,11 @@ class _SuccessorScan:
             parts = match.group(2).split("/")
             if parts[-1] == "__init__":
                 parts = parts[:-1]
-            if parts and all(part.isidentifier() for part in parts):
-                groups.setdefault("/usr/bin/python" + match.group(1), set()).add(".".join(parts))
+            if not parts or not all(part.isidentifier() for part in parts):
+                # Arquivo que ``import`` não alcança pode rodar por outro caminho (runpy, exec): sem prova.
+                self.reasons.add("requirer_python_module_name_unproven")
+                return False
+            groups.setdefault("/usr/bin/python" + match.group(1), set()).add(".".join(parts))
         if sum(len(names) for names in groups.values()) > MAX_REQUIRER_PYTHON_MODULES:
             self.reasons.add("requirer_python_modules_over_limit")
             return False
