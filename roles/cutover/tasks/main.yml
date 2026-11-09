@@ -4,6 +4,8 @@
 # Purpose: switch traffic from old → new server. Optional / gated.
 # Runs only when cutover.enabled == true AND validation_passed == true.
 # Idempotent — re-running on a host already in service is a no-op.
+# cutover_done is published only after every configured change is read back
+# from AWS; a failed mutation or a divergent readback fails the job.
 # ============================================================================
 
 - name: "[cutover] Skip when disabled"
@@ -21,6 +23,30 @@
     msg: "Refusing to cutover: validation_passed={{ validation_passed | default(false) }}"
   when: not (validation_passed | default(false) | bool)
 
+- name: "[cutover] Resolve cutover inputs"
+  ansible.builtin.set_fact:
+    cutover_use_lb: "{{ cutover_lb_target_group | length > 0 }}"
+    cutover_use_dns: "{{ cutover_dns_record | length > 0 }}"
+    cutover_new_instance_id: "{{ instance_id | default('', true) | string }}"
+    cutover_old_instance_id: "{{ old_server.instance_id | default('', true) | string }}"
+    cutover_new_ip: "{{ new_ip | default('', true) | string }}"
+  tags: [cutover]
+
+- name: "[cutover] Refuse a cutover that has nothing verifiable to switch"
+  ansible.builtin.assert:
+    that:
+      - cutover_use_lb or cutover_use_dns
+      - not cutover_use_lb or cutover_new_instance_id | length > 0
+      - not cutover_use_dns or (cutover_dns_zone | length > 0 and cutover_new_ip | length > 0)
+    fail_msg: >-
+      Refusing to cutover: lb_target_group={{ cutover_use_lb }}
+      instance_id={{ cutover_new_instance_id | length > 0 }}
+      dns_record={{ cutover_use_dns }} dns_zone={{ cutover_dns_zone | length > 0 }}
+      new_ip={{ cutover_new_ip | length > 0 }}. Configure a target group or a DNS
+      record, with the identity it needs.
+    quiet: true
+  tags: [cutover]
+
 - name: "[cutover] Display cutover plan"
   ansible.builtin.debug:
     msg:
@@ -28,46 +54,135 @@
       old_server: "{{ old_server.hostname | default('') }}"
       old_ip: "{{ old_server.ip_address | default('') }}"
       new_server: "{{ new_hostname | default('') }}"
-      new_ip: "{{ new_ip | default('') }}"
+      new_ip: "{{ cutover_new_ip }}"
       lb_target_group: "{{ cutover_lb_target_group }}"
       dns: "{{ cutover_dns_record }}"
+      region: "{{ region | default('', true) }}"
   tags: [cutover]
 
 # ── Step 1. Register new instance in load balancer ───────────────────────────
-- name: "[cutover] Register new instance in target group"
-  when: cutover_lb_target_group | length > 0
+- name: "[cutover] Register new instance in target group and wait until healthy"
+  when: cutover_use_lb
   community.aws.elb_target:
+    region: "{{ region | default(omit, true) }}"
     target_group_arn: "{{ cutover_lb_target_group }}"
-    target_id: "{{ instance_id }}"
+    target_id: "{{ cutover_new_instance_id }}"
     state: present
+    target_status: healthy
+    target_status_timeout: "{{ cutover_target_healthy_timeout | int }}"
   tags: [cutover, lb]
 
 # ── Step 2. Drain old instance ──────────────────────────────────────────────
 - name: "[cutover] Drain old instance from target group"
-  when: cutover_lb_target_group | length > 0 and old_server.instance_id | default('') | length > 0
+  when:
+    - cutover_use_lb
+    - cutover_old_instance_id | length > 0
+    - cutover_old_instance_id != cutover_new_instance_id
   community.aws.elb_target:
+    region: "{{ region | default(omit, true) }}"
     target_group_arn: "{{ cutover_lb_target_group }}"
-    target_id: "{{ old_server.instance_id }}"
+    target_id: "{{ cutover_old_instance_id }}"
     state: absent
   tags: [cutover, lb]
 
 - name: "[cutover] Wait for connection drain"
   ansible.builtin.pause:
     seconds: "{{ cutover_drain_timeout | int }}"
-  when: cutover_lb_target_group | length > 0
+  when: cutover_use_lb
   tags: [cutover, drain]
 
+- name: "[cutover] Read target group health back"
+  when: cutover_use_lb
+  community.aws.elb_target_group_info:
+    region: "{{ region | default(omit, true) }}"
+    target_group_arns:
+      - "{{ cutover_lb_target_group }}"
+    collect_targets_health: true
+  register: cutover_lb_readback
+  tags: [cutover, lb]
+
+- name: "[cutover] Record observed target group members"
+  when: cutover_use_lb
+  vars:
+    cutover_lb_groups: "{{ cutover_lb_readback.target_groups | default([]) }}"
+  ansible.builtin.set_fact:
+    cutover_lb_found: "{{ cutover_lb_groups | length > 0 }}"
+    cutover_lb_health: "{{ cutover_lb_groups[0].targets_health_description | default([]) if cutover_lb_groups else [] }}"
+    cutover_lb_targets_observed: {}
+  tags: [cutover, lb]
+
+- name: "[cutover] Index target group members by id"
+  when: cutover_use_lb
+  ansible.builtin.set_fact:
+    cutover_lb_targets_observed: "{{ cutover_lb_targets_observed | combine({item.target.id: item.target_health.state}) }}"
+  loop: "{{ cutover_lb_health }}"
+  loop_control:
+    label: "{{ item.target.id }}"
+  tags: [cutover, lb]
+
+- name: "[cutover] Confirm the target group now routes to the new instance"
+  when: cutover_use_lb
+  vars:
+    cutover_lb_new_state: "{{ cutover_lb_targets_observed[cutover_new_instance_id] | default('absent') }}"
+    cutover_lb_old_state: "{{ cutover_lb_targets_observed[cutover_old_instance_id] | default('absent') }}"
+  ansible.builtin.assert:
+    that:
+      - cutover_lb_found | bool
+      - cutover_lb_new_state == 'healthy'
+      - >-
+        cutover_old_instance_id | length == 0
+        or cutover_old_instance_id == cutover_new_instance_id
+        or cutover_lb_old_state in ['absent', 'draining']
+    fail_msg: "Target group readback diverges: found={{ cutover_lb_found }}
+      new={{ cutover_new_instance_id }}:{{ cutover_lb_new_state }}
+      old={{ cutover_old_instance_id }}:{{ cutover_lb_old_state }}"
+    quiet: true
+  tags: [cutover, lb]
+
 # ── Step 3. DNS update ──────────────────────────────────────────────────────
+# Route53 is global and `region` on this module selects latency-based routing,
+# so the AWS region is not passed here.
 - name: "[cutover] Update DNS record to point at new instance"
-  when: cutover_dns_zone | length > 0 and cutover_dns_record | length > 0
-  community.aws.route53:
+  when: cutover_use_dns
+  amazon.aws.route53:
     state: present
     zone: "{{ cutover_dns_zone }}"
     record: "{{ cutover_dns_record }}"
     type: A
     ttl: 60
-    value: "{{ new_ip }}"
+    value: "{{ cutover_new_ip }}"
     overwrite: true
+    wait: true
+    wait_timeout: "{{ cutover_dns_wait_timeout | int }}"
+  tags: [cutover, dns]
+
+- name: "[cutover] Read DNS record back"
+  when: cutover_use_dns
+  amazon.aws.route53:
+    state: get
+    zone: "{{ cutover_dns_zone }}"
+    record: "{{ cutover_dns_record }}"
+    type: A
+  register: cutover_dns_readback
+  tags: [cutover, dns]
+
+- name: "[cutover] Record observed DNS values"
+  when: cutover_use_dns
+  ansible.builtin.set_fact:
+    cutover_dns_observed:
+      zone: "{{ cutover_dns_zone }}"
+      record: "{{ cutover_dns_record }}"
+      type: A
+      values: "{{ cutover_dns_readback.resource_record_sets | default([]) | map(attribute='resource_records') | flatten | map(attribute='value') | list }}"
+  tags: [cutover, dns]
+
+- name: "[cutover] Confirm the DNS record now resolves to the new instance"
+  when: cutover_use_dns
+  ansible.builtin.assert:
+    that:
+      - cutover_dns_observed['values'] == [cutover_new_ip]
+    fail_msg: "DNS readback diverges: {{ cutover_dns_record }} A={{ cutover_dns_observed['values'] }} expected={{ [cutover_new_ip] }}"
+    quiet: true
   tags: [cutover, dns]
 
 - name: "[cutover] Publish cutover completion"
@@ -75,7 +190,11 @@
     data:
       cutover_done: true
       cutover_strategy_used: "{{ cutover_strategy }}"
-      cutover_completed_at: "{{ ansible_date_time.iso8601 | default('') }}"
+      cutover_completion_schema: "samurai.cutover_completion/v2"
+      cutover_completed_at: "{{ now(utc=True, fmt='%Y-%m-%dT%H:%M:%S.%fZ') }}"
+      cutover_execution_id: "{{ samurai_execution_id | default('') }}"
+      cutover_lb_targets_observed: "{{ cutover_lb_targets_observed | default({}) }}"
+      cutover_dns_observed: "{{ cutover_dns_observed | default({}) }}"
     aggregate: false
     per_host: false
   tags: [cutover]

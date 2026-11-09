@@ -5,3 +5,5 @@ cutover_drain_timeout: "{{ cutover.drain_timeout | default(samurai_cutover_drain
 cutover_lb_target_group: "{{ cutover.lb_target_group | default('') }}"
 cutover_dns_zone: "{{ cutover.dns_zone | default('') }}"
 cutover_dns_record: "{{ cutover.dns_record | default('') }}"
+cutover_target_healthy_timeout: "{{ cutover.target_healthy_timeout | default(300) }}"
+cutover_dns_wait_timeout: "{{ cutover.dns_wait_timeout | default(300) }}"
