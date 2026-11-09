@@ -71,15 +71,21 @@
   no_log: true
   tags: [image_build]
 
-- name: "[image_build] Require four scoped Azure evidence upload grants"
+- name: "[image_build] Require the scoped Azure evidence upload grants (4 mandatory, optional scriptlet/inventory grant allowed)"
   ansible.builtin.assert:
     that:
       - image_build_artifact_write_urls is mapping
       - >-
-        (image_build_artifact_write_urls.keys() | list | sort) ==
-        (['build.log', 'sbom.cyclonedx.json', 'scan.grype.json', 'describe_images.json'] | sort)
-      - image_build_artifact_write_urls.values() | list | select('match', '^https://') | list | length == 4
-    fail_msg: "Azure image build has no exact evidence upload grants."
+        ['build.log', 'sbom.cyclonedx.json', 'scan.grype.json', 'describe_images.json']
+        | difference(image_build_artifact_write_urls.keys() | list) | length == 0
+      - >-
+        image_build_artifact_write_urls.keys() | list
+        | difference(['build.log', 'sbom.cyclonedx.json', 'scan.grype.json', 'describe_images.json',
+                      'platform-inventory.json', 'build-removed-scriptlets.json']) | length == 0
+      - >-
+        image_build_artifact_write_urls.values() | list | select('match', '^https://') | list | length
+        == image_build_artifact_write_urls | length
+    fail_msg: "Azure image build has missing, unknown or non-https evidence upload grants."
   when:
     - image_build_provider == 'packer'
     - image_build_cloud_provider == 'azure'
