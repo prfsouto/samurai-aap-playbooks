@@ -1,0 +1,86 @@
+---
+# ============================================================================
+# Role: cutover — target group branch
+# Included from main.yml only when cutover_use_lb: these community.aws modules
+# are resolved only when this branch runs, so a DNS-only cutover loads on an
+# EE that ships amazon.aws without community.aws.
+# ============================================================================
+
+# ── Step 1. Register new instance in load balancer ───────────────────────────
+- name: "[cutover] Register new instance in target group and wait until healthy"
+  when: cutover_use_lb
+  community.aws.elb_target:
+    region: "{{ region | default(omit, true) }}"
+    target_group_arn: "{{ cutover_lb_target_group }}"
+    target_id: "{{ cutover_new_instance_id }}"
+    state: present
+    target_status: healthy
+    target_status_timeout: "{{ cutover_target_healthy_timeout | int }}"
+  tags: [cutover, lb]
+
+# ── Step 2. Drain old instance ──────────────────────────────────────────────
+- name: "[cutover] Drain old instance from target group"
+  when:
+    - cutover_use_lb
+    - cutover_old_instance_id | length > 0
+    - cutover_old_instance_id != cutover_new_instance_id
+  community.aws.elb_target:
+    region: "{{ region | default(omit, true) }}"
+    target_group_arn: "{{ cutover_lb_target_group }}"
+    target_id: "{{ cutover_old_instance_id }}"
+    state: absent
+  tags: [cutover, lb]
+
+- name: "[cutover] Wait for connection drain"
+  ansible.builtin.pause:
+    seconds: "{{ cutover_drain_timeout | int }}"
+  when: cutover_use_lb
+  tags: [cutover, drain]
+
+- name: "[cutover] Read target group health back"
+  when: cutover_use_lb
+  community.aws.elb_target_group_info:
+    region: "{{ region | default(omit, true) }}"
+    target_group_arns:
+      - "{{ cutover_lb_target_group }}"
+    collect_targets_health: true
+  register: cutover_lb_readback
+  tags: [cutover, lb]
+
+- name: "[cutover] Record observed target group members"
+  when: cutover_use_lb
+  vars:
+    cutover_lb_groups: "{{ cutover_lb_readback.target_groups | default([]) }}"
+  ansible.builtin.set_fact:
+    cutover_lb_found: "{{ cutover_lb_groups | length > 0 }}"
+    cutover_lb_health: "{{ cutover_lb_groups[0].targets_health_description | default([]) if cutover_lb_groups else [] }}"
+    cutover_lb_targets_observed: {}
+  tags: [cutover, lb]
+
+- name: "[cutover] Index target group members by id"
+  when: cutover_use_lb
+  ansible.builtin.set_fact:
+    cutover_lb_targets_observed: "{{ cutover_lb_targets_observed | combine({item.target.id: item.target_health.state}) }}"
+  loop: "{{ cutover_lb_health }}"
+  loop_control:
+    label: "{{ item.target.id }}"
+  tags: [cutover, lb]
+
+- name: "[cutover] Confirm the target group now routes to the new instance"
+  when: cutover_use_lb
+  vars:
+    cutover_lb_new_state: "{{ cutover_lb_targets_observed[cutover_new_instance_id] | default('absent') }}"
+    cutover_lb_old_state: "{{ cutover_lb_targets_observed[cutover_old_instance_id] | default('absent') }}"
+  ansible.builtin.assert:
+    that:
+      - cutover_lb_found | bool
+      - cutover_lb_new_state == 'healthy'
+      - >-
+        cutover_old_instance_id | length == 0
+        or cutover_old_instance_id == cutover_new_instance_id
+        or cutover_lb_old_state in ['absent', 'draining']
+    fail_msg: "Target group readback diverges: found={{ cutover_lb_found }}
+      new={{ cutover_new_instance_id }}:{{ cutover_lb_new_state }}
+      old={{ cutover_old_instance_id }}:{{ cutover_lb_old_state }}"
+    quiet: true
+  tags: [cutover, lb]
