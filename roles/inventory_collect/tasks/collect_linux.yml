@@ -89,6 +89,114 @@
         # instaladas (kernel, por exemplo) fica com as duas, como no módulo.
         _iic_rpm_packages: "{{ dict(_iic_rpm_entries | groupby('name')) }}"
 
+# Origem RPM (SOURCERPM) e rótulo de módulo (MODULARITYLABEL) por pacote, só para
+# família RedHat. ``rpm --querytags`` vem antes da consulta porque o rpm 4.11 do
+# RHEL 7 recusa a consulta INTEIRA quando a tag não existe: sem ela, a consulta
+# sai só com SOURCERPM e o rótulo não é gravado. Qualquer falha aqui deixa o
+# inventário como está e declara a observação indisponível; não derruba a coleta.
+- name: "[inventory_collect] Confirm the rpm database exposes MODULARITYLABEL (read-only, RedHat)"
+  ansible.builtin.command:
+    argv:
+      - rpm
+      - --querytags
+  register: inventory_collect_rpm_querytags
+  changed_when: false
+  failed_when: false
+  when: (ansible_facts.os_family | default('')) == 'RedHat'
+  tags: [inventory_collect, collect]
+
+- name: "[inventory_collect] Record whether the module label tag is observable (RedHat)"
+  ansible.builtin.set_fact:
+    inventory_collect_rpm_modularity_observed: >-
+      {{ (inventory_collect_rpm_querytags.rc | default(1)) == 0
+         and 'MODULARITYLABEL' in (inventory_collect_rpm_querytags.stdout_lines | default([]) | map('trim') | list) }}
+  when: (ansible_facts.os_family | default('')) == 'RedHat'
+  tags: [inventory_collect, collect]
+
+- name: "[inventory_collect] Read RPM source and module label per installed package (read-only, RedHat)"
+  ansible.builtin.command:
+    argv:
+      - rpm
+      - -qa
+      - --qf
+      - '%{NAME}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\t%{SOURCERPM}\t%{MODULARITYLABEL}\n'
+  register: inventory_collect_rpm_origin_with_label
+  changed_when: false
+  failed_when: false
+  when:
+    - (ansible_facts.os_family | default('')) == 'RedHat'
+    - inventory_collect_rpm_modularity_observed | default(false) | bool
+  tags: [inventory_collect, collect]
+
+- name: "[inventory_collect] Read RPM source per installed package without module label (read-only, RedHat)"
+  ansible.builtin.command:
+    argv:
+      - rpm
+      - -qa
+      - --qf
+      - '%{NAME}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\t%{SOURCERPM}\n'
+  register: inventory_collect_rpm_origin_without_label
+  changed_when: false
+  failed_when: false
+  when:
+    - (ansible_facts.os_family | default('')) == 'RedHat'
+    - not (inventory_collect_rpm_modularity_observed | default(false) | bool)
+  tags: [inventory_collect, collect]
+
+- name: "[inventory_collect] Prepare the RPM origin join request (RedHat)"
+  ansible.builtin.set_fact:
+    inventory_collect_rpm_origin_request:
+      packages: "{{ ansible_facts.packages | default({}) }}"
+      modularity_label_observed: "{{ inventory_collect_rpm_modularity_observed | default(false) | bool }}"
+      rpm_rc: "{{ _iic_rpm_origin.rc | default(1) }}"
+      rpm_stdout: "{{ _iic_rpm_origin.stdout | default('') }}"
+  vars:
+    _iic_rpm_origin: "{{ inventory_collect_rpm_origin_with_label if (inventory_collect_rpm_modularity_observed | default(false) | bool) else inventory_collect_rpm_origin_without_label }}"
+  when: (ansible_facts.os_family | default('')) == 'RedHat'
+  tags: [inventory_collect, collect]
+
+- name: "[inventory_collect] Join RPM origin and module label to the package entries (read-only, RedHat)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_facts.python.executable }}"
+      - -c
+      - "{{ lookup('file', role_path + '/files/collect_rhel_rpm_origin.py') }}"
+    stdin: "{{ inventory_collect_rpm_origin_request | to_json }}"
+  register: inventory_collect_rpm_origin_join
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when: (ansible_facts.os_family | default('')) == 'RedHat'
+  tags: [inventory_collect, collect]
+
+- name: "[inventory_collect] Publish the joined RPM origin into the package entries (RedHat)"
+  ansible.builtin.set_fact:
+    ansible_facts: >-
+      {{ ansible_facts | combine({
+          'packages': (inventory_collect_rpm_origin_join.stdout | from_json).packages,
+          'samurai_rpm_source_observation': (inventory_collect_rpm_origin_join.stdout | from_json).observation
+        }) }}
+  when:
+    - (ansible_facts.os_family | default('')) == 'RedHat'
+    - (inventory_collect_rpm_origin_join.rc | default(1)) == 0
+  no_log: true
+  tags: [inventory_collect, collect]
+
+- name: "[inventory_collect] Declare the RPM origin as unavailable when the join fails (RedHat)"
+  ansible.builtin.set_fact:
+    ansible_facts: >-
+      {{ ansible_facts | combine({
+          'samurai_rpm_source_observation': {
+            'observation_state': 'unavailable',
+            'reason': 'rpm_origin_join_failed',
+            'modularity_label_observed': false
+          }
+        }) }}
+  when:
+    - (ansible_facts.os_family | default('')) == 'RedHat'
+    - (inventory_collect_rpm_origin_join.rc | default(1)) != 0
+  tags: [inventory_collect, collect]
+
 - name: "[inventory_collect] Observe cloud-init completion (read-only)"
   ansible.builtin.command:
     argv:
