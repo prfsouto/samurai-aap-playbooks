@@ -1047,12 +1047,36 @@
               failed_when: false
               when: svc_down | default([]) | length > 0
 
-            - name: "Service check :: collect TCP listeners (after)"
+            # `systemctl is-active` says nothing about the ports: with
+            # Type=simple a unit is `active` as soon as its process exists,
+            # long before a JVM binds them — Tomcat on the lab hosts (Java
+            # 17) took ~60 s to bind 8080/8005, while the old single `ss`
+            # read ran within seconds and reported both ports as lost on
+            # vm1/vm2 even though Tomcat came up fine (job 230). Re-read the
+            # listeners until every pre-change port is back, or until
+            # SERVICE_SETTLE_SECONDS runs out (then the comparison below
+            # still reports what is missing, as before). Each port becomes
+            # ":<port> " — ss pads its local-address column, so ":80 " can
+            # never match ":8080". The wait ends on attempts instead of
+            # letting `until` exhaust: exhaustion marks the task failed even
+            # with failed_when: false (#86).
+            - name: "Service check :: list the ports that were listening before"
+              ansible.builtin.set_fact:
+                svc_ports_before_needles: >-
+                  {{ svc_listeners_before | map(attribute='port') | unique
+                     | map('regex_replace', '^', ':') | map('regex_replace', '$', ' ') | list }}
+
+            - name: "Service check :: collect TCP listeners (after), waiting for the pre-change ports"
               ansible.builtin.command:
                 argv: [ss, -ltnp]
               register: svc_ss_after
               changed_when: false
               failed_when: false
+              until: >-
+                (svc_ports_before_needles | reject('in', svc_ss_after.stdout | default('')) | list | length == 0)
+                or ((svc_ss_after.attempts | default(1) | int) >= (svc_wait_retries | int))
+              retries: "{{ svc_wait_retries }}"
+              delay: 10
 
             - name: "Service check :: select the post-change sources"
               ansible.builtin.set_fact:
