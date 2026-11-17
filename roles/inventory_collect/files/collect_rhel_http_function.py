@@ -7,8 +7,10 @@ Compatível com o Python da plataforma do RHEL 8 (3.6).
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -18,6 +20,15 @@ SUBJECTS = ("httpd.service", "nginx.service")
 URI = "http://127.0.0.1/"
 #: Caminhos registrados além da raiz, servidos por conteúdo de pacote (``/manual/`` vem do httpd-manual).
 EXTRA_URIS = ("http://127.0.0.1/manual/",)
+#: v4 (contrato): caminhos sem Host, medidos duas vezes; o status e o hash têm de se repetir para virar referência.
+V4_EXTRA_URIS = ("http://127.0.0.1/.noindex.html", "http://127.0.0.1/icons/apache_pb2.gif",
+                 "http://127.0.0.1/samurai-nao-existe-404")
+#: Estados literais de ``client_host`` quando não há nome válido. Têm ``_``, então nunca são um nome de host.
+CLIENT_HOST_NOT_CONFIGURED = "not_configured"
+CLIENT_HOST_INVALID = "invalid_value"
+_HOST = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*")
+#: Data no corpo (ISO, RFC 1123 ou autoindex): a página muda entre medições, então não serve de referência.
+_DATE = re.compile(rb"\d{4}-\d{2}-\d{2}|\d{2}-[A-Za-z]{3}-\d{4}|\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} [A-Za-z]{3} \d{4}|Index of /")
 UNIT_FIELDS = ("Id", "LoadState", "ActiveState", "SubState", "UnitFileState")
 BODY_LIMIT = 1048576
 UNIT_LIMIT = 16384
@@ -56,30 +67,74 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def http(uri=URI):
+def _header(headers, name):
+    value = headers.get(name) if headers is not None else None
+    return value[:256] if isinstance(value, str) else None
+
+
+def measure(uri=URI, host=None, method="GET"):
+    """Uma leitura local sem proxy e sem seguir redirecionamento; ``host`` vai no cabeçalho Host (rota do cliente)."""
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
-    reading = {"uri": uri, "measured": False, "status": None, "body_sha256": None,
-               "body_bytes": None, "truncated": None}
+    reading = {"uri": uri, "host": host, "method": method, "measured": False, "status": None,
+               "body_sha256": None, "body_bytes": None, "truncated": None, "content_type": None,
+               "server": None, "elapsed_ms": None, "dynamic": None}
+    started = time.monotonic()
     try:
-        response = opener.open(urllib.request.Request(uri, method="GET"), timeout=5)
+        response = opener.open(urllib.request.Request(uri, headers={"Host": host} if host else {}, method=method),
+                               timeout=5)
     except urllib.error.HTTPError as exc:
         response = exc
     except (urllib.error.URLError, OSError, ValueError) as exc:
         reading["error"] = type(exc).__name__
         return reading
     try:
-        body = response.read(BODY_LIMIT + 1)
+        body = b"" if method == "HEAD" else response.read(BODY_LIMIT + 1)
         status = response.code if isinstance(response, urllib.error.HTTPError) else response.status
+        headers = response.headers
     except OSError as exc:
         reading["error"] = type(exc).__name__
         return reading
     finally:
         response.close()
     truncated = len(body) > BODY_LIMIT
+    whole = method == "GET" and not truncated
     reading.update(measured=True, status=status, truncated=truncated,
-                   body_bytes=None if truncated else len(body),
-                   body_sha256=None if truncated else hashlib.sha256(body).hexdigest())
+                   body_bytes=len(body) if whole else None,
+                   body_sha256=hashlib.sha256(body).hexdigest() if whole else None,
+                   dynamic=bool(_DATE.search(body)) if whole else None,
+                   content_type=_header(headers, "Content-Type"), server=_header(headers, "Server"),
+                   elapsed_ms=int((time.monotonic() - started) * 1000))
     return reading
+
+
+def http(uri=URI):
+    return measure(uri)
+
+
+def client_host_state(raw):
+    """Nome do cliente quando válido; ausente vira ``not_configured``, inválido vira ``invalid_value``. Nunca inventa nome."""
+    name = (raw or "").strip().lower()
+    if not name:
+        return CLIENT_HOST_NOT_CONFIGURED
+    return name if len(name) <= 253 and _HOST.fullmatch(name) else CLIENT_HOST_INVALID
+
+
+def _stable(uri, host=None, method="GET"):
+    """Mede duas vezes; a rota só é estável se a segunda medição repete o status (e o hash, no GET)."""
+    first, again = measure(uri, host, method), measure(uri, host, method)
+    first.update(repeat_status=again["status"], repeat_sha256=again["body_sha256"])
+    return first
+
+
+def contract_readings(client_host):
+    """Leituras v4: GET dos caminhos sem Host e HEAD na raiz; com nome do cliente, GET e HEAD na raiz com o Host."""
+    # Mesmos caminhos que o contrato v4 lê: raiz, /manual/ (EXTRA_URIS) e os caminhos extras da v4.
+    readings = [_stable(uri) for uri in (URI,) + EXTRA_URIS + V4_EXTRA_URIS]
+    readings.append(_stable(URI, None, "HEAD"))
+    if client_host not in (CLIENT_HOST_NOT_CONFIGURED, CLIENT_HOST_INVALID):
+        readings.append(_stable(URI, client_host))
+        readings.append(_stable(URI, client_host, "HEAD"))
+    return readings
 
 
 def run(argv, limit=CONFIG_OUTPUT_LIMIT):
@@ -154,19 +209,20 @@ def configuration(subject):
     return value
 
 
-def collect(uri=URI):
+def collect(uri=URI, client_host=None):
     value = {"schema_version": SCHEMA, "scope": SCOPE, "configuration_writes": 0, "service_mutations": 0,
              "complete_application_function": False}
     units = {subject: unit(subject) for subject in SUBJECTS}
     if any(fields is None for fields in units.values()):
         value["observation_state"] = "unavailable"
         return value
-    value.update(observation_state="observed", units=units)
+    value.update(observation_state="observed", units=units, client_host=client_host_state(client_host))
     active = [subject for subject, fields in units.items()
               if fields["LoadState"] == "loaded" and fields["ActiveState"] == "active"]
     if active:
         value["http"] = http(uri)
         value["http_paths"] = [http(extra) for extra in EXTRA_URIS]
+        value["http_v4"] = contract_readings(value["client_host"])
         value["configuration"] = {subject: configuration(subject) for subject in active}
     else:
         value["http"] = {"uri": uri, "measured": False, "reason": "unit_not_active"}
@@ -174,4 +230,6 @@ def collect(uri=URI):
 
 
 if __name__ == "__main__":
-    sys.stdout.write(json.dumps(collect(), sort_keys=True, separators=(",", ":")) + "\n")
+    # O nome do cliente chega como argumento do ``python -c``; sem argumento, a observação diz ``not_configured``.
+    client = sys.argv[1] if len(sys.argv) > 1 else None
+    sys.stdout.write(json.dumps(collect(client_host=client), sort_keys=True, separators=(",", ":")) + "\n")

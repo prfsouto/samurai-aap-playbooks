@@ -242,6 +242,8 @@
       - "{{ ansible_facts.python.executable }}"
       - -c
       - "{{ lookup('file', role_path + '/files/collect_rhel_http_function.py') }}"
+      # Nome de cliente (Host da rota do cliente). Vazio quando a fonte não chega à coleta: a observação diz not_configured.
+      - "{{ inventory_collect_client_host | default('', true) }}"
   register: inventory_collect_rhel_http
   changed_when: false
   failed_when: false
