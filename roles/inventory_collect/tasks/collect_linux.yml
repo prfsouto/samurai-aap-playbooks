@@ -598,3 +598,43 @@
     - (inventory_collect_zypper_manual.rc | default(1)) != 0
   tags: [inventory_collect, collect]
 
+
+- name: "[inventory_collect] Observe the running kernel of the bound validation candidate"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_facts.python.executable }}"
+      - -c
+      - "{{ lookup('file', role_path + '/files/collect_linux_kernel_modules.py') }}"
+  register: inventory_collect_candidate_kernel
+  timeout: 10
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when:
+    - usage is mapping and usage.get('enabled', false) is sameas true
+    - usage.get('kernel_module_observation') == 'v1'
+    - usage.purpose is not defined and usage.privileged_measurement is not defined
+    - usage.execution_plan_id is integer and usage.execution_plan_id > 0
+    - usage.managed_server_id is integer and usage.managed_server_id > 0
+    - usage.collection_run_id is integer and usage.collection_run_id > 0
+    - usage.candidate_execution_id is string and usage.candidate_execution_id | length > 0
+    - usage.organization_id == inventory_collect_organization_id | int
+    - usage.samurai_execution_id == samurai_execution_id and usage.target_host == inventory_hostname
+  vars:
+    usage: "{{ inventory_collect_package_usage_request | default({}) }}"
+  tags: [inventory_collect, collect, package_usage]
+
+- name: "[inventory_collect] Bind kernel measurements to the candidate collection"
+  ansible.builtin.set_fact:
+    inventory_collect_functional: >-
+      {{ inventory_collect_functional | combine({'linux_kernel_modules':
+          (inventory_collect_candidate_kernel.stdout | from_json) | combine({'binding': {
+            'organization_id': usage.organization_id, 'execution_plan_id': usage.execution_plan_id,
+            'managed_server_id': usage.managed_server_id, 'collection_run_id': usage.collection_run_id,
+            'candidate_execution_id': usage.candidate_execution_id, 'target_host': usage.target_host,
+            'samurai_execution_id': samurai_execution_id}})}) }}
+  vars:
+    usage: "{{ inventory_collect_package_usage_request }}"
+  when: (inventory_collect_candidate_kernel.rc | default(1)) == 0
+  no_log: true
+  tags: [inventory_collect, collect, package_usage]
