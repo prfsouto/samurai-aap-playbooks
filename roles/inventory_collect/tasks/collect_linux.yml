@@ -143,6 +143,34 @@
     - not (inventory_collect_rpm_modularity_observed | default(false) | bool)
   tags: [inventory_collect, collect]
 
+- name: "[inventory_collect] Read installed RPM header signatures for the bound candidate"
+  ansible.builtin.command:
+    argv: "{{ ['rpm', '-q', '--qf', signer_format, '--'] + selected }}"
+  vars:
+    usage: "{{ inventory_collect_package_usage_request | default({}) }}"
+    requested: "{{ usage.rpm_signer_packages | default([]) }}"
+    selected: "{{ requested | intersect((ansible_facts.packages | default({})).keys() | list) | sort }}"
+    signer_format: '%{NAME}\t%{EPOCHNUM}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\t%{RSAHEADER:pgpsig}\t%{DSAHEADER:pgpsig}\t%{SIGPGP:pgpsig}\n'
+  register: inventory_collect_rpm_signers
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when:
+    - (ansible_facts.os_family | default('')) == 'RedHat'
+    - usage is mapping and usage.get('enabled', false) is sameas true
+    - usage.purpose is not defined and usage.privileged_measurement is not defined
+    - usage.execution_plan_id is integer and usage.execution_plan_id > 0
+    - usage.managed_server_id is integer and usage.managed_server_id > 0
+    - usage.collection_run_id is integer and usage.collection_run_id > 0
+    - usage.candidate_execution_id is string and usage.candidate_execution_id | length > 0
+    - usage.organization_id == inventory_collect_organization_id | int
+    - usage.samurai_execution_id == samurai_execution_id and usage.target_host == inventory_hostname
+    - requested is sequence and requested is not string and requested is not mapping and requested | length > 0
+    - requested | select('match', '^[A-Za-z0-9][A-Za-z0-9+._-]*$') | list | length == requested | length
+    - requested | difference(usage.packages | default([])) | length == 0
+    - selected | length > 0
+  tags: [inventory_collect, collect]
+
 - name: "[inventory_collect] Prepare the RPM origin join request (RedHat)"
   ansible.builtin.set_fact:
     inventory_collect_rpm_origin_request:
@@ -150,6 +178,9 @@
       modularity_label_observed: "{{ inventory_collect_rpm_modularity_observed | default(false) | bool }}"
       rpm_rc: "{{ _iic_rpm_origin.rc | default(1) }}"
       rpm_stdout: "{{ _iic_rpm_origin.stdout | default('') }}"
+      signer_packages: "{{ (inventory_collect_package_usage_request | default({})).rpm_signer_packages | default([]) }}"
+      signer_rc: "{{ inventory_collect_rpm_signers.rc | default(1) if not inventory_collect_rpm_signers.stderr | default('') else 1 }}"
+      signer_stdout: "{{ inventory_collect_rpm_signers.stdout | default('') }}"
   vars:
     _iic_rpm_origin: "{{ inventory_collect_rpm_origin_with_label if (inventory_collect_rpm_modularity_observed | default(false) | bool) else inventory_collect_rpm_origin_without_label }}"
   when: (ansible_facts.os_family | default('')) == 'RedHat'

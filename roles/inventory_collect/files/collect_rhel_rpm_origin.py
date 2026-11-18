@@ -14,6 +14,7 @@ Regras:
 * Falha da consulta devolve as entradas intactas e declara a observação indisponível.
 """
 import json
+import re
 import sys
 
 NONE = "(none)"
@@ -67,6 +68,23 @@ def _enrich(packages, index, with_modularity):
     return enriched, total, matched
 
 
+def _rpm_header_signers(stdout):
+    signers = {}
+    for line in stdout.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 8:
+            return {}
+        identity = tuple(fields[:5])
+        ids = set()
+        for field in fields[5:]:
+            if field == NONE:
+                continue
+            match = re.search(r" Key ID ([0-9a-fA-F]{16})$", field)
+            ids.add(match.group(1).lower() if match else None)
+        signers.setdefault(identity, set()).update(ids or {None})
+    return {key: next(iter(ids)) for key, ids in signers.items() if len(ids) == 1 and None not in ids}
+
+
 def collect(request):
     packages = request.get("packages") or {}
     entries_total = sum(len(entries) for entries in packages.values())
@@ -85,6 +103,17 @@ def collect(request):
     with_modularity = bool(request.get("modularity_label_observed"))
     index, malformed = _index_rpm_lines(request.get("rpm_stdout") or "", with_modularity)
     enriched, total, matched = _enrich(packages, index, with_modularity)
+    if int(request.get("signer_rc", 1)) == 0:
+        signers = _rpm_header_signers(request.get("signer_stdout") or "")
+        requested = set(request.get("signer_packages") or ())
+        for name in requested.intersection(enriched):
+            for item in enriched[name]:
+                epoch = item.get("epoch")
+                if "epoch" in item and epoch in (None, "(none)"):
+                    epoch = "0"
+                identity = (name, str(epoch), item.get("version"), item.get("release"), item.get("arch"))
+                if identity in signers:
+                    item["rpm_header_key_id"] = signers[identity]
     return {
         "packages": enriched,
         "observation": {
