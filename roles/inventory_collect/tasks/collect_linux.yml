@@ -152,6 +152,8 @@
     selected: "{{ requested | intersect((ansible_facts.packages | default({})).keys() | list) | sort }}"
     signer_format: '%{NAME}\t%{EPOCHNUM}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\t%{RSAHEADER:pgpsig}\t%{DSAHEADER:pgpsig}\t%{SIGPGP:pgpsig}\n'
   register: inventory_collect_rpm_signers
+  environment:
+    LC_ALL: C
   changed_when: false
   failed_when: false
   no_log: true
