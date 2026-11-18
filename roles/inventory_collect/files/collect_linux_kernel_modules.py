@@ -3,6 +3,7 @@ import datetime
 import json
 import os
 import re
+import subprocess
 from pathlib import Path
 
 MODULE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,127}")
@@ -66,7 +67,51 @@ def measure(path, parse):
         return {"state": "not_measured"}
 
 
-def collect(release, root=Path("/")):
+def kmod_directives(lines):
+    blacklisted, noop, other = set(), set(), set()
+    total = 0
+    for line in lines:
+        total += len(line)
+        if total > 16 * 1024 * 1024 or not line.endswith(b"\n"):
+            raise ValueError("incomplete kmod configuration")
+        fields = line.split()
+        if not fields or fields[0] not in (b"blacklist", b"install"):
+            continue
+        if len(fields) < 2:
+            raise ValueError("invalid directive")
+        name = fields[1].decode("ascii")
+        if not MODULE.fullmatch(name):
+            raise ValueError("unsupported module selector")
+        name = name.replace("-", "_")
+        if fields[0] == b"blacklist":
+            if len(fields) != 2:
+                raise ValueError("ambiguous blacklist")
+            blacklisted.add(name)
+        elif fields[2:] in ([b"/bin/false"], [b"/usr/bin/false"], [b"/bin/true"], [b"/usr/bin/true"]):
+            noop.add(name)
+        else:
+            other.add(name)
+    return {"blacklist": sorted(blacklisted), "install_noop": sorted(noop - other)}
+
+
+def measure_kmod():
+    args = ["/usr/bin/timeout", "-k", "1", "4", "/sbin/modprobe", "-c"]
+    try:
+        with subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env={"LC_ALL": "C", "PATH": "/usr/sbin:/usr/bin:/sbin:/bin"}) as process:
+            try:
+                lines = iter(lambda: process.stdout.readline(LIMIT + 1), b"")
+                value = kmod_directives(lines)
+            finally:
+                process.stdout.close()
+            if not process.stderr.read(1) and process.wait() == 0:
+                return {"state": "measured", "value": value}
+    except (OSError, ValueError):
+        pass
+    return {"state": "not_measured"}
+
+
+def collect(release, root=Path("/"), read_kmod=measure_kmod):
     if not RELEASE.fullmatch(release):
         raise ValueError("invalid kernel release")
     return {
@@ -76,6 +121,7 @@ def collect(release, root=Path("/")):
         "loaded": measure(root / "proc/modules", loaded_modules),
         "builtin": measure(root / "lib/modules" / release / "modules.builtin", builtin_modules),
         "boot_policy": measure(root / "proc/cmdline", boot_policy),
+        "kmod_policy": read_kmod(),
     }
 
 
