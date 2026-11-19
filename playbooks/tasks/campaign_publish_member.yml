@@ -12,7 +12,9 @@
              {'data_sync_tracked_resources': campaign_data_sync_tracked_resources}
              if campaign_data_sync_tracked_resources is defined else {}) | combine(
              {'data_sync_destination_reread_results': campaign_data_sync_destination_reread_results}
-             if campaign_data_sync_destination_reread_results is defined else {}) }}
+             if campaign_data_sync_destination_reread_results is defined else {}) | combine(
+             {'data_sync_destination_identities': campaign_data_sync_final_destination_identities}
+             if campaign_data_sync_final_destination_identities | default([]) | length > 0 else {}) }}
   vars:
     campaign_member_observation:
         organization_id: "{{ organization_id }}"

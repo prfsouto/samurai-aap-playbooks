@@ -175,4 +175,15 @@
           destination_device: "{{ data_sync_destination }}"
           filesystem_identity: "{{ data_volume_fs_identity_after }}"
           mounted_at: "{{ data_sync_mount_point | default('') }}"
+  register: data_sync_guard_publication
+  tags: [bootstrap, data_sync]
+
+- name: "[bootstrap] Retain the FINAL filesystem identity for this campaign member"
+  ansible.builtin.set_fact:
+    campaign_data_sync_final_destination_identities: >-
+      {{ campaign_data_sync_final_destination_identities
+         + data_sync_guard_publication.ansible_stats.data.data_sync_destination_identities }}
+  when:
+    - campaign_collect_final_destination_identity | default(false) | bool
+    - data_sync_guard_item.stage | default('') == 'final'
   tags: [bootstrap, data_sync]
